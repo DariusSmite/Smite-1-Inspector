@@ -4,6 +4,24 @@ A native Windows desktop app (C# / WinForms, .NET 8) for **SMITE 1**. It pairs a
 
 > SMITE 1 is in maintenance mode, but its servers and stats API are still up. This is an unofficial fan tool, see **Disclaimer** below.
 
+## Screenshots
+
+Player Tracker, showing a player's friends, sent requests, and blocked and hidden entries:
+
+![Player Tracker friends tab](screenshots/player-tracker-friends.png)
+
+A match scoreboard with each player's god, build, KDA and premade-party bars (privacy-flagged players still show their stats and can be nicknamed with a click):
+
+![Match scoreboard](screenshots/match-scoreboard.png)
+
+The live Friend List with status, online uptime, and a per-friend preview panel with notes:
+
+![Friend List](screenshots/friend-list.png)
+
+The God Inspector editing a god's ability tuning values:
+
+![God Inspector](screenshots/god-inspector.png)
+
 ## Features
 
 ### Player Tracker
