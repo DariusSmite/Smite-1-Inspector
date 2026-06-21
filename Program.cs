@@ -563,6 +563,24 @@ namespace SmiteGodLab
         public bool ShowFriendUptime { get; set; }   // Friend List: show how long online friends have been logged in
     }
 
+    // One entry in the Codex table-of-contents tree (a section H2 or an indented sub-section H3).
+    sealed class TocNode
+    {
+        public string Title;
+        public Control Anchor;        // the header Label in the doc flow → the ScrollControlIntoView jump target
+        public bool IsSection;        // true = top-level section, false = sub-section
+        public TocNode Parent;        // null for sections
+        public TocRow Row;            // the rendered sidebar row (back-ref)
+        public bool Expanded = true;  // sections start expanded
+        public readonly List<TocNode> Children = new();
+    }
+    // A single owner-drawn TOC row (chevron + label + accent bar painted in one Paint; no child controls).
+    sealed class TocRow : Panel
+    {
+        public bool Hovered;
+        public TocRow() => SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.ResizeRedraw, true);
+    }
+
     // Flat checkbox: white square box with a black check mark when ticked (sharp, on-theme).
     class FlatCheck : CheckBox
     {
@@ -2242,9 +2260,9 @@ namespace SmiteGodLab
             top.Controls.Add(new Label { Text = "How every feature and algorithm works, in depth.", AutoSize = true, ForeColor = Theme.Dim, Font = Theme.F(8.5f), Location = new Point(S(18), S(33)) });
             var body = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg };
             var content = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg, AutoScroll = true, Padding = new Padding(S(26), S(14), S(20), S(30)) };
-            var toc = new Panel { Dock = DockStyle.Left, Width = S(196), BackColor = Theme.Panel };
+            var toc = new Panel { Dock = DockStyle.Left, Width = S(212), BackColor = Theme.Panel };
             var tocLine = new Panel { Dock = DockStyle.Right, Width = S(1), BackColor = Theme.Line };
-            var tocFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true, BackColor = Theme.Panel, Padding = new Padding(S(12), S(16), S(8), S(16)) };
+            var tocFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true, BackColor = Theme.Panel, Padding = new Padding(S(12), S(14), S(6), S(16)) };
             toc.Controls.Add(tocFlow); toc.Controls.Add(tocLine);
             var flow = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, BackColor = Theme.Bg };
             content.Controls.Add(flow);
@@ -2252,21 +2270,27 @@ namespace SmiteGodLab
             var bodyCol = Color.FromArgb(202, 202, 208);
             var mono = new Font("Consolas", 9.5f);
             bool first = true;
-            tocFlow.Controls.Add(new Label { Text = "CONTENTS", AutoSize = true, ForeColor = Theme.Dim, Font = Theme.F(8f, FontStyle.Bold), Margin = new Padding(0, 0, 0, S(8)) });
-            // H2: a numbered section header + a clickable jump link in the sidebar.
+            // Expandable TOC tree: H2/H3 register nodes here; BuildToc() renders the sidebar after every anchor exists.
+            var nodes = new List<TocNode>();   // flat, in document order
+            TocNode curSection = null;         // most-recent H2 so an H3 attaches to it
+            TocNode active = null;             // the section/sub currently highlighted (follows scroll)
             void H2(string title)
             {
                 if (!first) flow.Controls.Add(new Panel { Width = wrap, Height = 1, BackColor = Theme.Line, Margin = new Padding(0, S(20), 0, S(8)) });
                 first = false;
                 var hdr = new Label { Text = title, AutoSize = true, ForeColor = Theme.Accent, Font = Theme.F(13.5f, FontStyle.Bold), Margin = new Padding(0, S(2), 0, S(7)) };
                 flow.Controls.Add(hdr);
-                var link = new Label { Text = title, AutoSize = true, ForeColor = Theme.Dim, Font = Theme.F(9.5f), Cursor = Cursors.Hand, Margin = new Padding(0, S(3), 0, S(3)) };
-                link.MouseEnter += (s, e) => link.ForeColor = Theme.Text;
-                link.MouseLeave += (s, e) => link.ForeColor = Theme.Dim;
-                link.Click += (s, e) => content.ScrollControlIntoView(hdr);
-                tocFlow.Controls.Add(link);
+                curSection = new TocNode { Title = title, Anchor = hdr, IsSection = true };
+                nodes.Add(curSection);
             }
-            void H3(string t) => flow.Controls.Add(new Label { Text = t, AutoSize = true, ForeColor = Theme.Text, Font = Theme.F(10.5f, FontStyle.Bold), Margin = new Padding(0, S(12), 0, S(4)) });
+            void H3(string t)
+            {
+                var sub = new Label { Text = t, AutoSize = true, ForeColor = Theme.Text, Font = Theme.F(10.5f, FontStyle.Bold), Margin = new Padding(0, S(12), 0, S(4)) };
+                flow.Controls.Add(sub);
+                var n = new TocNode { Title = t, Anchor = sub, IsSection = false, Parent = curSection };
+                curSection?.Children.Add(n);
+                nodes.Add(n);
+            }
             void P(string t) => flow.Controls.Add(new Label { Text = t, AutoSize = true, MaximumSize = new Size(wrap, 0), ForeColor = bodyCol, Font = Theme.F(9.5f), Margin = new Padding(0, 0, 0, S(6)) });
             void Math(string code)
             {
@@ -2291,7 +2315,7 @@ namespace SmiteGodLab
             H3("Friends & live matches");
             P("The Friends sub-tab lists a tracked player's Hi-Rez friends plus incoming/outgoing requests, decoded from friend flags (direction is relative to the viewed player). When a player is in a game, their status chip opens the in-progress scoreboard. A live match reveals everyone's name except hard-private profiles — completed matches anonymize private players, so a live match is the only place their identity surfaces.");
 
-            H2("Hidden-player nicknames");
+            H2("Hidden players");
             P("A privacy-flagged player hides their name and every id, but a match row still leaks their clan, account level, total mastery, the gods they played, and their premade party-mates. You can nickname such a player; the app then re-recognizes them next time from that fingerprint. This is best-effort recognition of a player YOU named — never recovery of a hidden name from the API, which is impossible.");
             H3("The matching algorithm");
             P("Each saved tag is scored against the hidden row. Same clan is the strong anchor; two clanless players get a weaker one; account level and total mastery must stay close (they only ever grow); each shared NAMED party-mate is strong evidence; a previously-seen god nudges it up. The best tag wins if its score clears the threshold:");
@@ -2370,6 +2394,98 @@ namespace SmiteGodLab
 
             H2("Your data");
             P("Everything you save — favorites, recent lookups, hidden-player tags, the friend list with its per-friend notes, your settings, and the god default snapshots — is stored as plain JSON in your Documents folder under Smite Inspector, so a shared copy of the app in a read-only location still works. Nothing is uploaded anywhere; the only network traffic is to the Hi-Rez API, and only for the stats you explicitly request.");
+
+            // --- expandable sidebar tree (owner-drawn rows; chevron toggle; red accent bar follows the scroll) ---
+            void SetExpanded(TocNode sec, bool exp)
+            {
+                sec.Expanded = exp;
+                tocFlow.SuspendLayout();
+                foreach (var c in sec.Children) if (c.Row != null) c.Row.Visible = exp;
+                tocFlow.ResumeLayout(true);
+                sec.Row?.Invalidate();
+            }
+            void SetActive(TocNode n)
+            {
+                if (n == active) return;
+                var prev = active; active = n;
+                if (n != null && !n.IsSection && n.Parent != null && !n.Parent.Expanded) SetExpanded(n.Parent, true);   // reveal the section we scrolled into
+                prev?.Row?.Invalidate(); prev?.Parent?.Row?.Invalidate();
+                n?.Row?.Invalidate(); n?.Parent?.Row?.Invalidate();
+            }
+            void SyncActiveNow()
+            {
+                if (nodes.Count == 0 || IsDisposed || !content.IsHandleCreated) return;
+                int top = -flow.Top + S(48);   // flow is the single AutoScroll child, so -flow.Top is the scroll offset
+                TocNode best = nodes[0];
+                foreach (var n in nodes) { if (n.Anchor.Top <= top) best = n; else break; }
+                SetActive(best);
+            }
+            TocRow MakeRow(TocNode n, int rowW)
+            {
+                var row = new TocRow { Width = rowW, Height = n.IsSection ? S(30) : S(26), Margin = new Padding(0, 0, 0, S(1)), Cursor = Cursors.Hand, BackColor = Theme.Panel };
+                n.Row = row;
+                row.MouseEnter += (s, e) => { row.Hovered = true; row.Invalidate(); };
+                row.MouseLeave += (s, e) => { row.Hovered = false; row.Invalidate(); };
+                row.MouseClick += (s, e) =>
+                {
+                    if (n.IsSection && e.X < S(22)) { SetExpanded(n, !n.Expanded); return; }   // chevron zone → toggle only
+                    if (n.IsSection && !n.Expanded) SetExpanded(n, true);
+                    content.ScrollControlIntoView(n.Anchor);
+                    SyncActiveNow();
+                };
+                row.Paint += (s, e) =>
+                {
+                    var g = e.Graphics;
+                    bool isActive = n == active;
+                    bool isAncestor = n.IsSection && active != null && active.Parent == n;
+                    Color bg = isActive ? Color.FromArgb(46, 24, 26) : row.Hovered ? Color.FromArgb(36, 36, 42) : Theme.Panel;
+                    using (var b = new SolidBrush(bg)) g.FillRectangle(b, row.ClientRectangle);
+                    if (isActive) using (var b = new SolidBrush(Theme.Accent)) g.FillRectangle(b, 0, 0, S(3), row.Height);
+                    int textX;
+                    if (n.IsSection)
+                    {
+                        g.SmoothingMode = SmoothingMode.AntiAlias;
+                        int cx = S(11), cy = row.Height / 2;
+                        var tri = n.Expanded
+                            ? new[] { new Point(cx - S(4), cy - S(2)), new Point(cx + S(4), cy - S(2)), new Point(cx, cy + S(3)) }
+                            : new[] { new Point(cx - S(2), cy - S(4)), new Point(cx - S(2), cy + S(4)), new Point(cx + S(3), cy) };
+                        using (var cb = new SolidBrush(isActive || isAncestor ? Theme.Text : Color.FromArgb(150, 150, 158))) g.FillPolygon(cb, tri);
+                        g.SmoothingMode = SmoothingMode.Default;
+                        textX = S(26);
+                    }
+                    else
+                    {
+                        using (var p = new Pen(Color.FromArgb(72, 72, 80))) g.DrawLine(p, S(28), row.Height / 2, S(33), row.Height / 2);
+                        textX = S(40);
+                    }
+                    var col = isActive ? Theme.Text : isAncestor ? Color.FromArgb(214, 214, 220) : n.IsSection ? Color.FromArgb(190, 190, 198) : Color.FromArgb(150, 150, 158);
+                    var font = n.IsSection ? Theme.F(10f, FontStyle.Bold) : Theme.F(9f);
+                    TextRenderer.DrawText(g, n.Title, font, new Rectangle(textX, 0, row.Width - textX - S(6), row.Height), col,
+                        TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+                };
+                return row;
+            }
+            void BuildToc()
+            {
+                tocFlow.SuspendLayout();
+                tocFlow.Controls.Clear();
+                tocFlow.Controls.Add(new Label { Text = "CONTENTS", AutoSize = true, ForeColor = Theme.Dim, Font = Theme.F(8f, FontStyle.Bold), Margin = new Padding(S(4), 0, 0, S(8)) });
+                int rowW = tocFlow.ClientSize.Width > S(40) ? tocFlow.ClientSize.Width - S(18) : S(194);
+                foreach (var n in nodes)
+                {
+                    var row = MakeRow(n, rowW);
+                    if (!n.IsSection) row.Visible = n.Parent == null || n.Parent.Expanded;
+                    tocFlow.Controls.Add(row);
+                }
+                tocFlow.ResumeLayout(true);
+            }
+
+            BuildToc();
+            if (nodes.Count > 0) { active = nodes[0]; nodes[0].Row?.Invalidate(); }
+            var scrollTimer = new System.Windows.Forms.Timer { Interval = 200 };   // active-follows-scroll (cheap; only runs while the Codex tab is open)
+            scrollTimer.Tick += (s, e) => SyncActiveNow();
+            content.VisibleChanged += (s, e) => { if (content.Visible) { scrollTimer.Start(); BeginInvoke(new Action(SyncActiveNow)); } else scrollTimer.Stop(); };
+            host.Disposed += (s, e) => scrollTimer.Dispose();
 
             body.Controls.Add(content); body.Controls.Add(toc);
             host.Controls.Add(body); host.Controls.Add(top);
