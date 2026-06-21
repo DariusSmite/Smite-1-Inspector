@@ -535,6 +535,7 @@ namespace SmiteGodLab
         public string Name { get; set; } = "";
         public string Id { get; set; } = "";
         public int Portal { get; set; }
+        public string Note { get; set; } = "";   // Friend List: free-text comment shown in the preview panel
     }
 
     // A user-assigned nickname for a privacy-hidden player, keyed by the fingerprint the privacy flag leaves
@@ -559,6 +560,7 @@ namespace SmiteGodLab
     {
         public int StartupTab { get; set; }   // 0 = God Inspector, 1 = Player Tracker
         public int TimeFormat { get; set; }   // 0 = system default, 1 = 12-hour, 2 = 24-hour
+        public bool ShowFriendUptime { get; set; }   // Friend List: show how long online friends have been logged in
     }
 
     // Flat checkbox: white square box with a black check mark when ticked (sharp, on-theme).
@@ -950,7 +952,7 @@ namespace SmiteGodLab
         Button openBtn, rescanBtn, applyBtn, reloadBtn, restoreBtn, addBtn, inspectBtn;
         Button[] navBtns;                            // left rail: 0 God Inspector, 1 Player Tracker, 2 Friend List, 3 Settings (tracker Track/Saved/Favorites/Friends are sub-tabs inside the view)
         int navIdx;
-        Panel settingsHost, friendListHost;          // Settings tab / Friend List tab content
+        Panel settingsHost, friendListHost, codexHost;   // Settings / Friend List / Codex tab content
         Action _flShow;                              // entering the Friend List tab: seed once, else resume the live poller
         Action _flPause;                             // leaving the Friend List tab: pause the live poller
         Button friendAddBtn;                         // ＋ add-current-player-to-Friend-List toggle (tracker)
@@ -1112,6 +1114,9 @@ namespace SmiteGodLab
             friendListHost.Dock = DockStyle.Fill; friendListHost.Visible = false;
             settingsHost = BuildSettingsPanel();
             settingsHost.Dock = DockStyle.Fill; settingsHost.Visible = false;
+            codexHost = BuildCodexPanel();
+            codexHost.Dock = DockStyle.Fill; codexHost.Visible = false;
+            bodyHost.Controls.Add(codexHost);
             bodyHost.Controls.Add(settingsHost);
             bodyHost.Controls.Add(friendListHost);
             bodyHost.Controls.Add(trackerHost);
@@ -1129,9 +1134,10 @@ namespace SmiteGodLab
             brandWrap.Controls.Add(new Label { Text = "SMITE 1", AutoSize = true, ForeColor = Theme.Text, Font = Theme.F(15f, FontStyle.Bold), Location = new Point(S(16), S(14)) });
             brandWrap.Controls.Add(new Label { Text = "INSPECTOR", AutoSize = true, ForeColor = Theme.Accent, Font = Theme.F(11f, FontStyle.Bold), Location = new Point(S(16), S(40)) });
             var navFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, BackColor = Theme.Panel, Padding = new Padding(S(8), S(4), S(8), S(8)) };
-            // 0 God Inspector, 1 Player Tracker, 2 Friend List, 3 Settings (the tracker's Track/Saved/Favorites/Friends are sub-tabs inside the view)
-            navBtns = new[] { MkNav("God Inspector"), MkNav("Player Tracker"), MkNav("Friend List"), MkNav("Settings") };
-            foreach (var b in navBtns) navFlow.Controls.Add(b);
+            // navBtns indexed by MODE: 0 God Inspector, 1 Player Tracker, 2 Friend List, 3 Settings, 4 Codex.
+            // Shown in a custom order: Player Tracker on top, then Friend List, then God Inspector, then Codex, then Settings.
+            navBtns = new[] { MkNav("God Inspector"), MkNav("Player Tracker"), MkNav("Friend List"), MkNav("Settings"), MkNav("Codex") };
+            foreach (var k in new[] { 1, 2, 0, 4, 3 }) navFlow.Controls.Add(navBtns[k]);
             for (int i = 0; i < navBtns.Length; i++) { int k = i; navBtns[i].Click += (s, e) => SelectNav(k); }
             sideRail.Controls.Add(navFlow); sideRail.Controls.Add(brandWrap); sideRail.Controls.Add(railLine);
 
@@ -1163,6 +1169,7 @@ namespace SmiteGodLab
             if (idx == 0) { SwitchMode(0); return; }
             if (idx == 2) { SwitchMode(2); _flShow?.Invoke(); return; }
             if (idx == 3) { SwitchMode(3); return; }
+            if (idx == 4) { SwitchMode(4); return; }
             bool wasTracker = curMode == 1;
             SwitchMode(1);
             if (!wasTracker) _trkSubTab?.Invoke(0);   // entering the tracker → default to the Track sub-tab
@@ -1173,11 +1180,12 @@ namespace SmiteGodLab
         {
             curMode = mode;
             if (mode != 2) _flPause?.Invoke();   // stop the Friend List live poller whenever another tab is showing (zero FL calls while hidden)
-            bool insp = mode == 0, trk = mode == 1, fl = mode == 2, set = mode == 3;
+            bool insp = mode == 0, trk = mode == 1, fl = mode == 2, set = mode == 3, cod = mode == 4;
             split.Visible = insp;
             trackerHost.Visible = trk;
             if (friendListHost != null) friendListHost.Visible = fl;
             if (settingsHost != null) settingsHost.Visible = set;
+            if (codexHost != null) codexHost.Visible = cod;
             bottomBar.Visible = insp;
             try { root.RowStyles[3].Height = insp ? S(48) : 0; } catch { }   // bottom bar (inspector only)
             try { root.RowStyles[0].Height = insp ? S(54) : 0; } catch { }   // top toolbar (inspector only)
@@ -2224,6 +2232,49 @@ namespace SmiteGodLab
         RadioButton MkRadio(string text, int x, int y) =>
             new RadioButton { Text = text, Location = new Point(x, y), AutoSize = true, ForeColor = Theme.Text, BackColor = Theme.Bg, Font = Theme.F(9.5f), Cursor = Cursors.Hand };
 
+        // In-depth reference for every feature + algorithm. Deliberately does NOT print the real daily API quota numbers.
+        Panel BuildCodexPanel()
+        {
+            var host = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg };
+            var top = new Panel { Dock = DockStyle.Top, Height = S(54), BackColor = Theme.Panel };
+            top.Controls.Add(new Label { Text = "Codex", AutoSize = true, ForeColor = Theme.Text, Font = Theme.F(13f, FontStyle.Bold), Location = new Point(S(16), S(9)) });
+            top.Controls.Add(new Label { Text = "How every feature and algorithm works, in depth.", AutoSize = true, ForeColor = Theme.Dim, Font = Theme.F(8.5f), Location = new Point(S(18), S(33)) });
+            var scroll = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg, AutoScroll = true, Padding = new Padding(S(22), S(12), S(22), S(24)) };
+            var flow = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, BackColor = Theme.Bg };
+            int wrap = S(760);
+            var bodyCol = Color.FromArgb(200, 200, 206);
+            void Add(string heading, string body)
+            {
+                flow.Controls.Add(new Label { Text = heading, AutoSize = true, ForeColor = Theme.Accent, Font = Theme.F(12.5f, FontStyle.Bold), Margin = new Padding(0, S(18), 0, S(5)) });
+                flow.Controls.Add(new Label { Text = body, AutoSize = true, MaximumSize = new Size(wrap, 0), ForeColor = bodyCol, Font = Theme.F(9.5f), Margin = new Padding(0, 0, 0, S(4)) });
+            }
+            Add("Smite 1 Inspector — overview",
+                "A single self-contained Windows app with two halves: a God Inspector that edits the game's god .ini tuning files offline, and a Player Tracker that pulls live stats from the official Hi-Rez SMITE 1 API. The left rail switches between Player Tracker, Friend List, God Inspector, this Codex, and Settings. Everything is offline-first except the tracker and friend features, which call the API only when you ask.");
+            Add("God Inspector",
+                "Point it at your SMITE config folder and it loads every god's .ini. Each tunable (ability scaling, cooldowns, costs and so on) becomes an editable row. You can change values, add new keys from the embedded UE3 SDK definition list, Apply (write back to the .ini), Reload, or Restore Defaults — on first load it snapshots the pristine value of every key per file, so a restore is always possible even after you have saved. Engine and system files are hidden unless you tick Show all entities. Ability icons and names come from a bundled media-kit asset pipeline.");
+            Add("Player Tracker — search and profile",
+                "Type a name and Search. Lookup first tries an EXACT getplayer match (case-insensitive); if that finds nothing it falls back to a prefix search and shows a disambiguation picker when several accounts match the same name. The profile card shows level, total mastery, region, platform, win/loss with win rate, worshippers, hours played, ranked tiers, account created and last login, and career achievements. The name row renders the in-game name beside a SMITE coin plus a platform coin (Steam, Xbox, Epic, Switch) and any linked accounts. A privacy-flagged profile is detected and labelled private rather than shown as a blank card.");
+            Add("Player Tracker — masteries, matches, achievements, queues",
+                "God Masteries lists every god you have played with rank, worshippers, KDA, win rate and minion kills. Recent Matches lists your latest games with god, queue, result, KDA, level, damage and gold. Achievements is a full grid of career stats — multi-kills, every spree type, objective kills and more. Double-click a mastery row for that god's per-queue breakdown; double-click a match for the full scoreboard, which colour-codes premade parties and shows each player's build.");
+            Add("Friends and live matches",
+                "The Friends sub-tab lists a tracked player's Hi-Rez friends, plus incoming and outgoing friend requests, decoded from the friend flags (the direction is relative to the viewed player). When a player is in a game their status chip becomes clickable and opens the in-progress scoreboard. A live match reveals the names of everyone in it except hard-private profiles — completed matches anonymize private players, so a live match is the only place their identity surfaces.");
+            Add("Hidden players and the nickname matcher",
+                "A privacy-flagged player hides their name and every id, but a match row still leaks their clan, account level, total mastery, the gods they played and their premade party-mates. You can give such a player a nickname, and the app re-recognizes them next time with a weighted fingerprint score: same clan is a strong anchor; two clanless players get a weaker anchor; account level and total mastery must stay close (they only ever grow); each shared NAMED party-mate is strong evidence; a previously-seen god adds a little. A score threshold decides a match, and with no shared party-mates the stats must stay inside a sane window or it is treated as a different person. Every confident sighting folds the new evidence back in — advancing level and mastery, accumulating companions and gods, and bumping a Seen counter — so recognition strengthens over time, and a confidence percentage summarizes how reliably a tag can be re-found. This is best-effort recognition of a player YOU named; it is never recovery of a hidden name from the API, which is not possible.");
+            Add("Friend List — the live status poller",
+                "Your curated buddy list with live status. Rather than re-scanning everyone on a fixed timer, it runs a continuous priority poller: every friend has its own next-check time driven by a tier. God-select refreshes fastest (a match is forming — the most actionable moment), then online or in a lobby, then in-game (they are committed for a while), then offline. Offline friends back off the longer they have been gone — about one extra minute per day idle, up to a ten-minute cap that holds for months, then stretching toward twenty minutes around a year — and they snap straight back to a fast rate the moment they appear online. Within a cycle the status checks run concurrently so a sweep finishes in roughly one round-trip, and a token-bucket limiter smooths the overall call rate so even a very large list never bursts.");
+            Add("Friend List — caching, display and notes",
+                "Leaving the tab pauses the poller and caches the list exactly as you left it; returning shows it instantly and resumes updates by priority (online first, then offline) instead of re-scanning. The slow getplayer call (name, avatar, last login) is cached and only refreshed when a friend crosses the online/offline line or every half hour. Sort by name, status or last seen. Offline rows show how long ago they were last online; toggle Show online time to also show how long currently-online friends have been logged in. Click a friend for a preview panel with their in-game avatar (or a coloured initial when they never set one), platform and status, an Open-profile button, a View-current-game button when they are in a match, and a Notes box for your own per-friend comments.");
+            Add("The Hi-Rez API",
+                "Stats come from the official SMITE 1 API. Each request is signed with an MD5 of the developer id, the method name, an auth key and a UTC timestamp; a session is created first and reused for its short lifetime, and responses come back as JSON arrays. Hi-Rez enforces a daily request limit and a session limit that the app must respect — the exact numbers are not shown here — so the friend poller is built to stay well within them: tiered cadences, the deep-idle backoff for long-offline friends, pausing entirely while its tab is hidden, caching the slow calls, and a self-throttle that eases off as the day's budget is approached. You can drop your own developer key into an api.txt file to use your own quota instead of the built-in one.");
+            Add("Limitations the API imposes",
+                "Two things the API cannot do, by design. It cannot reveal a privacy-flagged player's name or id from a completed match or a friends list — only a live, in-progress match exposes names, and even then not hard-private profiles. And it does not expose newer in-client avatars: it only knows an older avatar set, so many active players return no avatar at all (the app shows a coloured initial instead). Resolving linked-account names beyond the primary account is also not supported. These are server-side limits, not app bugs.");
+            Add("Your data and privacy",
+                "Everything you save — favorites, recent lookups, hidden-player tags, the friend list with its per-friend notes, your settings, and the god default snapshots — is stored as plain JSON in your Documents folder under Smite Inspector, so a shared copy of the app in a read-only location still works. Nothing is uploaded anywhere. The only network traffic is to the Hi-Rez API, and only for the stats you explicitly request.");
+            scroll.Controls.Add(flow);
+            host.Controls.Add(scroll); host.Controls.Add(top);
+            return host;
+        }
+
         Panel BuildSettingsPanel()
         {
             var host = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg, AutoScroll = true, Padding = new Padding(S(30), S(24), S(30), S(24)) };
@@ -2319,6 +2370,7 @@ namespace SmiteGodLab
             void SetProgress(int done, int total) { progBox.Tag = done + "/" + total; progBox.Visible = true; progBox.Invalidate(); }
             top.Controls.Add(title); top.Controls.Add(refresh); top.Controls.Add(sortLbl); top.Controls.Add(progBox);
             foreach (var b in sortBtns) top.Controls.Add(b);
+            var upChk = MkChk("Online time", settings.ShowFriendUptime); upChk.Location = new Point(S(660), S(18)); top.Controls.Add(upChk);   // handler wired below (after flRows/RowExtra exist)
             void StyleSort() { for (int i = 0; i < sortBtns.Length; i++) { bool on = i == flSort; sortBtns[i].ForeColor = on ? Color.White : Theme.Dim; sortBtns[i].BackColor = on ? Theme.Accent : Theme.Input; sortBtns[i].FlatAppearance.BorderColor = on ? Theme.Accent : Theme.Line; } }
 
             var body = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg, Padding = new Padding(S(14), S(10), S(14), S(14)) };
@@ -2361,16 +2413,24 @@ namespace SmiteGodLab
             var dPrompt = new Label { Location = new Point(S(22), S(134)), AutoSize = true, Font = Theme.F(9.5f), ForeColor = Theme.Dim, BackColor = Theme.Panel, Text = "Open this player's full profile?" };
             var dOpen = MkBtn("Open profile  →", 156, false, Theme.Blue, Color.White); dOpen.Location = new Point(S(22), S(160));
             var dViewGame = MkBtn("● View current game", 184, false, Theme.Input, Theme.Green); dViewGame.Location = new Point(S(22), S(198));
+            var dNoteLbl = new Label { Location = new Point(S(22), S(246)), AutoSize = true, Font = Theme.F(9f, FontStyle.Bold), ForeColor = Theme.Dim, BackColor = Theme.Panel, Text = "NOTES" };
+            var dNote = new TextBox { Location = new Point(S(22), S(268)), Size = new Size(S(320), S(120)), Multiline = true, ScrollBars = ScrollBars.Vertical, BorderStyle = BorderStyle.FixedSingle, BackColor = Theme.Input, ForeColor = Theme.Text, Font = Theme.F(9.5f) };
             var dHint = new Label { Location = new Point(S(22), S(26)), AutoSize = true, Font = Theme.F(10f), ForeColor = Theme.Dim, BackColor = Theme.Panel, Text = "Click a friend to preview their profile." };
-            detail.Controls.Add(dAvatar); detail.Controls.Add(dName); detail.Controls.Add(dSub); detail.Controls.Add(dSeen); detail.Controls.Add(dPrompt); detail.Controls.Add(dOpen); detail.Controls.Add(dViewGame); detail.Controls.Add(dHint);
+            detail.Controls.Add(dAvatar); detail.Controls.Add(dName); detail.Controls.Add(dSub); detail.Controls.Add(dSeen); detail.Controls.Add(dPrompt); detail.Controls.Add(dOpen); detail.Controls.Add(dViewGame); detail.Controls.Add(dNoteLbl); detail.Controls.Add(dNote); detail.Controls.Add(dHint);
 
             string detailId = null;
-            void HideDetail() { detailId = null; dImg = null; dAvatar.Visible = dName.Visible = dSub.Visible = dSeen.Visible = dPrompt.Visible = dOpen.Visible = dViewGame.Visible = false; dHint.Visible = true; }
+            string noteId = null;   // the friend whose note is currently in dNote (so we can flush it on switch/leave)
+            void FlushNote() { if (noteId != null) { var fe = friendList.FirstOrDefault(f => f.Id == noteId); if (fe != null && (fe.Note ?? "") != dNote.Text) { fe.Note = dNote.Text; SaveFriendList(); } } }
+            dNote.Leave += (s, e) => FlushNote();
+            void HideDetail() { FlushNote(); noteId = null; detailId = null; dImg = null; dAvatar.Visible = dName.Visible = dSub.Visible = dSeen.Visible = dPrompt.Visible = dOpen.Visible = dViewGame.Visible = dNoteLbl.Visible = dNote.Visible = false; dHint.Visible = true; }
             async void ShowDetail(PlayerRow r)   // async void → wrap the whole body so a stray throw can't crash the message loop
             {
                 try
                 {
+                    FlushNote();   // save the previously-shown friend's note before switching
                     detailId = r.Id;
+                    noteId = r.Id;
+                    dNote.Text = friendList.FirstOrDefault(f => f.Id == r.Id)?.Note ?? "";
                     dName.Text = r.Name;
                     // monogram fallback: first letter/digit of the name on a stable name-derived colour
                     var nm0 = r.Name ?? "";
@@ -2388,7 +2448,7 @@ namespace SmiteGodLab
                     dViewGame.ForeColor = inGame ? Theme.Green : Color.FromArgb(95, 95, 95);
                     dViewGame.Text = inGame ? "● View current game" : "Not in a game";
                     dHint.Visible = false;
-                    dAvatar.Visible = dName.Visible = dSub.Visible = dSeen.Visible = dPrompt.Visible = dOpen.Visible = dViewGame.Visible = true;
+                    dAvatar.Visible = dName.Visible = dSub.Visible = dSeen.Visible = dPrompt.Visible = dOpen.Visible = dViewGame.Visible = dNoteLbl.Visible = dNote.Visible = true;
                     dImg = null; dAvatar.Invalidate();
                     var img = await LoadAvatar(r.Avatar);
                     if (detailId == r.Id) { dImg = img; dAvatar.Invalidate(); }   // ignore if the user clicked a different friend meanwhile
@@ -2435,6 +2495,22 @@ namespace SmiteGodLab
                 double d = r.LastLogin == DateTime.MinValue ? 0 : (DateTime.Now - r.LastLogin).TotalDays;
                 double mins = d <= 180 ? Math.Max(1, Math.Min(10, d)) : d <= 365 ? 10 + (d - 180) / 185.0 * 10 : 20;
                 return (int)Math.Round(mins * 60);
+            }
+            // Compact session-uptime for an online friend ("how long logged in"): now − their last login.
+            string UptimeShort(TimeSpan t)
+            {
+                if (t.TotalMinutes < 1) return "just on";
+                if (t.TotalHours < 1) return (int)t.TotalMinutes + "m on";
+                if (t.TotalDays < 1) return (int)t.TotalHours + "h on";
+                return (int)t.TotalDays + "d on";
+            }
+            // The right-aligned secondary text for a row: offline → "last seen" age; online → session uptime (only if enabled).
+            string RowExtra(PlayerRow r)
+            {
+                if (r.Header || r.LastLogin == DateTime.MinValue) return "";
+                if (r.StatusSort == 2) return RelTime(r.LastLogin);                                          // offline
+                if (r.StatusSort <= 1 && settings.ShowFriendUptime) return UptimeShort(DateTime.Now - r.LastLogin);   // online
+                return "";
             }
             // Compact "freshness" string for the status hint so it's obvious the list is live + when it last checked.
             string AgoShort(DateTime when)
@@ -2518,7 +2594,7 @@ namespace SmiteGodLab
                             int code = await PullStatus(row);
                             row.ErrBackoff = 0;
                             if (fetchDetails) { if (await PullPlayer(row)) nameChanged = true; row.NextDetailUtc = DateTime.UtcNow.AddMinutes(30); }
-                            row.Extra = code == 0 ? RelTime(row.LastLogin) : "";   // show "last seen" only for offline friends
+                            row.Extra = RowExtra(row);   // offline → last-seen; online → uptime (if enabled)
                         }
                         catch { row.ErrBackoff++; row.Tier = 4; if (string.IsNullOrEmpty(row.Status) || row.Status == "…") { row.Status = "?"; row.StatusCol = Theme.Dim; } }
                         finally { sem.Release(); }
@@ -2573,8 +2649,7 @@ namespace SmiteGodLab
                     flTokens = Math.Min(effRate, flTokens + (add > 0 ? add : 0));
                     // free local refresh of the "last seen" text — costs no API call. Gate on rows that already show one
                     // (Extra non-empty ⇒ currently offline, or errored while offline) so we never paint it on online/in-game rows.
-                    foreach (var r in flRows) if (!r.Header && !string.IsNullOrEmpty(r.Extra) && r.LastLogin != DateTime.MinValue)
-                    { var ex = RelTime(r.LastLogin); if (ex != r.Extra) { r.Extra = ex; flist.UpdateRow(r); } }
+                    foreach (var r in flRows) if (!r.Header) { var ex = RowExtra(r); if (ex != r.Extra) { r.Extra = ex; flist.UpdateRow(r); } }
                     ReconcileRows();
                     SetFlHint();   // refresh "updated Xs ago" every tick so the freshness is never stale — even on a no-op tick
                     // FlTickBudget caps calls per tick; flTokens is the per-minute cap. Pick the most-overdue rows up to budget.
@@ -2601,7 +2676,7 @@ namespace SmiteGodLab
                                     bool boundary = (oldSort <= 1) != (row.StatusSort <= 1);   // crossed the online/offline line
                                     if (fetchDetails && flTokens >= 1 && (boundary || now >= row.NextDetailUtc))
                                     { flTokens -= 1; if (await PullPlayer(row)) nameDirty = true; row.NextDetailUtc = DateTime.UtcNow.AddMinutes(30); }
-                                    row.Extra = code == 0 ? RelTime(row.LastLogin) : "";
+                                    row.Extra = RowExtra(row);
                                     flLastPoll = DateTime.Now;
                                 }
                                 catch { row.ErrBackoff++; row.Tier = 4; if (string.IsNullOrEmpty(row.Status) || row.Status == "…") { row.Status = "?"; row.StatusCol = Theme.Dim; } }
@@ -2641,6 +2716,7 @@ namespace SmiteGodLab
 
             for (int i = 0; i < sortBtns.Length; i++) { int k = i; sortBtns[i].Click += (s, e) => { flSort = k; StyleSort(); ApplySort(); }; }
             StyleSort();
+            upChk.CheckedChanged += (s, e) => { settings.ShowFriendUptime = upChk.Checked; SaveSettings(); foreach (var r in flRows) if (!r.Header) r.Extra = RowExtra(r); flist.Invalidate(); };
             flist.Activated += ShowDetail;   // click a friend → preview frame on the right (Open profile loads the tracker)
             void ConfirmDelete(PlayerRow r)
             {
@@ -2660,7 +2736,7 @@ namespace SmiteGodLab
             refresh.Click += async (s, e) => await RefreshFriendList();
             _flShow = FlOnShow;
             _flPause = () => flPoll.Stop();
-            this.FormClosed += (s, e) => { flPoll.Stop(); flPoll.Dispose(); };
+            this.FormClosed += (s, e) => { FlushNote(); flPoll.Stop(); flPoll.Dispose(); };
             return host;
         }
 
@@ -3656,7 +3732,7 @@ namespace SmiteGodLab
             {
                 if (!File.Exists(SettingsFile)) return;
                 var s = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsFile));
-                if (s != null) { settings.StartupTab = s.StartupTab; settings.TimeFormat = s.TimeFormat; }
+                if (s != null) { settings.StartupTab = s.StartupTab; settings.TimeFormat = s.TimeFormat; settings.ShowFriendUptime = s.ShowFriendUptime; }
             }
             catch { }
         }
