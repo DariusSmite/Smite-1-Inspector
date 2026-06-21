@@ -1,0 +1,80 @@
+name: Release
+
+# Cuts a GitHub Release automatically:
+#  - push a tag like v0.2.0      ->  git tag v0.2.0 && git push origin v0.2.0
+#  - or run this workflow manually (Actions tab -> Release -> Run workflow) and type the version.
+# It builds the portable exe, generates patch notes from the commits since the previous tag,
+# and attaches SmiteInspector.exe to the release.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to release, e.g. v0.2.0 (created if it does not exist)'
+        required: true
+
+permissions:
+  contents: write   # required to create releases and push the tag on manual runs
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so patch notes can diff against the previous tag
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.version }}"
+            if ! echo "$TAG" | grep -qE '^v[0-9]'; then
+              echo "Version must look like v1.2.3"; exit 1
+            fi
+            git tag "$TAG"
+            git push origin "$TAG"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish single-file exe
+        shell: bash
+        run: |
+          VERSION="${{ steps.tag.outputs.tag }}"; VERSION="${VERSION#v}"
+          dotnet publish -c Release -r win-x64 --self-contained true \
+            -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true \
+            -p:Version="$VERSION" -o publish
+
+      - name: Build patch notes from commits
+        shell: bash
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          PREV=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)
+          if [ -n "$PREV" ]; then
+            echo "### Changes since $PREV" > notes.md
+            echo "" >> notes.md
+            git log --no-merges --pretty=format:'- %s' "$PREV..$TAG" >> notes.md
+          else
+            echo "### Initial release" > notes.md
+            echo "" >> notes.md
+            git log --no-merges --pretty=format:'- %s' "$TAG" >> notes.md
+          fi
+          printf '\n\n**Download:** `SmiteInspector.exe` below — portable, self-contained (no .NET install needed).\n' >> notes.md
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            "publish/SmiteInspector.exe" \
+            --title "Smite 1 Inspector ${{ steps.tag.outputs.tag }}" \
+            --notes-file notes.md
