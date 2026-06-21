@@ -2524,7 +2524,9 @@ namespace SmiteGodLab
                     // hand off to the live poller: every row is due now (the bucket spreads them out) and gets its tier cadence
                     flSeeded = true;
                     var seedNow = DateTime.UtcNow;
-                    foreach (var r in flRows) { r.NextDueUtc = seedNow; if (r.NextDetailUtc == DateTime.MinValue) r.NextDetailUtc = seedNow.AddMinutes(30); }
+                    // every row was just polled by this pass — schedule the next check per tier cadence (not immediately,
+                    // which would re-scan the whole list a second time right after the seed).
+                    foreach (var r in flRows) { r.NextDueUtc = seedNow.AddSeconds(TierInterval(r.Tier) + Jitter(TierInterval(r.Tier))); if (r.NextDetailUtc == DateTime.MinValue) r.NextDetailUtc = seedNow.AddMinutes(30); }
                     if (curMode == 2 && !flPoll.Enabled) flPoll.Start();
                 }
                 catch (Exception ex) { hint.ForeColor = Theme.AccentHi; hint.Text = "Status check failed: " + ex.Message; }
@@ -2618,6 +2620,13 @@ namespace SmiteGodLab
                 if (!flSeeded) { _ = RefreshFriendList(); return; }   // first visit: full pass seeds rows + starts the poller
                 ReconcileRows();                                     // catch adds/removes that happened while the tab was hidden
                 if (friendList.Count == 0) { hint.ForeColor = Theme.Dim; hint.Text = "No friends yet — add players from the Player Tracker (＋ Friend List)."; return; }
+                // Don't re-poll everyone just because their due-time lapsed while the tab was hidden — that bursts the whole
+                // list at once (looks like a full rescan). Restart each row's priority clock from NOW so updates trickle in
+                // per tier cadence; brand-new rows (NextDueUtc == MinValue, just reconciled in) stay due immediately.
+                var resumeNow = DateTime.UtcNow;
+                foreach (var r in flRows) if (!r.Header && r.NextDueUtc != DateTime.MinValue)
+                    r.NextDueUtc = resumeNow.AddSeconds(TierInterval(r.Tier) + Jitter(TierInterval(r.Tier)));
+                SetFlHint();   // show the genuine "updated Xs ago" for the cached data until the poller refreshes it
                 if (!flPoll.Enabled) flPoll.Start();
             }
 
