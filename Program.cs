@@ -1000,6 +1000,12 @@ namespace SmiteGodLab
         [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
         static extern int SetWindowTheme(IntPtr hWnd, string app, string idList);
 
+        [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
+        struct RECT { public int Left, Top, Right, Bottom; }
+        // True physical client width of the form. Managed ClientSize inflates on child controls (and the form) at this
+        // app's mixed DPI, so layout math that needs real pixels must read it from Win32 GetClientRect on the top-level form.
+        int PhysicalClientWidth() { return GetClientRect(Handle, out var r) ? r.Right - r.Left : ClientSize.Width; }
+
         public MainForm()
         {
             try { using (var g = CreateGraphics()) scale = g.DpiX / 96f; } catch { scale = 1f; }
@@ -2482,9 +2488,21 @@ namespace SmiteGodLab
 
             BuildToc();
             if (nodes.Count > 0) { active = nodes[0]; nodes[0].Row?.Invalidate(); }
+            // Center the reading column in the wide content area (with a comfortable minimum gutter off the sidebar),
+            // so the text isn't crammed against the TOC and the empty space is balanced left/right.
+            void CenterContent()
+            {
+                // Win32 physical width — managed ClientSize inflates at this app's mixed DPI, even on the form.
+                int avail = PhysicalClientWidth() - S(190) - S(213);   // content area = form client minus the rail and the TOC
+                int gut = System.Math.Max(S(24), (avail - wrap) / 2);
+                gut = System.Math.Min(gut, System.Math.Max(S(24), avail - wrap - S(16)));   // never push the column off the right edge
+                if (content.Padding.Left != gut) content.Padding = new Padding(gut, S(14), S(16), S(30));
+            }
+            content.SizeChanged += (s, e) => CenterContent();
+            CenterContent();
             var scrollTimer = new System.Windows.Forms.Timer { Interval = 200 };   // active-follows-scroll (cheap; only runs while the Codex tab is open)
             scrollTimer.Tick += (s, e) => SyncActiveNow();
-            content.VisibleChanged += (s, e) => { if (content.Visible) { scrollTimer.Start(); BeginInvoke(new Action(SyncActiveNow)); } else scrollTimer.Stop(); };
+            content.VisibleChanged += (s, e) => { if (content.Visible) { CenterContent(); scrollTimer.Start(); BeginInvoke(new Action(SyncActiveNow)); } else scrollTimer.Stop(); };
             host.Disposed += (s, e) => scrollTimer.Dispose();
 
             body.Controls.Add(content); body.Controls.Add(toc);
