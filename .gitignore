@@ -1,0 +1,18 @@
+# Build output
+bin/
+obj/
+
+# Hi-Rez SMITE Partner Program media kit (~9.4 GB, copyrighted — local working reference only)
+For use/
+
+# Dev scratch: ad-hoc capture/test scripts, screenshots, sandbox data, and the API
+# contract test (which embeds plaintext credentials). Not for distribution.
+_work/
+
+# Local API credential override ("devId,authKey") — never commit a real key
+api.txt
+
+# IDE / misc
+.vs/
+*.user
+*.suo

@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AssemblyName>SmiteGodLab</AssemblyName>
+    <RootNamespace>SmiteGodLab</RootNamespace>
+    <Version>0.1.0</Version>
+    <Product>SMITE God Lab</Product>
+    <!-- Publish hints; the build.bat passes these on the command line too. -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+  </PropertyGroup>
+
+  <!-- God->ability mapping + SDK-derived section/slot/type data travel inside the exe. -->
+  <ItemGroup>
+    <EmbeddedResource Include="data\abilities.json" />
+    <EmbeddedResource Include="data\sdkdata.json" />
+    <EmbeddedResource Include="data\sdkinspect.json" />
+  </ItemGroup>
+
+  <!-- Precharged icons (downscaled) embedded in the exe: gicon.<base>.jpg portraits, aicon.<slug>.jpg abilities. -->
+  <ItemGroup>
+    <EmbeddedResource Include="icons\*.jpg">
+      <LogicalName>gicon.%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="icons\abilities\*.jpg">
+      <LogicalName>aicon.%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+    <!-- Full-roster god icons: icons\godlist\<norm>.jpg -> gx.<norm>.jpg (tracker lists + scoreboard). -->
+    <EmbeddedResource Include="icons\godlist\*.jpg">
+      <LogicalName>gx.%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+    <!-- Item icons: icons\items\<norm>.jpg -> itm.<norm>.jpg (match scoreboard builds). -->
+    <EmbeddedResource Include="icons\items\*.jpg">
+      <LogicalName>itm.%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+    <!-- Platform / game logos for the profile name row: assets\logos\<key>.* -> logo.<key>.<ext>. -->
+    <EmbeddedResource Include="assets\logos\*.jpg">
+      <LogicalName>logo.%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="assets\logos\*.png">
+      <LogicalName>logo.%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+</Project>

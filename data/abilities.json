@@ -1,0 +1,1325 @@
+{
+ "Anubis": [
+  {
+   "slot": "P",
+   "name": "Sorrow",
+   "slug": "sorrow"
+  },
+  {
+   "slot": "1",
+   "name": "Plague of Locusts",
+   "slug": "plague-of-locusts"
+  },
+  {
+   "slot": "2",
+   "name": "Mummify",
+   "slug": "mummify"
+  },
+  {
+   "slot": "3",
+   "name": "Grasping Hands",
+   "slug": "grasping-hands"
+  },
+  {
+   "slot": "4",
+   "name": "Death Gaze",
+   "slug": "death-gaze"
+  }
+ ],
+ "Arachne": [
+  {
+   "slot": "P",
+   "name": "Predator",
+   "slug": "predator"
+  },
+  {
+   "slot": "1",
+   "name": "Venomous Bite",
+   "slug": "venomous-bite"
+  },
+  {
+   "slot": "2",
+   "name": "Cocoon",
+   "slug": "cocoon"
+  },
+  {
+   "slot": "3",
+   "name": "Web",
+   "slug": "web"
+  },
+  {
+   "slot": "4",
+   "name": "Night Crawler",
+   "slug": "night-crawler"
+  }
+ ],
+ "Artemis": [
+  {
+   "slot": "P",
+   "name": "Still Target",
+   "slug": "still-target"
+  },
+  {
+   "slot": "1",
+   "name": "Transgressor's Fate",
+   "slug": "transgressors-fate"
+  },
+  {
+   "slot": "2",
+   "name": "Vengeful Assault",
+   "slug": "vengeful-assault"
+  },
+  {
+   "slot": "3",
+   "name": "Suppress the Insolent",
+   "slug": "suppress-the-insolent"
+  },
+  {
+   "slot": "4",
+   "name": "Calydonian Boar",
+   "slug": "calydonian-boar"
+  }
+ ],
+ "Atlas": [
+  {
+   "slot": "P",
+   "name": "The Astrolabe",
+   "slug": "the-astrolabe"
+  },
+  {
+   "slot": "1",
+   "name": "Unburden",
+   "slug": "unburden"
+  },
+  {
+   "slot": "2",
+   "name": "Gravity Pull",
+   "slug": "gravity-pull"
+  },
+  {
+   "slot": "3",
+   "name": "Kinetic Charge",
+   "slug": "kinetic-charge"
+  },
+  {
+   "slot": "4",
+   "name": "Gamma-Ray Burst",
+   "slug": "gamma-ray-burst"
+  }
+ ],
+ "Bakasura": [
+  {
+   "slot": "P",
+   "name": "Insatiable Hunger",
+   "slug": "insatiable-hunger"
+  },
+  {
+   "slot": "1",
+   "name": "Take Down",
+   "slug": "take-down"
+  },
+  {
+   "slot": "2",
+   "name": "Eat Minion",
+   "slug": "eat-minion"
+  },
+  {
+   "slot": "3",
+   "name": "Butcher Blades",
+   "slug": "butcher-blades"
+  },
+  {
+   "slot": "4",
+   "name": "Regurgitate",
+   "slug": "regurgitate"
+  }
+ ],
+ "BakeKujira": [
+  {
+   "slot": "P",
+   "name": "Curse of the Whale",
+   "slug": "curse-of-the-whale"
+  },
+  {
+   "slot": "1",
+   "name": "Rough Waters",
+   "slug": "rough-waters"
+  },
+  {
+   "slot": "2",
+   "name": "Sonic Wave",
+   "slug": "sonic-wave"
+  },
+  {
+   "slot": "3",
+   "name": "Twisting Dive",
+   "slug": "twisting-dive"
+  },
+  {
+   "slot": "4",
+   "name": "King of the Eastern Seas",
+   "slug": "king-of-the-eastern-seas"
+  }
+ ],
+ "Bastet": [
+  {
+   "slot": "P",
+   "name": "Nine Lives",
+   "slug": "nine-lives"
+  },
+  {
+   "slot": "1",
+   "name": "Pounce",
+   "slug": "pounce"
+  },
+  {
+   "slot": "2",
+   "name": "Razor Whip",
+   "slug": "razor-whip"
+  },
+  {
+   "slot": "3",
+   "name": "Ensnaring Claw",
+   "slug": "ensnaring-claw"
+  },
+  {
+   "slot": "4",
+   "name": "Cat Call",
+   "slug": "cat-call"
+  }
+ ],
+ "ChangE": [
+  {
+   "slot": "P",
+   "name": "Jade Rabbit",
+   "slug": "jade-rabbit"
+  },
+  {
+   "slot": "1",
+   "name": "Crescent Moon Dance",
+   "slug": "crescent-moon-dance"
+  },
+  {
+   "slot": "2",
+   "name": "Moonlit Waltz",
+   "slug": "moonlit-waltz"
+  },
+  {
+   "slot": "3",
+   "name": "Moonflower Dance",
+   "slug": "moonflower-dance"
+  },
+  {
+   "slot": "4",
+   "name": "Waxing Moon",
+   "slug": "waxing-moon"
+  }
+ ],
+ "Charon": [
+  {
+   "slot": "P",
+   "name": "Ferryman of Souls",
+   "slug": "ferryman-of-souls"
+  },
+  {
+   "slot": "1",
+   "name": "Spectral Surge",
+   "slug": "spectral-surge"
+  },
+  {
+   "slot": "2",
+   "name": "Damnation",
+   "slug": "damnation"
+  },
+  {
+   "slot": "3",
+   "name": "Swift Voyage",
+   "slug": "swift-voyage"
+  },
+  {
+   "slot": "4",
+   "name": "Summon Styx",
+   "slug": "summon-styx"
+  }
+ ],
+ "Charybdis": [
+  {
+   "slot": "P",
+   "name": "Raging Tides",
+   "slug": "raging-tides"
+  },
+  {
+   "slot": "1",
+   "name": "Spike Shot",
+   "slug": "spike-shot"
+  },
+  {
+   "slot": "2",
+   "name": "Capsize",
+   "slug": "capsize"
+  },
+  {
+   "slot": "3",
+   "name": "Whirlpool Form",
+   "slug": "whirlpool"
+  },
+  {
+   "slot": "4",
+   "name": "The Maw Hungers",
+   "slug": "the-maw-hungers"
+  }
+ ],
+ "Chernobog": [
+  {
+   "slot": "P",
+   "name": "Heart of Cold",
+   "slug": "heart-of-cold"
+  },
+  {
+   "slot": "1",
+   "name": "Crystallized Curses",
+   "slug": "crystallized-curses"
+  },
+  {
+   "slot": "2",
+   "name": "Vicious Barrage",
+   "slug": "vicious-barrage"
+  },
+  {
+   "slot": "3",
+   "name": "Into Darkness",
+   "slug": "into-darkness"
+  },
+  {
+   "slot": "4",
+   "name": "Living Nightmare",
+   "slug": "living-nightmare"
+  }
+ ],
+ "Cliodhna": [
+  {
+   "slot": "P",
+   "name": "Phantasmal",
+   "slug": "phantasmal"
+  },
+  {
+   "slot": "1",
+   "name": "Banshee's Wail",
+   "slug": "banshees-wail"
+  },
+  {
+   "slot": "2",
+   "name": "Flickering Visions",
+   "slug": "flickering-visions"
+  },
+  {
+   "slot": "3",
+   "name": "Lurching Claw",
+   "slug": "lurching-claw"
+  },
+  {
+   "slot": "4",
+   "name": "Tearing the Veil",
+   "slug": "tearing-the-veil"
+  }
+ ],
+ "Danzaburou": [
+  {
+   "slot": "P",
+   "name": "Dubious Savings",
+   "slug": "dubious-savings"
+  },
+  {
+   "slot": "1",
+   "name": "Fool's Gold",
+   "slug": "fools-gold"
+  },
+  {
+   "slot": "2",
+   "name": "Alluring Spirits",
+   "slug": "alluring-spirits"
+  },
+  {
+   "slot": "3",
+   "name": "Tanuki Trickery",
+   "slug": "tanuki-trickery"
+  },
+  {
+   "slot": "4",
+   "name": "Uproarious Rocket",
+   "slug": "uproarious-rocket"
+  }
+ ],
+ "ErlangShen": [
+  {
+   "slot": "P",
+   "name": "Howling Celestial Dog",
+   "slug": "howling-celestial-dog"
+  },
+  {
+   "slot": "1",
+   "name": "Spot Weakness",
+   "slug": "spot-weakness"
+  },
+  {
+   "slot": "2",
+   "name": "Pin",
+   "slug": "pin"
+  },
+  {
+   "slot": "3",
+   "name": "72 Transformations",
+   "slug": "72-transformations-erlang"
+  },
+  {
+   "slot": "4",
+   "name": "9 Turns Blessing",
+   "slug": "9-turns-blessing"
+  }
+ ],
+ "Fafnir": [
+  {
+   "slot": "P",
+   "name": "Endless Greed",
+   "slug": "endless-greed"
+  },
+  {
+   "slot": "1",
+   "name": "Cursed Strength",
+   "slug": "cursed-strength"
+  },
+  {
+   "slot": "2",
+   "name": "Coerce",
+   "slug": "coerce"
+  },
+  {
+   "slot": "3",
+   "name": "Underhanded Tactics",
+   "slug": "underhanded-tactics"
+  },
+  {
+   "slot": "4",
+   "name": "Dragonic Corruption",
+   "slug": "draconic-corruption"
+  }
+ ],
+ "Gilgamesh": [
+  {
+   "slot": "P",
+   "name": "Epic of Gilgamesh",
+   "slug": "epic-of-gilgamesh"
+  },
+  {
+   "slot": "1",
+   "name": "Sun-Forged Scimitar",
+   "slug": "sun-forged-scimitar"
+  },
+  {
+   "slot": "2",
+   "name": "Drop Kick",
+   "slug": "drop-kick"
+  },
+  {
+   "slot": "3",
+   "name": "Hero's Advance",
+   "slug": "heros-advance"
+  },
+  {
+   "slot": "4",
+   "name": "Winds of Shamash",
+   "slug": "winds-of-shamash"
+  }
+ ],
+ "Hades": [
+  {
+   "slot": "P",
+   "name": "Blight",
+   "slug": "blight"
+  },
+  {
+   "slot": "1",
+   "name": "Death From Below",
+   "slug": "death-from-below"
+  },
+  {
+   "slot": "2",
+   "name": "Shroud of Darkness",
+   "slug": "shroud-of-darkness"
+  },
+  {
+   "slot": "3",
+   "name": "Devour Souls",
+   "slug": "devour-souls"
+  },
+  {
+   "slot": "4",
+   "name": "Pillar of Agony",
+   "slug": "pillar-of-agony"
+  }
+ ],
+ "Hera": [
+  {
+   "slot": "P",
+   "name": "Commanding Presence",
+   "slug": "commanding-presence"
+  },
+  {
+   "slot": "1",
+   "name": "Royal Assault",
+   "slug": "royal-assault"
+  },
+  {
+   "slot": "2",
+   "name": "Polymorph",
+   "slug": "polymorph"
+  },
+  {
+   "slot": "3",
+   "name": "Divine Shroud",
+   "slug": "divine-shroud"
+  },
+  {
+   "slot": "4",
+   "name": "Argus, the Defender",
+   "slug": "argus-the-defender"
+  }
+ ],
+ "Ishtar": [
+  {
+   "slot": "P",
+   "name": "Mark of Vengeance",
+   "slug": "mark-of-vengeance"
+  },
+  {
+   "slot": "1",
+   "name": "Imbue Arrows",
+   "slug": "imbue-arrows"
+  },
+  {
+   "slot": "2",
+   "name": "Rolling Thunder",
+   "slug": "rolling-thunder"
+  },
+  {
+   "slot": "3",
+   "name": "Jolt",
+   "slug": "jolt"
+  },
+  {
+   "slot": "4",
+   "name": "Blades of Retribution",
+   "slug": "blades-of-retribution"
+  }
+ ],
+ "IxChel": [
+  {
+   "slot": "P",
+   "name": "Rainbow Weaver",
+   "slug": "rainbow-weaver"
+  },
+  {
+   "slot": "1",
+   "name": "Gleaming Blast",
+   "slug": "gleaming-blast"
+  },
+  {
+   "slot": "2",
+   "name": "Lunar Invocation",
+   "slug": "lunar-invocation"
+  },
+  {
+   "slot": "3",
+   "name": "Rainbow Crash",
+   "slug": "rainbow-crash"
+  },
+  {
+   "slot": "4",
+   "name": "Great End",
+   "slug": "great-end"
+  }
+ ],
+ "Izanami": [
+  {
+   "slot": "P",
+   "name": "Death Draws Nigh",
+   "slug": "death-draws-nigh"
+  },
+  {
+   "slot": "1",
+   "name": "Sickle Storm",
+   "slug": "sickle-storm"
+  },
+  {
+   "slot": "2",
+   "name": "Spectral Projection",
+   "slug": "spectral-projection"
+  },
+  {
+   "slot": "3",
+   "name": "Fade Away",
+   "slug": "fade-away"
+  },
+  {
+   "slot": "4",
+   "name": "Dark Portal",
+   "slug": "dark-portal"
+  }
+ ],
+ "Jormungandr": [
+  {
+   "slot": "P",
+   "name": "Immovable",
+   "slug": "immovable"
+  },
+  {
+   "slot": "1",
+   "name": "Venomous Haze",
+   "slug": "venomous-haze"
+  },
+  {
+   "slot": "2",
+   "name": "Consuming Bellow",
+   "slug": "consuming-bellow"
+  },
+  {
+   "slot": "3",
+   "name": "Submerge",
+   "slug": "submerge"
+  },
+  {
+   "slot": "4",
+   "name": "The World Serpent",
+   "slug": "the-world-serpent"
+  }
+ ],
+ "KingArthur": [
+  {
+   "slot": "P",
+   "name": "Steadfast",
+   "slug": "steadfast"
+  },
+  {
+   "slot": "1",
+   "name": "Overhead Slash",
+   "slug": "overhead-slash"
+  },
+  {
+   "slot": "2",
+   "name": "Battle Stomp",
+   "slug": "battle-stomp"
+  },
+  {
+   "slot": "3",
+   "name": "Twin Cleave",
+   "slug": "twin-cleave"
+  },
+  {
+   "slot": "4",
+   "name": "Excalibur's Wrath",
+   "slug": "excaliburs-wrath"
+  }
+ ],
+ "Kuzenbo": [
+  {
+   "slot": "P",
+   "name": "Water Bowl",
+   "slug": "water-bowl"
+  },
+  {
+   "slot": "1",
+   "name": "NeNe Kappa",
+   "slug": "nene-kappa"
+  },
+  {
+   "slot": "2",
+   "name": "Shell Spikes",
+   "slug": "shell-spikes"
+  },
+  {
+   "slot": "3",
+   "name": "Sumo Slam",
+   "slug": "sumo-slam"
+  },
+  {
+   "slot": "4",
+   "name": "Watery Grave",
+   "slug": "watery-grave"
+  }
+ ],
+ "Lancelot": [
+  {
+   "slot": "P",
+   "name": "Camelot's Quest",
+   "slug": "camelots-quest"
+  },
+  {
+   "slot": "1",
+   "name": "Piercing Thrust",
+   "slug": "piercing-thrust"
+  },
+  {
+   "slot": "2",
+   "name": "Skilled Strikes",
+   "slug": "skilled-strikes"
+  },
+  {
+   "slot": "3",
+   "name": "Mount Up",
+   "slug": "mount-up"
+  },
+  {
+   "slot": "4",
+   "name": "The Grand Joust",
+   "slug": "the-grand-joust"
+  }
+ ],
+ "MamanBrigitte": [
+  {
+   "slot": "P",
+   "name": "Soul Spikes",
+   "slug": "soul-spikes"
+  },
+  {
+   "slot": "1",
+   "name": "Party Trick",
+   "slug": "party-trick"
+  },
+  {
+   "slot": "2",
+   "name": "Madame Fangs",
+   "slug": "madame-fangs"
+  },
+  {
+   "slot": "3",
+   "name": "Spirit Seize",
+   "slug": "spirit-seize"
+  },
+  {
+   "slot": "4",
+   "name": "Explosion of Souls",
+   "slug": "explosion-of-souls"
+  }
+ ],
+ "Martichoras": [
+  {
+   "slot": "P",
+   "name": "Monstrosity",
+   "slug": "monstrosity"
+  },
+  {
+   "slot": "1",
+   "name": "Acid Rain",
+   "slug": "acid-rain"
+  },
+  {
+   "slot": "2",
+   "name": "Poisoned Barb",
+   "slug": "poisoned-barb"
+  },
+  {
+   "slot": "3",
+   "name": "Stalk Prey",
+   "slug": "stalk-prey"
+  },
+  {
+   "slot": "4",
+   "name": "Death From Above",
+   "slug": "death-from-above"
+  }
+ ],
+ "Maui": [
+  {
+   "slot": "P",
+   "name": "Manaiakalani",
+   "slug": "manaiakalani"
+  },
+  {
+   "slot": "1",
+   "name": "Master Fisherman",
+   "slug": "master-fisherman"
+  },
+  {
+   "slot": "2",
+   "name": "Mystical Ulua",
+   "slug": "mystical-ulua"
+  },
+  {
+   "slot": "3",
+   "name": "Solar Swing",
+   "slug": "solar-swing"
+  },
+  {
+   "slot": "4",
+   "name": "Landfall",
+   "slug": "landfall"
+  }
+ ],
+ "Medusa": [
+  {
+   "slot": "P",
+   "name": "Sidewinder",
+   "slug": "sidewinder"
+  },
+  {
+   "slot": "1",
+   "name": "Viper Shot",
+   "slug": "viper-shot"
+  },
+  {
+   "slot": "2",
+   "name": "Acid Spray",
+   "slug": "acid-spray"
+  },
+  {
+   "slot": "3",
+   "name": "Lacerate",
+   "slug": "lacerate"
+  },
+  {
+   "slot": "4",
+   "name": "Petrify",
+   "slug": "petrify"
+  }
+ ],
+ "MorganLeFay": [
+  {
+   "slot": "P",
+   "name": "Empowered Blade",
+   "slug": "empowered-blade"
+  },
+  {
+   "slot": "1",
+   "name": "Sigil Mastery",
+   "slug": "sigil-mastery"
+  },
+  {
+   "slot": "2",
+   "name": "Dragonflight",
+   "slug": "dragonflight"
+  },
+  {
+   "slot": "3",
+   "name": "Shroud of Wildfire",
+   "slug": "shroud-of-wildfire"
+  },
+  {
+   "slot": "4",
+   "name": "Consuming Power",
+   "slug": "consuming-power"
+  }
+ ],
+ "Mulan": [
+  {
+   "slot": "P",
+   "name": "Training Arc",
+   "slug": "training-arc"
+  },
+  {
+   "slot": "1",
+   "name": "Cross Strike",
+   "slug": "cross-strike"
+  },
+  {
+   "slot": "2",
+   "name": "Spear Thrust",
+   "slug": "spear-thrust"
+  },
+  {
+   "slot": "3",
+   "name": "Grapple",
+   "slug": "grapple"
+  },
+  {
+   "slot": "4",
+   "name": "Divine Mastery",
+   "slug": "divine-mastery"
+  }
+ ],
+ "NutGod": [
+  {
+   "slot": "P",
+   "name": "Flux",
+   "slug": "flux"
+  },
+  {
+   "slot": "1",
+   "name": "Convergence",
+   "slug": "convergence"
+  },
+  {
+   "slot": "2",
+   "name": "Crashing Comet",
+   "slug": "crashing-comet"
+  },
+  {
+   "slot": "3",
+   "name": "Warp",
+   "slug": "warp"
+  },
+  {
+   "slot": "4",
+   "name": "Skyfall",
+   "slug": "skyfall"
+  }
+ ],
+ "Olorun": [
+  {
+   "slot": "P",
+   "name": "Touch of Fate",
+   "slug": "touch-of-fate"
+  },
+  {
+   "slot": "1",
+   "name": "Focused Light",
+   "slug": "focused-light"
+  },
+  {
+   "slot": "2",
+   "name": "Overflowing Divinity",
+   "slug": "overflowing-divinity"
+  },
+  {
+   "slot": "3",
+   "name": "Consecration",
+   "slug": "consecration"
+  },
+  {
+   "slot": "4",
+   "name": "Sanctified Field",
+   "slug": "sanctified-field"
+  }
+ ],
+ "Pele": [
+  {
+   "slot": "P",
+   "name": "Everlasting Flame",
+   "slug": "everlasting-flame"
+  },
+  {
+   "slot": "1",
+   "name": "Pyroclast",
+   "slug": "pyroclast"
+  },
+  {
+   "slot": "2",
+   "name": "Magma Rush",
+   "slug": "magma-rush"
+  },
+  {
+   "slot": "3",
+   "name": "Eruption",
+   "slug": "eruption"
+  },
+  {
+   "slot": "4",
+   "name": "Volcanic Lightning",
+   "slug": "volcanic-lightning"
+  }
+ ],
+ "Set": [
+  {
+   "slot": "P",
+   "name": "Relentless",
+   "slug": "relentless"
+  },
+  {
+   "slot": "1",
+   "name": "Skewer",
+   "slug": "skewer"
+  },
+  {
+   "slot": "2",
+   "name": "Spawn of Set",
+   "slug": "spawn-of-set"
+  },
+  {
+   "slot": "3",
+   "name": "Sandstorm",
+   "slug": "sandstorm"
+  },
+  {
+   "slot": "4",
+   "name": "Kingslayer",
+   "slug": "kingslayer"
+  }
+ ],
+ "Shiva": [
+  {
+   "slot": "P",
+   "name": "Samsara",
+   "slug": "samsara"
+  },
+  {
+   "slot": "1",
+   "name": "Emblazoned Sweep",
+   "slug": "emblazoned-sweep"
+  },
+  {
+   "slot": "2",
+   "name": "Damaru's Tempo",
+   "slug": "damarus-tempo"
+  },
+  {
+   "slot": "3",
+   "name": "Pillar of Dawn",
+   "slug": "pillar-of-dawn"
+  },
+  {
+   "slot": "4",
+   "name": "Shiva Tandava",
+   "slug": "shiva-tandava"
+  }
+ ],
+ "Skadi": [
+  {
+   "slot": "P",
+   "name": "Kaldr, the Winter Wolf",
+   "slug": "kaldr-the-winter-wolf"
+  },
+  {
+   "slot": "1",
+   "name": "Piercing Cold",
+   "slug": "piercing-cold"
+  },
+  {
+   "slot": "2",
+   "name": "Rune of the Hunt",
+   "slug": "rune-of-the-hunt"
+  },
+  {
+   "slot": "3",
+   "name": "Permafrost",
+   "slug": "permafrost"
+  },
+  {
+   "slot": "4",
+   "name": "Winter's Grasp",
+   "slug": "winters-grasp"
+  }
+ ],
+ "Surtr": [
+  {
+   "slot": "P",
+   "name": "Obsidian Flesh",
+   "slug": "obsidian-flesh"
+  },
+  {
+   "slot": "1",
+   "name": "Flames of Muspell",
+   "slug": "flames-of-muspell"
+  },
+  {
+   "slot": "2",
+   "name": "Giant's Grasp",
+   "slug": "giants-grasp"
+  },
+  {
+   "slot": "3",
+   "name": "Emberwalk",
+   "slug": "emberwalk"
+  },
+  {
+   "slot": "4",
+   "name": "End of Days",
+   "slug": "end-of-days"
+  }
+ ],
+ "Sylvanus": [
+  {
+   "slot": "P",
+   "name": "Nature's Protection",
+   "slug": "natures-protection"
+  },
+  {
+   "slot": "1",
+   "name": "Verdant Growth",
+   "slug": "verdant-growth"
+  },
+  {
+   "slot": "2",
+   "name": "Wisps",
+   "slug": "wisps"
+  },
+  {
+   "slot": "3",
+   "name": "Nature's Grasp",
+   "slug": "natures-grasp"
+  },
+  {
+   "slot": "4",
+   "name": "Wrath of Terra",
+   "slug": "wrath-of-terra"
+  }
+ ],
+ "TheMorrigan": [
+  {
+   "slot": "P",
+   "name": "Doomsayer",
+   "slug": "doomsayer"
+  },
+  {
+   "slot": "1",
+   "name": "Deadly Aspects",
+   "slug": "deadly-aspects"
+  },
+  {
+   "slot": "2",
+   "name": "Dark Omen",
+   "slug": "dark-omen"
+  },
+  {
+   "slot": "3",
+   "name": "Confusion",
+   "slug": "confusion"
+  },
+  {
+   "slot": "4",
+   "name": "Changeling",
+   "slug": "changeling"
+  }
+ ],
+ "Tiamat": [
+  {
+   "slot": "P",
+   "name": "Death Begets Life",
+   "slug": "death-begets-life"
+  },
+  {
+   "slot": "1",
+   "name": "Primordial Onslaught",
+   "slug": "primordial-onslaught"
+  },
+  {
+   "slot": "2",
+   "name": "Ruination",
+   "slug": "ruination"
+  },
+  {
+   "slot": "3",
+   "name": "Grounding Dive",
+   "slug": "grounding-dive"
+  },
+  {
+   "slot": "4",
+   "name": "Children of Creation",
+   "slug": "children-of-creation"
+  }
+ ],
+ "Tsukuyomi": [
+  {
+   "slot": "P",
+   "name": "Shingetsu & Mangetsu",
+   "slug": "shingetsu-&-mangetsu"
+  },
+  {
+   "slot": "1",
+   "name": "Dark Moon Shuriken",
+   "slug": "dark-moon-shuriken"
+  },
+  {
+   "slot": "2",
+   "name": "Kusarigama",
+   "slug": "kusarigama"
+  },
+  {
+   "slot": "3",
+   "name": "Silver Moon Caltrops",
+   "slug": "silver-moon-caltrops"
+  },
+  {
+   "slot": "4",
+   "name": "Piercing Moonlight",
+   "slug": "piercing-moonlight"
+  }
+ ],
+ "Vulcan": [
+  {
+   "slot": "P",
+   "name": "Master Craftsman",
+   "slug": "master-craftsman"
+  },
+  {
+   "slot": "1",
+   "name": "Backfire",
+   "slug": "backfire"
+  },
+  {
+   "slot": "2",
+   "name": "Inferno Cannon",
+   "slug": "inferno-cannon"
+  },
+  {
+   "slot": "3",
+   "name": "Magma Bomb",
+   "slug": "magma-bomb"
+  },
+  {
+   "slot": "4",
+   "name": "Earthshaker",
+   "slug": "earthshaker"
+  }
+ ],
+ "Xbalanque": [
+  {
+   "slot": "P",
+   "name": "Dead of Night",
+   "slug": "dead-of-night"
+  },
+  {
+   "slot": "1",
+   "name": "Branching Bola",
+   "slug": "branching-bola"
+  },
+  {
+   "slot": "2",
+   "name": "Poison Darts",
+   "slug": "poison-darts"
+  },
+  {
+   "slot": "3",
+   "name": "Rising Jaguar",
+   "slug": "rising-jaguar"
+  },
+  {
+   "slot": "4",
+   "name": "Darkest of Nights",
+   "slug": "darkest-of-nights"
+  }
+ ],
+ "YuHuang": [
+  {
+   "slot": "P",
+   "name": "Master of the Dao",
+   "slug": "master-of-the-dao"
+  },
+  {
+   "slot": "1",
+   "name": "Flames of the Phoenix",
+   "slug": "flames-of-the-phoenix"
+  },
+  {
+   "slot": "2",
+   "name": "Dao Cultivation",
+   "slug": "dao-cultivation"
+  },
+  {
+   "slot": "3",
+   "name": "Celestial Flight",
+   "slug": "celestial-flight"
+  },
+  {
+   "slot": "4",
+   "name": "Dueling Dragons",
+   "slug": "dueling-dragons"
+  }
+ ],
+ "aphrodite": [
+  {
+   "slot": "P",
+   "name": "Center of Attention",
+   "slug": "center-of-attention"
+  },
+  {
+   "slot": "1",
+   "name": "Kiss",
+   "slug": "kiss"
+  },
+  {
+   "slot": "2",
+   "name": "Back Off!",
+   "slug": "back-off!"
+  },
+  {
+   "slot": "3",
+   "name": "Love Birds",
+   "slug": "love-birds"
+  },
+  {
+   "slot": "4",
+   "name": "Undying Love",
+   "slug": "undying-love"
+  }
+ ],
+ "fenrir": [
+  {
+   "slot": "P",
+   "name": "Unbound Runes",
+   "slug": "unbound-runes"
+  },
+  {
+   "slot": "1",
+   "name": "Unchained",
+   "slug": "unchained"
+  },
+  {
+   "slot": "2",
+   "name": "Seething Howl",
+   "slug": "seething-howl"
+  },
+  {
+   "slot": "3",
+   "name": "Brutalize",
+   "slug": "brutalize"
+  },
+  {
+   "slot": "4",
+   "name": "Ragnarok",
+   "slug": "ragnarok"
+  }
+ ],
+ "nuwa": [
+  {
+   "slot": "P",
+   "name": "Strength of Wood",
+   "slug": "strength-of-wood"
+  },
+  {
+   "slot": "1",
+   "name": "Mysterious Fog",
+   "slug": "mysterious-fog"
+  },
+  {
+   "slot": "2",
+   "name": "Clay Soldiers",
+   "slug": "clay-soldiers"
+  },
+  {
+   "slot": "3",
+   "name": "Shining Metal",
+   "slug": "shining-metal"
+  },
+  {
+   "slot": "4",
+   "name": "Fire Shards",
+   "slug": "fire-shards"
+  }
+ ],
+ "ratatoskr": [
+  {
+   "slot": "P",
+   "name": "Acorn of Yggdrasil",
+   "slug": "acorn-of-yggdrasil"
+  },
+  {
+   "slot": "1",
+   "name": "Dart",
+   "slug": "dart"
+  },
+  {
+   "slot": "2",
+   "name": "Flurry of Acorns",
+   "slug": "flurry"
+  },
+  {
+   "slot": "3",
+   "name": "Acorn Blast",
+   "slug": "acorn-blast"
+  },
+  {
+   "slot": "4",
+   "name": "Through the Cosmos",
+   "slug": "through-the-cosmos"
+  }
+ ]
+}
