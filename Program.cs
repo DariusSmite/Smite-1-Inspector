@@ -2331,6 +2331,9 @@ namespace SmiteGodLab
             // Right-side preview "frame": clicking a friend shows their in-game icon + status here with an Open-profile prompt.
             var detail = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Panel };
             Image dImg = null;
+            // Monogram fallback for players with no in-game avatar (Avatar_URL empty) — their initial on a name-derived tile.
+            string dMono = ""; Color dMonoCol = Theme.Input;
+            var dMonoPalette = new[] { Color.FromArgb(64, 88, 120), Color.FromArgb(112, 72, 92), Color.FromArgb(66, 108, 92), Color.FromArgb(120, 98, 58), Color.FromArgb(92, 80, 124), Color.FromArgb(58, 102, 112) };
             var dAvatar = new Panel { Location = new Point(S(22), S(22)), Size = new Size(S(96), S(96)), BackColor = Theme.Panel };
             dAvatar.Paint += (s, e) =>
             {
@@ -2344,7 +2347,12 @@ namespace SmiteGodLab
                 path.AddArc(rc.X, rc.Bottom - rad, rad, rad, 90, 90);
                 path.CloseFigure();
                 if (dImg != null) { gg.SetClip(path); gg.DrawImage(dImg, rc); gg.ResetClip(); }
-                else { using var bb = new SolidBrush(Theme.Input); gg.FillPath(bb, path); }
+                else
+                {
+                    using (var bb = new SolidBrush(dMonoCol)) gg.FillPath(bb, path);   // no avatar → colored monogram tile
+                    if (!string.IsNullOrEmpty(dMono))
+                        TextRenderer.DrawText(gg, dMono, Theme.F(32f, FontStyle.Bold), new Rectangle(0, 0, dAvatar.Width, dAvatar.Height), Color.FromArgb(235, 235, 235), TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                }
                 using var pen = new Pen(Theme.Line); gg.DrawPath(pen, path);
             };
             var dName = new Label { Location = new Point(S(132), S(26)), AutoSize = true, Font = Theme.F(14f, FontStyle.Bold), ForeColor = Theme.Text, BackColor = Theme.Panel };
@@ -2364,6 +2372,12 @@ namespace SmiteGodLab
                 {
                     detailId = r.Id;
                     dName.Text = r.Name;
+                    // monogram fallback: first letter/digit of the name on a stable name-derived colour
+                    var nm0 = r.Name ?? "";
+                    char mc = nm0.FirstOrDefault(ch => char.IsLetterOrDigit(ch));
+                    dMono = mc == '\0' ? "?" : char.ToUpperInvariant(mc).ToString();
+                    int hsh = 0; foreach (var ch in nm0) hsh = hsh * 31 + ch;
+                    dMonoCol = dMonoPalette[(hsh & 0x7fffffff) % dMonoPalette.Length];
                     var (pc, _) = PlatformChip(r.Portal);
                     dSub.Text = pc + "    ·    " + (string.IsNullOrEmpty(r.Status) || r.Status == "…" ? "—" : r.Status);
                     dSub.ForeColor = r.StatusCol;
