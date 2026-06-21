@@ -2406,12 +2406,31 @@ namespace SmiteGodLab
             bool flTicking = false;    // re-entrancy guard: a tick's awaits can outlast the 2s interval
             double flTokens = 0;       // token bucket: smooths + caps the call rate regardless of roster size
             DateTime flLastFill = DateTime.UtcNow;
+            DateTime flLastPoll = DateTime.MinValue;   // wall-clock of the most recent successful status poll (drives the "updated Xs ago" hint)
             const double FlCallsPerMin = 120;  // sustained ceiling on getplayerstatus calls/min while the tab is open
-            const int FlTickBudget = 12;       // max calls started per 2s tick (burst cap)
+            const int FlTickBudget = 16;       // max calls started per tick (burst cap; processed concurrently)
+            const int FlConcurrency = 12;      // concurrent getplayerstatus requests per tick (parallel = fast sweep, not one-at-a-time)
             var flRng = new Random();
             // tier cadences (seconds): 0 god-select · 1 online/lobby · 2 in-game · 3 offline · 4 unknown
             int TierInterval(int tier) => tier == 0 ? 10 : tier == 1 ? 15 : tier == 2 ? 20 : tier == 3 ? 60 : 90;
             int Jitter(int sec) => (int)((flRng.NextDouble() - 0.5) * 0.2 * sec);   // ±10% so rows don't all re-fire in lockstep
+            // Compact "freshness" string for the status hint so it's obvious the list is live + when it last checked.
+            string AgoShort(DateTime when)
+            {
+                if (when == DateTime.MinValue) return "checking…";
+                int s = (int)(DateTime.Now - when).TotalSeconds;
+                if (s < 4) return "just now";
+                if (s < 60) return s + "s ago";
+                if (s < 3600) return (s / 60) + "m ago";
+                return (s / 3600) + "h ago";
+            }
+            void SetFlHint()
+            {
+                if (IsDisposed || curMode != 2) return;
+                int online = flRows.Count(r => !r.Header && r.StatusSort <= 1);
+                hint.ForeColor = Theme.Dim;
+                hint.Text = friendList.Count + " friends · " + online + " online · updated " + AgoShort(flLastPoll);
+            }
             // Re-sort live as statuses arrive so the list stays ordered in real time. Coalesced via a single
             // pending post (a burst of completions triggers at most one re-sort per message-pump cycle), and a
             // no-op for A-Z (a status change can't affect alphabetical order).
@@ -2467,7 +2486,7 @@ namespace SmiteGodLab
                     hint.ForeColor = Theme.Dim; hint.Text = "Checking statuses…";
                     bool nameChanged = false;
                     bool fetchDetails = friendList.Count <= 100;   // getplayer per friend (name + last login); skip for huge lists to spare the rate limit
-                    using var sem = new SemaphoreSlim(5);
+                    using var sem = new SemaphoreSlim(FlConcurrency);
                     await Task.WhenAll(flRows.Select(async row =>
                     {
                         await sem.WaitAsync();
@@ -2486,8 +2505,8 @@ namespace SmiteGodLab
                     }));
                     if (nameChanged) SaveFriendList();
                     ApplySort();
-                    int online = flRows.Count(r => r.StatusSort <= 1);
-                    hint.ForeColor = Theme.Dim; hint.Text = friendList.Count + " friends · " + online + " online · updated " + FmtNow();
+                    flLastPoll = DateTime.Now;
+                    SetFlHint();
                     // hand off to the live poller: every row is due now (the bucket spreads them out) and gets its tier cadence
                     flSeeded = true;
                     var seedNow = DateTime.UtcNow;
@@ -2510,7 +2529,7 @@ namespace SmiteGodLab
             }
             // The continuous priority-tiered poller. Forms.Timer fires on the UI thread and awaits resume on it, so every
             // flRows/flist access here is lock-free. Each tick: refill the bucket, free-refresh offline "last seen",
-            // reconcile adds/removes, then spend tokens on the most-overdue rows (in-game refreshes fastest, offline slowest).
+            // reconcile adds/removes, then concurrently poll the most-overdue rows (god-select refreshes fastest, offline slowest).
             flPoll.Tick += async (s, e) =>
             {
                 if (curMode != 2 || IsDisposed) { flPoll.Stop(); return; }
@@ -2532,41 +2551,49 @@ namespace SmiteGodLab
                     foreach (var r in flRows) if (!r.Header && !string.IsNullOrEmpty(r.Extra) && r.LastLogin != DateTime.MinValue)
                     { var ex = RelTime(r.LastLogin); if (ex != r.Extra) { r.Extra = ex; flist.UpdateRow(r); } }
                     ReconcileRows();
-                    // FlTickBudget is a per-tick CALL cap (status + detail counted together); flTokens is the per-minute cap.
+                    SetFlHint();   // refresh "updated Xs ago" every tick so the freshness is never stale — even on a no-op tick
+                    // FlTickBudget caps calls per tick; flTokens is the per-minute cap. Pick the most-overdue rows up to budget.
                     int callsLeft = Math.Min(FlTickBudget, (int)Math.Floor(flTokens));
                     if (callsLeft <= 0) { if (usedToday >= 295000) { hint.ForeColor = Theme.Dim; hint.Text = "Daily API budget reached — live updates paused."; } return; }
                     bool fetchDetails = friendList.Count <= 100;
-                    var due = flRows.Where(r => !r.Header && !r.Polling && r.NextDueUtc <= now).OrderBy(r => r.NextDueUtc).ToList();
-                    if (due.Count == 0) return;
+                    var batch = flRows.Where(r => !r.Header && !r.Polling && r.NextDueUtc <= now).OrderBy(r => r.NextDueUtc).Take(callsLeft).ToList();
+                    if (batch.Count == 0) return;
                     bool nameDirty = false;
-                    foreach (var row in due)
-                    {
-                        if (callsLeft <= 0) break;                        // spent this tick's call budget; rest stay due for next tick
-                        if (flBusy || !flRows.Contains(row)) continue;   // a manual pass started, or the row was removed
-                        row.Polling = true; flTokens -= 1; callsLeft--;
-                        int oldSort = row.StatusSort;
-                        try
+                    // Poll the batch CONCURRENTLY (not one-at-a-time) so a sweep finishes in ~one round-trip, not N of them.
+                    using (var psem = new SemaphoreSlim(FlConcurrency))
+                        await Task.WhenAll(batch.Select(async row =>
                         {
-                            int code = await PullStatus(row);
-                            row.ErrBackoff = 0;
-                            bool boundary = (oldSort <= 1) != (row.StatusSort <= 1);   // crossed the online/offline line
-                            if (fetchDetails && callsLeft > 0 && (boundary || now >= row.NextDetailUtc))
-                            { flTokens -= 1; callsLeft--; if (await PullPlayer(row)) nameDirty = true; row.NextDetailUtc = DateTime.UtcNow.AddMinutes(30); }
-                            row.Extra = code == 0 ? RelTime(row.LastLogin) : "";
-                        }
-                        catch { row.ErrBackoff++; row.Tier = 4; if (string.IsNullOrEmpty(row.Status) || row.Status == "…") { row.Status = "?"; row.StatusCol = Theme.Dim; } }
-                        finally
-                        {
-                            row.Polling = false;
-                            int iv = TierInterval(row.Tier);
-                            if (row.ErrBackoff > 0) iv = (int)Math.Min(600, iv * Math.Pow(2, row.ErrBackoff));   // back off a flapping/dead id
-                            row.NextDueUtc = DateTime.UtcNow.AddSeconds(iv + Jitter(iv));
-                            if (curMode == 2 && !IsDisposed && flRows.Contains(row)) { flist.UpdateRow(row); LiveSort(); }
-                        }
-                    }
+                            await psem.WaitAsync();
+                            try
+                            {
+                                if (flBusy || !flRows.Contains(row)) return;   // a manual pass took over, or the row was removed
+                                row.Polling = true; flTokens -= 1;
+                                int oldSort = row.StatusSort;
+                                try
+                                {
+                                    int code = await PullStatus(row);
+                                    row.ErrBackoff = 0;
+                                    bool boundary = (oldSort <= 1) != (row.StatusSort <= 1);   // crossed the online/offline line
+                                    if (fetchDetails && flTokens >= 1 && (boundary || now >= row.NextDetailUtc))
+                                    { flTokens -= 1; if (await PullPlayer(row)) nameDirty = true; row.NextDetailUtc = DateTime.UtcNow.AddMinutes(30); }
+                                    row.Extra = code == 0 ? RelTime(row.LastLogin) : "";
+                                    flLastPoll = DateTime.Now;
+                                }
+                                catch { row.ErrBackoff++; row.Tier = 4; if (string.IsNullOrEmpty(row.Status) || row.Status == "…") { row.Status = "?"; row.StatusCol = Theme.Dim; } }
+                                finally
+                                {
+                                    row.Polling = false;
+                                    int iv = TierInterval(row.Tier);
+                                    if (row.ErrBackoff > 0) iv = (int)Math.Min(600, iv * Math.Pow(2, row.ErrBackoff));   // back off a flapping/dead id
+                                    row.NextDueUtc = DateTime.UtcNow.AddSeconds(iv + Jitter(iv));
+                                    if (curMode == 2 && !IsDisposed && flRows.Contains(row)) flist.UpdateRow(row);
+                                }
+                            }
+                            finally { psem.Release(); }
+                        }));
                     if (nameDirty) SaveFriendList();
-                    if (!IsDisposed && curMode == 2)
-                    { int online = flRows.Count(r => !r.Header && r.StatusSort <= 1); hint.ForeColor = Theme.Dim; hint.Text = friendList.Count + " friends · " + online + " online · live"; }
+                    LiveSort();
+                    SetFlHint();
                 }
                 catch { }   // async-void handler: never let a stray error crash the app — the next tick retries
                 finally { flTicking = false; }
