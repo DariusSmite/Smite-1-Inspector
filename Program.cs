@@ -624,7 +624,6 @@ namespace SmiteGodLab
         struct PAINTSTRUCT { public IntPtr hdc; public int fErase; public RECT rcPaint; public int fRestore; public int fIncUpdate; [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValArray, SizeConst = 32)] public byte[] rgbReserved; }
         [System.Runtime.InteropServices.DllImport("user32.dll")] static extern IntPtr BeginPaint(IntPtr hWnd, out PAINTSTRUCT ps);
         [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool EndPaint(IntPtr hWnd, ref PAINTSTRUCT ps);
-        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool InvalidateRect(IntPtr hWnd, IntPtr lpRect, bool bErase);
 
         public event Action<PlayerRow> Activated;
         public event Action<PlayerRow> Deleted;
@@ -694,8 +693,9 @@ namespace SmiteGodLab
 
             bool sel = index == SelectedIndex;
             bool hov = index == _hoverRow && !sel;   // whole-row hover highlight
-            Color bgc = sel ? Color.FromArgb(48, 48, 56) : hov ? Color.FromArgb(33, 33, 40) : Color.FromArgb(20, 20, 20);
+            Color bgc = sel ? Color.FromArgb(50, 50, 60) : hov ? Color.FromArgb(34, 34, 42) : Color.FromArgb(20, 20, 20);
             using (var bg = new SolidBrush(bgc)) g.FillRectangle(bg, bounds);
+            if (sel) using (var ab = new SolidBrush(Color.FromArgb(193, 30, 31))) g.FillRectangle(ab, bounds.Left, bounds.Top, Sc(3), bounds.Height);   // red accent bar = selected
             g.SmoothingMode = SmoothingMode.AntiAlias;
 
             if (_chip == null) _chip = new Font(Font.FontFamily, Math.Max(6f, Font.Size - 1.5f), FontStyle.Bold);
@@ -760,7 +760,8 @@ namespace SmiteGodLab
             if (i < 0 || i >= _rows.Count) { base.OnMouseDown(e); return; }
             var r = _rows[i];
             if (r.Header) { HeaderClicked?.Invoke(r); return; }   // toggle collapse
-            SelectedIndex = i;
+            SelectedIndex = i; _hoverRow = i;
+            Invalidate(); Update();   // show the selection immediately — don't wait for the next mouse-move
             if ((r.Deletable || r.Savable) && e.X >= ClientSize.Width - TrashW)   // action glyph at the right edge
             { if (r.Deletable) Deleted?.Invoke(r); else Saved?.Invoke(r); return; }
             base.OnMouseDown(e);
@@ -823,20 +824,21 @@ namespace SmiteGodLab
 
         protected override void WndProc(ref Message m)
         {
-            const int WM_ERASEBKGND = 0x0014, WM_PAINT = 0x000F;
+            const int WM_ERASEBKGND = 0x0014, WM_PAINT = 0x000F, WM_VSCROLL = 0x0115, WM_MOUSEWHEEL = 0x020A, WM_KEYDOWN = 0x0100;
             if (m.Msg == WM_ERASEBKGND) { m.Result = (IntPtr)1; return; }     // we paint the whole client in WM_PAINT
             if (m.Msg == WM_PAINT && PaintBuffered()) { m.Result = IntPtr.Zero; return; }
             base.WndProc(ref m);   // PaintBuffered returns false only if BeginPaint failed → let base validate (no repaint loop)
+            // The native ListBox scrolls by bit-blitting existing pixels and invalidating only the exposed strip; that
+            // WM_PAINT is low-priority and gets deferred while wheel/drag input keeps coming, so scrolling looks frozen
+            // until input stops. Force the exposed strip to paint NOW.
+            if (m.Msg == WM_VSCROLL || m.Msg == WM_MOUSEWHEEL || m.Msg == WM_KEYDOWN) Update();
         }
-        // Full double-buffered repaint: draw every visible row to an off-screen bitmap, then blit once. This is
-        // what kills the owner-draw flicker — a native OwnerDraw ListBox paints each item straight to the screen
-        // DC, so a live status re-sort visibly redraws row-by-row. We bypass that and own the paint.
+        // Double-buffered repaint: draw the visible rows to an off-screen bitmap, then blit (the DC is clipped to the
+        // update region, so a scroll only repaints the exposed strip from the buffer — the native bit-blit already
+        // shifted the rest correctly). This kills owner-draw flicker (a native OwnerDraw ListBox paints each item
+        // straight to the screen DC, so a live re-sort visibly redraws row-by-row).
         bool PaintBuffered()
         {
-            // Expand the update region to the WHOLE client first: a native ListBox scrolls by bit-blitting and only
-            // invalidates the newly-exposed strip, which would clip our full-buffer blit and leave torn/duplicated
-            // rows. Forcing a full-client region makes BeginPaint hand us an unclipped DC.
-            InvalidateRect(Handle, IntPtr.Zero, false);
             var hdc = BeginPaint(Handle, out var ps);
             if (hdc == IntPtr.Zero) return false;   // BeginPaint failed (GDI exhausted / dying window) — don't validate; let base try
             try
@@ -2285,7 +2287,16 @@ namespace SmiteGodLab
             // Status strip docked under the toolbar. A fixed right-aligned label on the toolbar lands off-screen at
             // high DPI (the bug fixed in the tracker), so the "N online · updated …" feedback gets its own strip here.
             var hint = new Label { Dock = DockStyle.Top, Height = S(22), TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(S(16), 0, S(14), 0), ForeColor = Theme.Dim, Font = Theme.F(8.5f), BackColor = Theme.Panel, Text = "Add players from the Player Tracker (＋ Friend List)." };
-            top.Controls.Add(title); top.Controls.Add(refresh); top.Controls.Add(sortLbl);
+            // Red-outlined progress box: shows "12/58" while statuses are being checked, hidden otherwise.
+            var progBox = new Panel { Location = new Point(S(576), S(12)), Size = new Size(S(78), S(30)), BackColor = Theme.Panel, Visible = false };
+            progBox.Paint += (s, e) =>
+            {
+                var gg = e.Graphics; gg.SmoothingMode = SmoothingMode.AntiAlias;
+                using (var pen = new Pen(Theme.Accent, S(2))) gg.DrawRectangle(pen, S(1), S(1), progBox.Width - S(3), progBox.Height - S(3));
+                TextRenderer.DrawText(gg, progBox.Tag as string ?? "", Theme.F(9.5f, FontStyle.Bold), progBox.ClientRectangle, Theme.Text, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+            };
+            void SetProgress(int done, int total) { progBox.Tag = done + "/" + total; progBox.Visible = true; progBox.Invalidate(); }
+            top.Controls.Add(title); top.Controls.Add(refresh); top.Controls.Add(sortLbl); top.Controls.Add(progBox);
             foreach (var b in sortBtns) top.Controls.Add(b);
             void StyleSort() { for (int i = 0; i < sortBtns.Length; i++) { bool on = i == flSort; sortBtns[i].ForeColor = on ? Color.White : Theme.Dim; sortBtns[i].BackColor = on ? Theme.Accent : Theme.Input; sortBtns[i].FlatAppearance.BorderColor = on ? Theme.Accent : Theme.Line; } }
 
@@ -2381,6 +2392,7 @@ namespace SmiteGodLab
                 try
                 {
                     flRows.Clear(); flRows.AddRange(friendList.Select(Row));
+                    int progDone = 0, progTotal = flRows.Count; SetProgress(0, progTotal);
                     ApplySort();
                     hint.ForeColor = Theme.Dim; hint.Text = "Checking statuses…";
                     bool nameChanged = false;
@@ -2418,6 +2430,7 @@ namespace SmiteGodLab
                         finally { sem.Release(); }
                         flist.UpdateRow(row);   // repaint just this row (no whole-list flash) …
                         LiveSort();             // … and re-order live as statuses land (throttled; A-Z is a no-op)
+                        progDone++; SetProgress(progDone, progTotal);   // "12/58" in the red box (continuation is on the UI thread)
                     }));
                     if (nameChanged) SaveFriendList();
                     ApplySort();
@@ -2425,7 +2438,7 @@ namespace SmiteGodLab
                     hint.ForeColor = Theme.Dim; hint.Text = friendList.Count + " friends · " + online + " online · updated " + FmtNow();
                 }
                 catch (Exception ex) { hint.ForeColor = Theme.AccentHi; hint.Text = "Status check failed: " + ex.Message; }
-                finally { flBusy = false; }
+                finally { flBusy = false; progBox.Visible = false; }
                 if (flAgain) { flAgain = false; await RefreshFriendList(); }   // pick up adds/removes that arrived during this pass
             }
 
