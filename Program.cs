@@ -619,7 +619,7 @@ namespace SmiteGodLab
         public int StatusSort = 9;                               // for Friend List status sort (0 = in game … higher = offline)
         public string Avatar = "";                               // in-game avatar/icon URL (getplayer Avatar_URL) for the preview panel
         // Friend List live-poller scheduling (runtime only — never serialized to friendlist.json):
-        public int Tier = 1;                                     // 0 in-game · 1 online/lobby/queue · 2 offline · 3 unknown/error (= StatusSort)
+        public int Tier = 1;                                     // refresh priority, fastest→slowest: 0 god-select · 1 online/lobby · 2 in-game · 3 offline · 4 unknown/error
         public DateTime NextDueUtc = DateTime.MinValue;          // when getplayerstatus is next eligible (MinValue = due now)
         public DateTime NextDetailUtc = DateTime.MinValue;       // when the slow getplayer (name/avatar/last-login) is next eligible
         public bool Polling;                                     // in-flight guard so a slow await spanning ticks can't double-schedule a row
@@ -2406,11 +2406,11 @@ namespace SmiteGodLab
             bool flTicking = false;    // re-entrancy guard: a tick's awaits can outlast the 2s interval
             double flTokens = 0;       // token bucket: smooths + caps the call rate regardless of roster size
             DateTime flLastFill = DateTime.UtcNow;
-            const double FlCallsPerMin = 40;   // sustained ceiling on getplayerstatus calls/min while the tab is open
-            const int FlTickBudget = 8;        // max calls started per 2s tick (burst cap)
+            const double FlCallsPerMin = 120;  // sustained ceiling on getplayerstatus calls/min while the tab is open
+            const int FlTickBudget = 12;       // max calls started per 2s tick (burst cap)
             var flRng = new Random();
-            // faster-than-snappy tier cadences (seconds): in-game / online / offline / unknown
-            int TierInterval(int tier) => tier == 0 ? 15 : tier == 1 ? 30 : tier == 2 ? 180 : 90;
+            // tier cadences (seconds): 0 god-select · 1 online/lobby · 2 in-game · 3 offline · 4 unknown
+            int TierInterval(int tier) => tier == 0 ? 10 : tier == 1 ? 15 : tier == 2 ? 20 : tier == 3 ? 60 : 90;
             int Jitter(int sec) => (int)((flRng.NextDouble() - 0.5) * 0.2 * sec);   // ±10% so rows don't all re-fire in lockstep
             // Re-sort live as statuses arrive so the list stays ordered in real time. Coalesced via a single
             // pending post (a burst of completions triggers at most one re-sort per message-pump cycle), and a
@@ -2431,8 +2431,9 @@ namespace SmiteGodLab
                     { var st = sdoc.RootElement[0]; code = GI(st, "status"); var (t, c) = StatusInfo(code, GS(st, "status_string")); row.Status = t; row.StatusCol = c; }
                     else { row.Status = "?"; row.StatusCol = Theme.Dim; }
                 }
-                row.StatusSort = code == 3 ? 0 : (code == 1 || code == 2 || code == 4) ? 1 : code == 0 ? 2 : 3;
-                row.Tier = row.StatusSort;
+                row.StatusSort = code == 3 ? 0 : (code == 1 || code == 2 || code == 4) ? 1 : code == 0 ? 2 : 3;   // drives the Status sort button
+                // refresh priority is separate: god-select (a match is forming) is the most time-sensitive, in-game the least (locked in)
+                row.Tier = code == 2 ? 0 : (code == 1 || code == 4) ? 1 : code == 3 ? 2 : code == 0 ? 3 : 4;
                 return code;
             }
             // Slow, rarely-changing details: name self-heal + last login + avatar. Returns true if the display name changed.
@@ -2477,7 +2478,7 @@ namespace SmiteGodLab
                             if (fetchDetails) { if (await PullPlayer(row)) nameChanged = true; row.NextDetailUtc = DateTime.UtcNow.AddMinutes(30); }
                             row.Extra = code == 0 ? RelTime(row.LastLogin) : "";   // show "last seen" only for offline friends
                         }
-                        catch { row.ErrBackoff++; row.Tier = 3; if (string.IsNullOrEmpty(row.Status) || row.Status == "…") { row.Status = "?"; row.StatusCol = Theme.Dim; } }
+                        catch { row.ErrBackoff++; row.Tier = 4; if (string.IsNullOrEmpty(row.Status) || row.Status == "…") { row.Status = "?"; row.StatusCol = Theme.Dim; } }
                         finally { sem.Release(); }
                         flist.UpdateRow(row);   // repaint just this row (no whole-list flash) …
                         LiveSort();             // … and re-order live as statuses land (throttled; A-Z is a no-op)
@@ -2526,8 +2527,9 @@ namespace SmiteGodLab
                     if (usedToday >= 295000) effRate = 0; else if (usedToday >= 270000) effRate = 2;
                     double add = (now - flLastFill).TotalMinutes * effRate; flLastFill = now;
                     flTokens = Math.Min(effRate, flTokens + (add > 0 ? add : 0));
-                    // free local refresh of offline "last seen" text — costs no API call (offline + errored-but-known rows)
-                    foreach (var r in flRows) if (!r.Header && r.Tier >= 2 && r.LastLogin != DateTime.MinValue)
+                    // free local refresh of the "last seen" text — costs no API call. Gate on rows that already show one
+                    // (Extra non-empty ⇒ currently offline, or errored while offline) so we never paint it on online/in-game rows.
+                    foreach (var r in flRows) if (!r.Header && !string.IsNullOrEmpty(r.Extra) && r.LastLogin != DateTime.MinValue)
                     { var ex = RelTime(r.LastLogin); if (ex != r.Extra) { r.Extra = ex; flist.UpdateRow(r); } }
                     ReconcileRows();
                     // FlTickBudget is a per-tick CALL cap (status + detail counted together); flTokens is the per-minute cap.
@@ -2552,7 +2554,7 @@ namespace SmiteGodLab
                             { flTokens -= 1; callsLeft--; if (await PullPlayer(row)) nameDirty = true; row.NextDetailUtc = DateTime.UtcNow.AddMinutes(30); }
                             row.Extra = code == 0 ? RelTime(row.LastLogin) : "";
                         }
-                        catch { row.ErrBackoff++; row.Tier = 3; if (string.IsNullOrEmpty(row.Status) || row.Status == "…") { row.Status = "?"; row.StatusCol = Theme.Dim; } }
+                        catch { row.ErrBackoff++; row.Tier = 4; if (string.IsNullOrEmpty(row.Status) || row.Status == "…") { row.Status = "?"; row.StatusCol = Theme.Dim; } }
                         finally
                         {
                             row.Polling = false;
