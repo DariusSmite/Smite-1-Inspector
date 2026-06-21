@@ -604,6 +604,7 @@ namespace SmiteGodLab
         public string Key = "";                                  // stable key for headers (collapse tracking)
         public DateTime LastLogin = DateTime.MinValue;           // for Friend List "last seen" sort
         public int StatusSort = 9;                               // for Friend List status sort (0 = in game … higher = offline)
+        public string Avatar = "";                               // in-game avatar/icon URL (getplayer Avatar_URL) for the preview panel
         public static PlayerRow Section(string caption, string key = "") => new PlayerRow { Header = true, Name = caption, Key = key };
     }
 
@@ -614,6 +615,17 @@ namespace SmiteGodLab
         readonly List<PlayerRow> _rows = new List<PlayerRow>();
         Font _glyph, _chip, _hdr;
         int _hoverAction = -1;   // index of the row whose action glyph (trash/☆) the cursor is over → highlight it
+        int _hoverRow = -1;      // index of the row the cursor is over (whole-row hover highlight)
+        Bitmap _buf;             // off-screen double-buffer (WM_PAINT) — kills owner-draw flicker on live re-sorts
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        struct RECT { public int Left, Top, Right, Bottom; }
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        struct PAINTSTRUCT { public IntPtr hdc; public int fErase; public RECT rcPaint; public int fRestore; public int fIncUpdate; [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValArray, SizeConst = 32)] public byte[] rgbReserved; }
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern IntPtr BeginPaint(IntPtr hWnd, out PAINTSTRUCT ps);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool EndPaint(IntPtr hWnd, ref PAINTSTRUCT ps);
+        [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool InvalidateRect(IntPtr hWnd, IntPtr lpRect, bool bErase);
+
         public event Action<PlayerRow> Activated;
         public event Action<PlayerRow> Deleted;
         public event Action<PlayerRow> Saved;          // ☆ clicked on a Savable row (add to favorites)
@@ -621,6 +633,8 @@ namespace SmiteGodLab
 
         public PlayerList()
         {
+            // OwnerDrawFixed is load-bearing even though we paint in WM_PAINT (not WM_DRAWITEM): it makes ItemHeight
+            // effective, which IndexFromPoint / GetItemRectangle / TopIndex all key off for hit-testing and scrolling.
             DrawMode = DrawMode.OwnerDrawFixed;
             BorderStyle = BorderStyle.FixedSingle;
             IntegralHeight = false;
@@ -646,7 +660,7 @@ namespace SmiteGodLab
                 for (int i = 0; i < _rows.Count; i++) Items[i] = _rows[i].Name ?? "";
             else { Items.Clear(); foreach (var r in _rows) Items.Add(r.Name ?? ""); }   // ListBox.Items.Add(null) throws
             EndUpdate();
-            if (_rows.Count == 0) { _hoverAction = -1; Invalidate(); return; }
+            if (_rows.Count == 0) { _hoverAction = _hoverRow = -1; Invalidate(); return; }
             int ns = prevSel != null ? _rows.IndexOf(prevSel) : -1;
             SelectedIndex = ns >= 0 ? ns : (AutoSelectFirst ? 0 : -1);          // don't fabricate a selection where there was none
             RefreshHover();   // rows moved under a possibly-stationary cursor → re-hit-test which glyph is hovered
@@ -662,35 +676,36 @@ namespace SmiteGodLab
             if (rc.IntersectsWith(ClientRectangle)) Invalidate(rc);
         }
 
-        protected override void OnDrawItem(DrawItemEventArgs e)
+        // Draws one row into g at bounds. Called from the double-buffered WM_PAINT (PaintBuffered), not WM_DRAWITEM.
+        void DrawRow(Graphics g, int index, Rectangle bounds)
         {
-            if (e.Index < 0 || e.Index >= _rows.Count) return;
-            var r = _rows[e.Index];
-            var g = e.Graphics;
+            var r = _rows[index];
 
             if (r.Header)   // clickable section divider: ▼/▶ collapse arrow + accent caption
             {
-                using (var hb = new SolidBrush(Color.FromArgb(13, 13, 13))) g.FillRectangle(hb, e.Bounds);
+                using (var hb = new SolidBrush(Color.FromArgb(13, 13, 13))) g.FillRectangle(hb, bounds);
                 if (_hdr == null) _hdr = new Font(Font.FontFamily, Font.Size, FontStyle.Bold);
-                var arrow = new Rectangle(e.Bounds.Left + Sc(6), e.Bounds.Top, Sc(16), e.Bounds.Height);
+                var arrow = new Rectangle(bounds.Left + Sc(6), bounds.Top, Sc(16), bounds.Height);
                 TextRenderer.DrawText(g, r.Collapsed ? "▶" : "▼", Font, arrow, Color.FromArgb(193, 30, 31), TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
-                var hrect = new Rectangle(e.Bounds.Left + Sc(24), e.Bounds.Top, e.Bounds.Width - Sc(26), e.Bounds.Height);
+                var hrect = new Rectangle(bounds.Left + Sc(24), bounds.Top, bounds.Width - Sc(26), bounds.Height);
                 TextRenderer.DrawText(g, r.Name, _hdr, hrect, Color.FromArgb(193, 30, 31), TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
                 return;
             }
 
-            bool sel = (e.State & DrawItemState.Selected) != 0;
-            using (var bg = new SolidBrush(sel ? Color.FromArgb(44, 44, 50) : Color.FromArgb(20, 20, 20))) g.FillRectangle(bg, e.Bounds);
+            bool sel = index == SelectedIndex;
+            bool hov = index == _hoverRow && !sel;   // whole-row hover highlight
+            Color bgc = sel ? Color.FromArgb(48, 48, 56) : hov ? Color.FromArgb(33, 33, 40) : Color.FromArgb(20, 20, 20);
+            using (var bg = new SolidBrush(bgc)) g.FillRectangle(bg, bounds);
             g.SmoothingMode = SmoothingMode.AntiAlias;
 
             if (_chip == null) _chip = new Font(Font.FontFamily, Math.Max(6f, Font.Size - 1.5f), FontStyle.Bold);
             int pad = Sc(6);
-            var chip = new Rectangle(e.Bounds.Left + pad, e.Bounds.Top + Sc(5), Sc(58), e.Bounds.Height - Sc(10));
+            var chip = new Rectangle(bounds.Left + pad, bounds.Top + Sc(5), Sc(58), bounds.Height - Sc(10));
             using (var cb = new SolidBrush(r.PlatCol)) g.FillRectangle(cb, chip);
             TextRenderer.DrawText(g, r.Plat, _chip, chip, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
 
             int nameX = chip.Right + Sc(10);
-            int rEdge = e.Bounds.Right;
+            int rEdge = bounds.Right;
             bool hasAction = r.Deletable || r.Savable;
             int rightLimit = rEdge - (hasAction ? TrashW : Sc(6));
 
@@ -698,20 +713,20 @@ namespace SmiteGodLab
             {
                 var sz = TextRenderer.MeasureText(r.Status, Font);
                 int stX = rightLimit - sz.Width - Sc(4);
-                int dotX = stX - Sc(15), dotY = e.Bounds.Top + e.Bounds.Height / 2 - Sc(4);
+                int dotX = stX - Sc(15), dotY = bounds.Top + bounds.Height / 2 - Sc(4);
                 using (var db = new SolidBrush(r.StatusCol)) g.FillEllipse(db, dotX, dotY, Sc(9), Sc(9));
-                TextRenderer.DrawText(g, r.Status, Font, new Rectangle(stX, e.Bounds.Top, sz.Width + Sc(6), e.Bounds.Height), r.StatusCol, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                TextRenderer.DrawText(g, r.Status, Font, new Rectangle(stX, bounds.Top, sz.Width + Sc(6), bounds.Height), r.StatusCol, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
                 rightLimit = dotX - Sc(8);
             }
             if (!string.IsNullOrEmpty(r.Extra))   // e.g. last-login, dim, to the left of the status
             {
                 var ez = TextRenderer.MeasureText(r.Extra, _chip);
                 int exX = rightLimit - ez.Width - Sc(4);
-                TextRenderer.DrawText(g, r.Extra, _chip, new Rectangle(exX, e.Bounds.Top, ez.Width + Sc(6), e.Bounds.Height), Color.FromArgb(120, 120, 120), TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                TextRenderer.DrawText(g, r.Extra, _chip, new Rectangle(exX, bounds.Top, ez.Width + Sc(6), bounds.Height), Color.FromArgb(120, 120, 120), TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
                 rightLimit = exX - Sc(8);
             }
 
-            var nameRect = new Rectangle(nameX, e.Bounds.Top, rightLimit - nameX, e.Bounds.Height);
+            var nameRect = new Rectangle(nameX, bounds.Top, rightLimit - nameX, bounds.Height);
             string nm = r.Name + (r.Priv ? "   (private)" : "");
             TextRenderer.DrawText(g, nm, Font, nameRect, Color.White, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
 
@@ -719,8 +734,8 @@ namespace SmiteGodLab
             {
                 if (_glyph == null) { try { _glyph = new Font("Segoe MDL2 Assets", Font.Size); } catch { _glyph = Font; } }
                 // trash glyph drawn inline below (char-code form). original:"✕" : "";   // Segoe MDL2 trash, else a ✕
-                var tr = new Rectangle(rEdge - TrashW, e.Bounds.Top, TrashW, e.Bounds.Height);
-                bool hot = e.Index == _hoverAction;   // cursor is over this row's action glyph → highlight it
+                var tr = new Rectangle(rEdge - TrashW, bounds.Top, TrashW, bounds.Height);
+                bool hot = index == _hoverAction;   // cursor is over this row's action glyph → highlight it
                 string glyph; Color gc;
                 var hotRect = new Rectangle(tr.Left + Sc(2), tr.Top + Sc(4), tr.Width - Sc(4), tr.Height - Sc(8));
                 if (r.Deletable)
@@ -760,35 +775,38 @@ namespace SmiteGodLab
             if (!(_rows[i].Deletable || _rows[i].Savable)) return -1;
             return p.X >= ClientSize.Width - TrashW ? i : -1;
         }
-        // Re-evaluate the hovered action row from the CURRENT cursor (used after a re-sort moves rows under a
-        // stationary cursor — a bare index would highlight the row that drifted away instead of the one now under it).
+        // The non-header row index under the point, else -1 (for whole-row hover highlight).
+        int RowAt(Point p)
+        {
+            int i = IndexFromPoint(p);
+            return (i >= 0 && i < _rows.Count && !_rows[i].Header) ? i : -1;
+        }
+        bool Loadable(int i) => i >= 0 && i < _rows.Count && !string.IsNullOrEmpty(_rows[i].Id) && _rows[i].Id != "0";
+        void SetHover(int row, int action)
+        {
+            if (row == _hoverRow && action == _hoverAction) return;
+            _hoverRow = row; _hoverAction = action;
+            Invalidate();   // buffered paint → a full repaint is flicker-free
+        }
+        // Re-evaluate hover from the CURRENT cursor (after a re-sort moves rows under a stationary cursor).
         public void RefreshHover()
         {
-            int next = -1;
-            if (IsHandleCreated) { var p = PointToClient(Cursor.Position); if (ClientRectangle.Contains(p)) next = ActionIndexAt(p); }
-            if (next == _hoverAction) return;
-            int prev = _hoverAction; _hoverAction = next;
-            if (prev >= 0 && prev < _rows.Count) Invalidate(GetItemRectangle(prev));
-            if (_hoverAction >= 0) Invalidate(GetItemRectangle(_hoverAction));
+            int row = -1, act = -1;
+            if (IsHandleCreated) { var p = PointToClient(Cursor.Position); if (ClientRectangle.Contains(p)) { row = RowAt(p); act = ActionIndexAt(p); } }
+            SetHover(row, act);
         }
-        // Track when the cursor is over a row's action glyph so OnDrawItem can highlight it + show a hand cursor.
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
-            int next = ActionIndexAt(e.Location);
-            Cursor = next >= 0 ? Cursors.Hand : Cursors.Default;
-            if (next != _hoverAction)
-            {
-                int prev = _hoverAction; _hoverAction = next;
-                if (prev >= 0 && prev < _rows.Count) Invalidate(GetItemRectangle(prev));
-                if (_hoverAction >= 0) Invalidate(GetItemRectangle(_hoverAction));
-            }
+            int act = ActionIndexAt(e.Location), row = RowAt(e.Location);
+            Cursor = (act >= 0 || Loadable(row)) ? Cursors.Hand : Cursors.Default;
+            SetHover(row, act);
         }
         protected override void OnMouseLeave(EventArgs e)
         {
             base.OnMouseLeave(e);
             Cursor = Cursors.Default;
-            if (_hoverAction >= 0) { int prev = _hoverAction; _hoverAction = -1; if (prev < _rows.Count) Invalidate(GetItemRectangle(prev)); }
+            SetHover(-1, -1);
         }
 
         static void RoundRect(Graphics g, Rectangle r, int rad, Color fill, Color border)
@@ -805,26 +823,45 @@ namespace SmiteGodLab
 
         protected override void WndProc(ref Message m)
         {
-            const int WM_ERASEBKGND = 0x0014;
-            if (m.Msg == WM_ERASEBKGND)
+            const int WM_ERASEBKGND = 0x0014, WM_PAINT = 0x000F;
+            if (m.Msg == WM_ERASEBKGND) { m.Result = (IntPtr)1; return; }     // we paint the whole client in WM_PAINT
+            if (m.Msg == WM_PAINT && PaintBuffered()) { m.Result = IntPtr.Zero; return; }
+            base.WndProc(ref m);   // PaintBuffered returns false only if BeginPaint failed → let base validate (no repaint loop)
+        }
+        // Full double-buffered repaint: draw every visible row to an off-screen bitmap, then blit once. This is
+        // what kills the owner-draw flicker — a native OwnerDraw ListBox paints each item straight to the screen
+        // DC, so a live status re-sort visibly redraws row-by-row. We bypass that and own the paint.
+        bool PaintBuffered()
+        {
+            // Expand the update region to the WHOLE client first: a native ListBox scrolls by bit-blitting and only
+            // invalidates the newly-exposed strip, which would clip our full-buffer blit and leave torn/duplicated
+            // rows. Forcing a full-client region makes BeginPaint hand us an unclipped DC.
+            InvalidateRect(Handle, IntPtr.Zero, false);
+            var hdc = BeginPaint(Handle, out var ps);
+            if (hdc == IntPtr.Zero) return false;   // BeginPaint failed (GDI exhausted / dying window) — don't validate; let base try
+            try
             {
-                // Skip the default full-background erase (the main source of refresh flicker): every row's
-                // OnDrawItem already repaints its whole bounds, so the pre-erase just causes a blank flash.
-                // We still clear the strip BELOW the last item (no OnDrawItem fires there) so a shrunken
-                // list — e.g. after a delete — leaves no ghost rows.
-                try
+                int w = ClientSize.Width, h = ClientSize.Height;
+                if (w > 0 && h > 0)
                 {
-                    int bottom = Math.Max(0, _rows.Count - TopIndex) * Math.Max(1, ItemHeight);
-                    if (bottom < ClientSize.Height)
-                        using (var g = Graphics.FromHdc(m.WParam))
-                        using (var bb = new SolidBrush(BackColor))
-                            g.FillRectangle(bb, 0, bottom, ClientSize.Width, ClientSize.Height - bottom);
+                    if (_buf == null || _buf.Width != w || _buf.Height != h) { _buf?.Dispose(); _buf = new Bitmap(w, h); }
+                    using (var g = Graphics.FromImage(_buf))
+                    {
+                        g.Clear(BackColor);
+                        int top = Math.Max(0, TopIndex), ih = Math.Max(1, ItemHeight);
+                        for (int i = top; i < _rows.Count; i++)
+                        {
+                            int y = (i - top) * ih;
+                            if (y >= h) break;
+                            try { DrawRow(g, i, new Rectangle(0, y, w, ih)); } catch { }   // one bad row must not drop the whole frame
+                        }
+                    }
+                    using (var screen = Graphics.FromHdc(hdc)) screen.DrawImageUnscaled(_buf, 0, 0);
                 }
-                catch { }
-                m.Result = (IntPtr)1;
-                return;
             }
-            base.WndProc(ref m);
+            catch { }
+            finally { EndPaint(Handle, ref ps); }
+            return true;
         }
 
         protected override void OnKeyDown(KeyEventArgs e)
@@ -842,7 +879,7 @@ namespace SmiteGodLab
         }
         protected override void Dispose(bool disposing)
         {
-            if (disposing) { if (_glyph != null && _glyph != Font) _glyph.Dispose(); _chip?.Dispose(); _hdr?.Dispose(); }
+            if (disposing) { if (_glyph != null && _glyph != Font) _glyph.Dispose(); _chip?.Dispose(); _hdr?.Dispose(); _buf?.Dispose(); }
             base.Dispose(disposing);
         }
     }
@@ -2212,6 +2249,28 @@ namespace SmiteGodLab
             return host;
         }
 
+        static readonly HttpClient _imgHttp = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+        readonly Dictionary<string, Image> _avatarCache = new Dictionary<string, Image>();
+        // Download (and cache) a player's in-game avatar image from its Avatar_URL. Returns null on empty/failure.
+        async Task<Image> LoadAvatar(string url)
+        {
+            if (string.IsNullOrEmpty(url)) return null;
+            if (_avatarCache.TryGetValue(url, out var cached)) return cached;   // includes negatively-cached nulls
+            Image img = null;
+            try
+            {
+                var bytes = await _imgHttp.GetByteArrayAsync(url);
+                using var ms = new MemoryStream(bytes);
+                using var tmp = Image.FromStream(ms);
+                img = new Bitmap(tmp);   // copy so the stream can be disposed
+            }
+            catch { img = null; }
+            // Cache success AND failure (null) so a broken URL isn't re-downloaded on every preview click. Light cap so a
+            // very long session can't grow the cache without bound (entries aren't disposed, so just stop adding past it).
+            if (_avatarCache.Count < 256) _avatarCache[url] = img;
+            return img;
+        }
+
         // The Friend List tab: your saved buddies + their live status (online / in game / offline).
         Panel BuildFriendListPanel()
         {
@@ -2233,10 +2292,62 @@ namespace SmiteGodLab
             var body = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg, Padding = new Padding(S(14), S(10), S(14), S(14)) };
             // Fixed-width column: a Dock=Fill list stretches to the AutoScale-inflated parent and draws its
             // right-aligned content (status, trash) off the physical window edge. A fixed width keeps it in view.
-            var col = new Panel { Dock = DockStyle.Left, Width = S(680), BackColor = Theme.Bg };
+            var col = new Panel { Dock = DockStyle.Left, Width = S(430), BackColor = Theme.Bg };
             var flist = new PlayerList { Dock = DockStyle.Fill, Font = Theme.F(10.5f), AutoSelectFirst = false };
             col.Controls.Add(flist);
-            body.Controls.Add(col);
+
+            // Right-side preview "frame": clicking a friend shows their in-game icon + status here with an Open-profile prompt.
+            var detail = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Panel };
+            Image dImg = null;
+            var dAvatar = new Panel { Location = new Point(S(22), S(22)), Size = new Size(S(96), S(96)), BackColor = Theme.Panel };
+            dAvatar.Paint += (s, e) =>
+            {
+                var gg = e.Graphics; gg.SmoothingMode = SmoothingMode.AntiAlias;
+                var rc = new Rectangle(0, 0, dAvatar.Width - 1, dAvatar.Height - 1);
+                int rad = S(12);
+                using var path = new GraphicsPath();
+                path.AddArc(rc.X, rc.Y, rad, rad, 180, 90);
+                path.AddArc(rc.Right - rad, rc.Y, rad, rad, 270, 90);
+                path.AddArc(rc.Right - rad, rc.Bottom - rad, rad, rad, 0, 90);
+                path.AddArc(rc.X, rc.Bottom - rad, rad, rad, 90, 90);
+                path.CloseFigure();
+                if (dImg != null) { gg.SetClip(path); gg.DrawImage(dImg, rc); gg.ResetClip(); }
+                else { using var bb = new SolidBrush(Theme.Input); gg.FillPath(bb, path); }
+                using var pen = new Pen(Theme.Line); gg.DrawPath(pen, path);
+            };
+            var dName = new Label { Location = new Point(S(132), S(26)), AutoSize = true, Font = Theme.F(14f, FontStyle.Bold), ForeColor = Theme.Text, BackColor = Theme.Panel };
+            var dSub = new Label { Location = new Point(S(132), S(60)), AutoSize = true, Font = Theme.F(9.5f), ForeColor = Theme.Dim, BackColor = Theme.Panel };
+            var dSeen = new Label { Location = new Point(S(132), S(84)), AutoSize = true, Font = Theme.F(9f), ForeColor = Theme.Dim, BackColor = Theme.Panel };
+            var dPrompt = new Label { Location = new Point(S(22), S(134)), AutoSize = true, Font = Theme.F(9.5f), ForeColor = Theme.Dim, BackColor = Theme.Panel, Text = "Open this player's full profile?" };
+            var dOpen = MkBtn("Open profile  →", 156, false, Theme.Blue, Color.White); dOpen.Location = new Point(S(22), S(160));
+            var dHint = new Label { Location = new Point(S(22), S(26)), AutoSize = true, Font = Theme.F(10f), ForeColor = Theme.Dim, BackColor = Theme.Panel, Text = "Click a friend to preview their profile." };
+            detail.Controls.Add(dAvatar); detail.Controls.Add(dName); detail.Controls.Add(dSub); detail.Controls.Add(dSeen); detail.Controls.Add(dPrompt); detail.Controls.Add(dOpen); detail.Controls.Add(dHint);
+
+            string detailId = null;
+            void HideDetail() { detailId = null; dImg = null; dAvatar.Visible = dName.Visible = dSub.Visible = dSeen.Visible = dPrompt.Visible = dOpen.Visible = false; dHint.Visible = true; }
+            async void ShowDetail(PlayerRow r)   // async void → wrap the whole body so a stray throw can't crash the message loop
+            {
+                try
+                {
+                    detailId = r.Id;
+                    dName.Text = r.Name;
+                    var (pc, _) = PlatformChip(r.Portal);
+                    dSub.Text = pc + "    ·    " + (string.IsNullOrEmpty(r.Status) || r.Status == "…" ? "—" : r.Status);
+                    dSub.ForeColor = r.StatusCol;
+                    dSeen.Text = r.LastLogin > DateTime.MinValue ? "Last seen " + RelTime(r.LastLogin) : "";
+                    dOpen.Tag = r;
+                    dHint.Visible = false;
+                    dAvatar.Visible = dName.Visible = dSub.Visible = dSeen.Visible = dPrompt.Visible = dOpen.Visible = true;
+                    dImg = null; dAvatar.Invalidate();
+                    var img = await LoadAvatar(r.Avatar);
+                    if (detailId == r.Id) { dImg = img; dAvatar.Invalidate(); }   // ignore if the user clicked a different friend meanwhile
+                }
+                catch { }
+            }
+            dOpen.Click += async (s, e) => { if (dOpen.Tag is PlayerRow rr) { SelectNav(1); if (_trkLoadPlayer != null) await _trkLoadPlayer(rr.Id, rr.Name); } };
+            HideDetail();
+
+            body.Controls.Add(detail); body.Controls.Add(col);   // Fill (detail) added before the Left (col) so it fills the remainder
             host.Controls.Add(body); host.Controls.Add(hint); host.Controls.Add(top);
 
             PlayerRow Row(FavPlayer f) { var (code, col) = PlatformChip(f.Portal); return new PlayerRow { Name = f.Name, Id = f.Id, Portal = f.Portal, Deletable = true, Plat = code, PlatCol = col, Status = "…", StatusCol = Theme.Dim, StatusSort = 9 }; }
@@ -2298,6 +2409,7 @@ namespace SmiteGodLab
                                     if (!string.IsNullOrEmpty(ig) && ig != row.Name)
                                     { row.Name = ig; var fe = friendList.FirstOrDefault(f => f.Id == row.Id); if (fe != null) fe.Name = ig; nameChanged = true; }
                                     row.LastLogin = ParseApiDate(GS(pp, "Last_Login_Datetime"));
+                                    row.Avatar = GS(pp, "Avatar_URL");   // in-game icon for the preview panel
                                     row.Extra = code == 0 ? RelTime(row.LastLogin) : "";   // show "last seen" only for offline friends
                                 }
                             }
@@ -2319,13 +2431,14 @@ namespace SmiteGodLab
 
             for (int i = 0; i < sortBtns.Length; i++) { int k = i; sortBtns[i].Click += (s, e) => { flSort = k; StyleSort(); ApplySort(); }; }
             StyleSort();
-            flist.Activated += async r => { SelectNav(1); if (_trkLoadPlayer != null) await _trkLoadPlayer(r.Id, r.Name); };
+            flist.Activated += ShowDetail;   // click a friend → preview frame on the right (Open profile loads the tracker)
             void ConfirmDelete(PlayerRow r)
             {
                 if (MessageBox.Show(this, "Remove “" + r.Name + "” from your Friend List?", "Remove friend",
                         MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
                 RemoveFriendList(r.Id);
                 flRows.RemoveAll(x => x.Id == r.Id);   // drop locally + re-sort instead of a full network refresh → seamless
+                if (detailId == r.Id) HideDetail();    // clear the preview if it was showing the deleted friend
                 ApplySort();
                 int online = flRows.Count(x => x.StatusSort <= 1);
                 hint.ForeColor = Theme.Dim;
