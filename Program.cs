@@ -2232,46 +2232,147 @@ namespace SmiteGodLab
         RadioButton MkRadio(string text, int x, int y) =>
             new RadioButton { Text = text, Location = new Point(x, y), AutoSize = true, ForeColor = Theme.Text, BackColor = Theme.Bg, Font = Theme.F(9.5f), Cursor = Cursors.Hand };
 
-        // In-depth reference for every feature + algorithm. Deliberately does NOT print the real daily API quota numbers.
+        // In-depth reference for every feature + algorithm, structured like documentation (TOC sidebar + sections +
+        // formula blocks). Deliberately does NOT print the real daily API quota numbers.
         Panel BuildCodexPanel()
         {
             var host = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg };
             var top = new Panel { Dock = DockStyle.Top, Height = S(54), BackColor = Theme.Panel };
             top.Controls.Add(new Label { Text = "Codex", AutoSize = true, ForeColor = Theme.Text, Font = Theme.F(13f, FontStyle.Bold), Location = new Point(S(16), S(9)) });
             top.Controls.Add(new Label { Text = "How every feature and algorithm works, in depth.", AutoSize = true, ForeColor = Theme.Dim, Font = Theme.F(8.5f), Location = new Point(S(18), S(33)) });
-            var scroll = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg, AutoScroll = true, Padding = new Padding(S(22), S(12), S(22), S(24)) };
+            var body = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg };
+            var content = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg, AutoScroll = true, Padding = new Padding(S(26), S(14), S(20), S(30)) };
+            var toc = new Panel { Dock = DockStyle.Left, Width = S(196), BackColor = Theme.Panel };
+            var tocLine = new Panel { Dock = DockStyle.Right, Width = S(1), BackColor = Theme.Line };
+            var tocFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true, BackColor = Theme.Panel, Padding = new Padding(S(12), S(16), S(8), S(16)) };
+            toc.Controls.Add(tocFlow); toc.Controls.Add(tocLine);
             var flow = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, BackColor = Theme.Bg };
-            int wrap = S(760);
-            var bodyCol = Color.FromArgb(200, 200, 206);
-            void Add(string heading, string body)
+            content.Controls.Add(flow);
+            int wrap = S(520);
+            var bodyCol = Color.FromArgb(202, 202, 208);
+            var mono = new Font("Consolas", 9.5f);
+            bool first = true;
+            tocFlow.Controls.Add(new Label { Text = "CONTENTS", AutoSize = true, ForeColor = Theme.Dim, Font = Theme.F(8f, FontStyle.Bold), Margin = new Padding(0, 0, 0, S(8)) });
+            // H2: a numbered section header + a clickable jump link in the sidebar.
+            void H2(string title)
             {
-                flow.Controls.Add(new Label { Text = heading, AutoSize = true, ForeColor = Theme.Accent, Font = Theme.F(12.5f, FontStyle.Bold), Margin = new Padding(0, S(18), 0, S(5)) });
-                flow.Controls.Add(new Label { Text = body, AutoSize = true, MaximumSize = new Size(wrap, 0), ForeColor = bodyCol, Font = Theme.F(9.5f), Margin = new Padding(0, 0, 0, S(4)) });
+                if (!first) flow.Controls.Add(new Panel { Width = wrap, Height = 1, BackColor = Theme.Line, Margin = new Padding(0, S(20), 0, S(8)) });
+                first = false;
+                var hdr = new Label { Text = title, AutoSize = true, ForeColor = Theme.Accent, Font = Theme.F(13.5f, FontStyle.Bold), Margin = new Padding(0, S(2), 0, S(7)) };
+                flow.Controls.Add(hdr);
+                var link = new Label { Text = title, AutoSize = true, ForeColor = Theme.Dim, Font = Theme.F(9.5f), Cursor = Cursors.Hand, Margin = new Padding(0, S(3), 0, S(3)) };
+                link.MouseEnter += (s, e) => link.ForeColor = Theme.Text;
+                link.MouseLeave += (s, e) => link.ForeColor = Theme.Dim;
+                link.Click += (s, e) => content.ScrollControlIntoView(hdr);
+                tocFlow.Controls.Add(link);
             }
-            Add("Smite 1 Inspector — overview",
-                "A single self-contained Windows app with two halves: a God Inspector that edits the game's god .ini tuning files offline, and a Player Tracker that pulls live stats from the official Hi-Rez SMITE 1 API. The left rail switches between Player Tracker, Friend List, God Inspector, this Codex, and Settings. Everything is offline-first except the tracker and friend features, which call the API only when you ask.");
-            Add("God Inspector",
-                "Point it at your SMITE config folder and it loads every god's .ini. Each tunable (ability scaling, cooldowns, costs and so on) becomes an editable row. You can change values, add new keys from the embedded UE3 SDK definition list, Apply (write back to the .ini), Reload, or Restore Defaults — on first load it snapshots the pristine value of every key per file, so a restore is always possible even after you have saved. Engine and system files are hidden unless you tick Show all entities. Ability icons and names come from a bundled media-kit asset pipeline.");
-            Add("Player Tracker — search and profile",
-                "Type a name and Search. Lookup first tries an EXACT getplayer match (case-insensitive); if that finds nothing it falls back to a prefix search and shows a disambiguation picker when several accounts match the same name. The profile card shows level, total mastery, region, platform, win/loss with win rate, worshippers, hours played, ranked tiers, account created and last login, and career achievements. The name row renders the in-game name beside a SMITE coin plus a platform coin (Steam, Xbox, Epic, Switch) and any linked accounts. A privacy-flagged profile is detected and labelled private rather than shown as a blank card.");
-            Add("Player Tracker — masteries, matches, achievements, queues",
-                "God Masteries lists every god you have played with rank, worshippers, KDA, win rate and minion kills. Recent Matches lists your latest games with god, queue, result, KDA, level, damage and gold. Achievements is a full grid of career stats — multi-kills, every spree type, objective kills and more. Double-click a mastery row for that god's per-queue breakdown; double-click a match for the full scoreboard, which colour-codes premade parties and shows each player's build.");
-            Add("Friends and live matches",
-                "The Friends sub-tab lists a tracked player's Hi-Rez friends, plus incoming and outgoing friend requests, decoded from the friend flags (the direction is relative to the viewed player). When a player is in a game their status chip becomes clickable and opens the in-progress scoreboard. A live match reveals the names of everyone in it except hard-private profiles — completed matches anonymize private players, so a live match is the only place their identity surfaces.");
-            Add("Hidden players and the nickname matcher",
-                "A privacy-flagged player hides their name and every id, but a match row still leaks their clan, account level, total mastery, the gods they played and their premade party-mates. You can give such a player a nickname, and the app re-recognizes them next time with a weighted fingerprint score: same clan is a strong anchor; two clanless players get a weaker anchor; account level and total mastery must stay close (they only ever grow); each shared NAMED party-mate is strong evidence; a previously-seen god adds a little. A score threshold decides a match, and with no shared party-mates the stats must stay inside a sane window or it is treated as a different person. Every confident sighting folds the new evidence back in — advancing level and mastery, accumulating companions and gods, and bumping a Seen counter — so recognition strengthens over time, and a confidence percentage summarizes how reliably a tag can be re-found. This is best-effort recognition of a player YOU named; it is never recovery of a hidden name from the API, which is not possible.");
-            Add("Friend List — the live status poller",
-                "Your curated buddy list with live status. Rather than re-scanning everyone on a fixed timer, it runs a continuous priority poller: every friend has its own next-check time driven by a tier. God-select refreshes fastest (a match is forming — the most actionable moment), then online or in a lobby, then in-game (they are committed for a while), then offline. Offline friends back off the longer they have been gone — about one extra minute per day idle, up to a ten-minute cap that holds for months, then stretching toward twenty minutes around a year — and they snap straight back to a fast rate the moment they appear online. Within a cycle the status checks run concurrently so a sweep finishes in roughly one round-trip, and a token-bucket limiter smooths the overall call rate so even a very large list never bursts.");
-            Add("Friend List — caching, display and notes",
-                "Leaving the tab pauses the poller and caches the list exactly as you left it; returning shows it instantly and resumes updates by priority (online first, then offline) instead of re-scanning. The slow getplayer call (name, avatar, last login) is cached and only refreshed when a friend crosses the online/offline line or every half hour. Sort by name, status or last seen. Offline rows show how long ago they were last online; toggle Show online time to also show how long currently-online friends have been logged in. Click a friend for a preview panel with their in-game avatar (or a coloured initial when they never set one), platform and status, an Open-profile button, a View-current-game button when they are in a match, and a Notes box for your own per-friend comments.");
-            Add("The Hi-Rez API",
-                "Stats come from the official SMITE 1 API. Each request is signed with an MD5 of the developer id, the method name, an auth key and a UTC timestamp; a session is created first and reused for its short lifetime, and responses come back as JSON arrays. Hi-Rez enforces a daily request limit and a session limit that the app must respect — the exact numbers are not shown here — so the friend poller is built to stay well within them: tiered cadences, the deep-idle backoff for long-offline friends, pausing entirely while its tab is hidden, caching the slow calls, and a self-throttle that eases off as the day's budget is approached. You can drop your own developer key into an api.txt file to use your own quota instead of the built-in one.");
-            Add("Limitations the API imposes",
-                "Two things the API cannot do, by design. It cannot reveal a privacy-flagged player's name or id from a completed match or a friends list — only a live, in-progress match exposes names, and even then not hard-private profiles. And it does not expose newer in-client avatars: it only knows an older avatar set, so many active players return no avatar at all (the app shows a coloured initial instead). Resolving linked-account names beyond the primary account is also not supported. These are server-side limits, not app bugs.");
-            Add("Your data and privacy",
-                "Everything you save — favorites, recent lookups, hidden-player tags, the friend list with its per-friend notes, your settings, and the god default snapshots — is stored as plain JSON in your Documents folder under Smite Inspector, so a shared copy of the app in a read-only location still works. Nothing is uploaded anywhere. The only network traffic is to the Hi-Rez API, and only for the stats you explicitly request.");
-            scroll.Controls.Add(flow);
-            host.Controls.Add(scroll); host.Controls.Add(top);
+            void H3(string t) => flow.Controls.Add(new Label { Text = t, AutoSize = true, ForeColor = Theme.Text, Font = Theme.F(10.5f, FontStyle.Bold), Margin = new Padding(0, S(12), 0, S(4)) });
+            void P(string t) => flow.Controls.Add(new Label { Text = t, AutoSize = true, MaximumSize = new Size(wrap, 0), ForeColor = bodyCol, Font = Theme.F(9.5f), Margin = new Padding(0, 0, 0, S(6)) });
+            void Math(string code)
+            {
+                var box = new Panel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, BackColor = Color.FromArgb(22, 22, 26), Padding = new Padding(S(12), S(9), S(14), S(9)), Margin = new Padding(0, S(2), 0, S(10)) };
+                box.Controls.Add(new Label { Text = code, AutoSize = true, Font = mono, ForeColor = Color.FromArgb(206, 214, 226), BackColor = Color.Transparent });
+                box.Paint += (s, e) => { using var p = new Pen(Color.FromArgb(64, 64, 72)); e.Graphics.DrawRectangle(p, 0, 0, box.Width - 1, box.Height - 1); };
+                flow.Controls.Add(box);
+            }
+
+            H2("Overview");
+            P("Smite 1 Inspector is a single self-contained Windows app with two halves: a God Inspector that edits the game's god .ini tuning files offline, and a Player Tracker that pulls live stats from the official Hi-Rez SMITE 1 API. The left rail switches between Player Tracker, Friend List, God Inspector, this Codex, and Settings. Everything is offline-first except the tracker and friend features, which call the API only when you ask.");
+
+            H2("God Inspector");
+            P("Point it at your SMITE config folder and it loads every god's .ini. Each tunable — ability scaling, cooldowns, costs and so on — becomes an editable row. Change values, add new keys from the embedded UE3 SDK definition list, then Apply (write back to the .ini), Reload, or Restore Defaults.");
+            P("On first load it snapshots the pristine value of every key per file, so a restore is always possible even after you have saved. Engine and system files are hidden unless you tick Show all entities. Ability icons and names come from a bundled media-kit asset pipeline.");
+
+            H2("Player Tracker");
+            H3("Search & profile");
+            P("Type a name and Search. Lookup first tries an EXACT getplayer match (case-insensitive); if that finds nothing it falls back to a prefix search and shows a disambiguation picker when several accounts share the name. The profile card shows level, total mastery, region, platform, win/loss with win rate, worshippers, hours, ranked tiers, account created and last login, and career achievements. The name row renders the in-game name beside a SMITE coin plus a platform coin and any linked accounts. A privacy-flagged profile is detected and labelled private instead of shown blank.");
+            H3("Masteries, matches & achievements");
+            P("God Masteries lists every god played with rank, worshippers, KDA, win rate and minion kills. Recent Matches lists your latest games with god, queue, result, KDA, level, damage and gold. Achievements is a full grid of career stats. Double-click a mastery for that god's per-queue breakdown; double-click a match for the full scoreboard, which colour-codes premade parties and shows each player's build.");
+            H3("Friends & live matches");
+            P("The Friends sub-tab lists a tracked player's Hi-Rez friends plus incoming/outgoing requests, decoded from friend flags (direction is relative to the viewed player). When a player is in a game, their status chip opens the in-progress scoreboard. A live match reveals everyone's name except hard-private profiles — completed matches anonymize private players, so a live match is the only place their identity surfaces.");
+
+            H2("Hidden-player nicknames");
+            P("A privacy-flagged player hides their name and every id, but a match row still leaks their clan, account level, total mastery, the gods they played, and their premade party-mates. You can nickname such a player; the app then re-recognizes them next time from that fingerprint. This is best-effort recognition of a player YOU named — never recovery of a hidden name from the API, which is impossible.");
+            H3("The matching algorithm");
+            P("Each saved tag is scored against the hidden row. Same clan is the strong anchor; two clanless players get a weaker one; account level and total mastery must stay close (they only ever grow); each shared NAMED party-mate is strong evidence; a previously-seen god nudges it up. The best tag wins if its score clears the threshold:");
+            Math("score = 0\n"
+               + "  same clan id ................ +100\n"
+               + "  both clanless ...............  +30\n"
+               + "  clan mismatch ............... -55\n"
+               + "  |dLevel|<=8 and |dMastery|<=6  +40 - (2*dLevel + 2*dMastery)\n"
+               + "  else within +/-25 / +/-15 ...   +6\n"
+               + "  beyond ......................  -20\n"
+               + "  each shared party-mate ......  +60\n"
+               + "  a previously-seen god .......  +12\n"
+               + "\n"
+               + "gate: with no shared party-mate, the loose\n"
+               + "      +/-25 / +/-15 window must hold, else reject.\n"
+               + "\n"
+               + "match when  score >= 60");
+            P("So same-clan with sane stats matches easily; a clan change still re-links if two party-mates agree; and a different same-clan player with a big level gap and no shared friends is correctly rejected by the gate.");
+            H3("Confidence score");
+            P("A percentage summarizes how reliably a tag can be re-found — more sightings and more cross-evidence (party-mates, gods) mean higher confidence; a lone first tag is modest:");
+            Math("confidence% = min( 99,\n"
+               + "      25\n"
+               + "    + 18 * sightings\n"
+               + "    +  8 * min(party-mates, 4)\n"
+               + "    +  4 * min(gods seen,   3) )");
+            P("Every confident sighting folds the new evidence back in — advancing level and mastery, accumulating party-mates and gods, and bumping the sighting count — so both recognition and confidence strengthen over time.");
+
+            H2("Friend List");
+            P("Your curated buddy list with live status. Instead of re-scanning everyone on a fixed timer, it runs a continuous priority poller: every friend has its own next-check time driven by a tier, so the people who matter refresh fastest while dormant friends cost almost nothing.");
+            H3("Priority tiers");
+            P("The status (god-select, online, in-game, offline) sets how often a friend is re-checked. God-select is the most actionable (a match is forming); in-game is the least (they are committed for a while):");
+            Math("god-select ...... every  10 s\n"
+               + "online / lobby .. every  15 s\n"
+               + "in-game ......... every  20 s\n"
+               + "offline ......... see backoff below\n"
+               + "error / unknown . every  90 s, doubling per\n"
+               + "                  failure (capped at 600 s)");
+            H3("Offline backoff");
+            P("Offline friends back off the longer they have been gone — roughly one extra minute per day idle, holding at a ten-minute cap for months, then stretching toward twenty minutes after about a year. They snap straight back to a fast tier the instant they appear online:");
+            Math("d = days since last login\n"
+               + "\n"
+               + "d <= 180   : minutes = clamp(d, 1, 10)\n"
+               + "180<d<=365 : minutes = 10 + (d-180)/185 * 10\n"
+               + "d  > 365   : minutes = 20\n"
+               + "\n"
+               + "interval = minutes * 60 s\n"
+               + "\n"
+               + "1d->1m   6d->6m   10d..6mo->10m\n"
+               + "~9mo->15m         1yr+->20m");
+            H3("Rate limiting");
+            P("A token bucket smooths and caps the overall call rate so even a very large roster can never burst, and each cycle's checks run concurrently so a sweep finishes in roughly one round-trip rather than one-at-a-time:");
+            Math("bucket refills at a fixed ceiling R checks/min.\n"
+               + "each status check spends 1 token; a cycle spends\n"
+               + "  min(tokens available, per-cycle burst cap)\n"
+               + "checks at once -> the real rate can never exceed\n"
+               + "R/min for ANY roster size.\n"
+               + "\n"
+               + "as the day's usage nears the API limit, R is cut,\n"
+               + "then paused, so the app stays under the daily cap.");
+            H3("Uptime, caching & notes");
+            P("Last login serves two displays, labelled by current status:");
+            Math("online  : uptime    = now - last login\n"
+               + "offline : last seen = now - last login");
+            P("Toggle Show online time to display uptime on online rows. Leaving the tab pauses the poller and caches the list exactly as you left it; returning shows it instantly and resumes by priority (online first, then offline) instead of re-scanning. The slow getplayer call (name, avatar, last login) is cached and only refreshed on an online/offline transition or every half hour. The preview panel shows the in-game avatar (or a coloured initial when none is set), an Open-profile button, a View-current-game button when they are in a match, and a per-friend Notes box.");
+
+            H2("The Hi-Rez API");
+            H3("Request signing");
+            P("Stats come from the official SMITE 1 API. Each request is signed with an MD5 of the developer id, the method name, an auth key and a UTC timestamp:");
+            Math("signature = md5( devId + method + authKey + utcTimestamp )\n"
+               + "url = base / methodJson / devId / signature\n"
+               + "          / sessionId / timestamp / args...");
+            H3("Sessions & the cap");
+            P("A session is created first and reused for its short lifetime; responses come back as JSON arrays. Hi-Rez enforces a daily request limit and a session limit that the app must respect — the exact numbers are not shown here. The friend poller is built to stay well within them via tiered cadences, the offline backoff, pausing while its tab is hidden, caching the slow calls, and the self-throttle above. You can drop your own developer key into an api.txt file to use your own quota instead of the built-in one.");
+            H3("Limitations");
+            P("Two things the API cannot do, by design. It cannot reveal a privacy-flagged player's name or id from a completed match or a friends list — only a live match exposes names, and even then not hard-private profiles. And it does not expose newer in-client avatars: it only knows an older avatar set, so many active players return no avatar (the app shows a coloured initial instead). Resolving linked-account names beyond the primary is also unsupported. These are server-side limits, not app bugs.");
+
+            H2("Your data");
+            P("Everything you save — favorites, recent lookups, hidden-player tags, the friend list with its per-friend notes, your settings, and the god default snapshots — is stored as plain JSON in your Documents folder under Smite Inspector, so a shared copy of the app in a read-only location still works. Nothing is uploaded anywhere; the only network traffic is to the Hi-Rez API, and only for the stats you explicitly request.");
+
+            body.Controls.Add(content); body.Controls.Add(toc);
+            host.Controls.Add(body); host.Controls.Add(top);
             return host;
         }
 
