@@ -3521,7 +3521,7 @@ namespace SmiteGodLab
         // row: clan id, account level, total mastery, the gods seen, and the player_ids of the NAMED players in their
         // party (the strongest signal — a hidden player keeps running with the same friends). Returns the best tag over
         // a confidence threshold, or null. Score design:
-        //   same clan id            +100   |  different clan id           -55  (clan change is possible if companions agree)
+        //   same clan id            +100   |  both clanless                +30  |  clan mismatch  -55  (clan change is possible if companions agree)
         //   level/mastery in ±8/±6  +up to 40 (closer = higher)          |  in loose ±25/±15  +6  |  beyond      -35
         //   each shared companion   +60    (2 shared party-mates can outweigh a clan change)
         //   god previously seen     +12
@@ -3545,7 +3545,9 @@ namespace SmiteGodLab
                 // a DIFFERENT person (even in the same clan). Companion evidence lifts the gate (they may have leveled a lot).
                 if (overlap == 0 && !statsLoose) continue;
                 int score = 0;
-                if (clanId != 0 && t.ClanId == clanId) score += 100; else if (t.ClanId != clanId) score -= 55;
+                if (clanId != 0 && t.ClanId == clanId) score += 100;        // same clan: strong anchor
+                else if (clanId == 0 && t.ClanId == 0) score += 30;          // both clanless: weak anchor (needs close stats or a god to clear 60)
+                else score -= 55;                                           // clan mismatch (changed clan, or one side clanless)
                 if (statsClose) score += 40 - (dl * 2 + dm * 2); else if (statsLoose) score += 6; else score -= 20;
                 score += overlap * 60;
                 if (!string.IsNullOrEmpty(god) && t.Gods != null && t.Gods.Contains(god)) score += 12;
@@ -3557,14 +3559,22 @@ namespace SmiteGodLab
         void SetHiddenTag(int clanId, string clan, int level, int mastery, string nick, IReadOnlyCollection<string> companions = null, string god = null)
         {
             var existing = MatchHidden(clanId, level, mastery, companions, god);
-            if (existing != null) hiddenTags.Remove(existing);
-            if (!string.IsNullOrWhiteSpace(nick))
+            if (string.IsNullOrWhiteSpace(nick))   // empty nick = remove
             {
-                var t = new HiddenTag { ClanId = clanId, Clan = clan, Level = level, Mastery = mastery, Nick = nick.Trim(), Seen = 1, LastSeen = DateTime.Now.ToString("yyyy-MM-dd") };
-                if (companions != null) foreach (var c in companions) if (!string.IsNullOrEmpty(c) && !t.Companions.Contains(c)) t.Companions.Add(c);
-                if (!string.IsNullOrEmpty(god) && !t.Gods.Contains(god)) t.Gods.Add(god);
-                hiddenTags.Add(t);
+                if (existing != null) hiddenTags.Remove(existing);
+                SaveHiddenTags();
+                return;
             }
+            if (existing != null)   // rename in place: keep Seen/companions/gods and fold this sighting's evidence in
+            {
+                existing.Nick = nick.Trim();
+                UpdateSighting(existing, clan, level, mastery, companions, god);   // also saves
+                return;
+            }
+            var t = new HiddenTag { ClanId = clanId, Clan = clan, Level = level, Mastery = mastery, Nick = nick.Trim(), Seen = 1, LastSeen = DateTime.Now.ToString("yyyy-MM-dd") };
+            if (companions != null) foreach (var c in companions) if (!string.IsNullOrEmpty(c) && !t.Companions.Contains(c)) t.Companions.Add(c);
+            if (!string.IsNullOrEmpty(god) && !t.Gods.Contains(god)) t.Gods.Add(god);
+            hiddenTags.Add(t);
             SaveHiddenTags();
         }
         // On every confident sighting, fold the new evidence back into the tag so it tracks the player as they evolve:
@@ -3572,6 +3582,7 @@ namespace SmiteGodLab
         void UpdateSighting(HiddenTag tag, string clan, int level, int mastery, IReadOnlyCollection<string> companions, string god)
         {
             if (tag == null) return;
+            tag.Companions ??= new(); tag.Gods ??= new();
             bool changed = false;
             if (level > tag.Level) { tag.Level = level; changed = true; }
             if (mastery > tag.Mastery) { tag.Mastery = mastery; changed = true; }
