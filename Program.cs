@@ -452,10 +452,17 @@ namespace SmiteGodLab
         }
         static string Deob(int seed, string b64)
         {
-            var d = Convert.FromBase64String(b64);
-            var p = Pad(seed, d.Length);
-            for (int i = 0; i < d.Length; i++) d[i] ^= p[i];
-            return Encoding.UTF8.GetString(d);
+            // Never throw from here: this runs in a static field initializer, so a malformed blob would surface as a
+            // TypeInitializationException on first use and brick every API call — even when a valid api.txt override
+            // exists. Degrade to "" instead; MakeHttp()'s api.txt read still applies and signing fails cleanly.
+            try
+            {
+                var d = Convert.FromBase64String(b64);
+                var p = Pad(seed, d.Length);
+                for (int i = 0; i < d.Length; i++) d[i] ^= p[i];
+                return Encoding.UTF8.GetString(d);
+            }
+            catch { return ""; }
         }
 
         static string Md5(string s)
@@ -628,6 +635,7 @@ namespace SmiteGodLab
         public bool AutoSelectFirst = true;   // pickers default-select row 0 (keyboard nav); the Friend List opts out so no row looks "selected"
         public void SetRows(IEnumerable<PlayerRow> rows)
         {
+            if (IsDisposed) return;   // a queued LiveSort BeginInvoke can fire during teardown — don't touch a dead handle
             // Preserve the selection BY IDENTITY across a re-sort, and update Items IN PLACE when the count is
             // unchanged (e.g. a live status re-sort) — a blanket Items.Clear()+re-add makes the native ListBox
             // blank then refill (the bulk of the refresh flicker).
@@ -756,7 +764,8 @@ namespace SmiteGodLab
         // stationary cursor — a bare index would highlight the row that drifted away instead of the one now under it).
         public void RefreshHover()
         {
-            int next = (IsHandleCreated && ClientRectangle.Contains(PointToClient(Cursor.Position))) ? ActionIndexAt(PointToClient(Cursor.Position)) : -1;
+            int next = -1;
+            if (IsHandleCreated) { var p = PointToClient(Cursor.Position); if (ClientRectangle.Contains(p)) next = ActionIndexAt(p); }
             if (next == _hoverAction) return;
             int prev = _hoverAction; _hoverAction = next;
             if (prev >= 0 && prev < _rows.Count) Invalidate(GetItemRectangle(prev));
@@ -2249,12 +2258,14 @@ namespace SmiteGodLab
             {
                 if (flSort == 0 || sortPending || !flist.IsHandleCreated) return;
                 sortPending = true;
-                flist.BeginInvoke(new Action(() => { sortPending = false; if (flBusy) ApplySort(); }));
+                flist.BeginInvoke(new Action(() => { sortPending = false; if (flBusy && flist.IsHandleCreated && !flist.IsDisposed) ApplySort(); }));
             }
             async Task RefreshFriendList()
             {
+                // Coalesce FIRST: if a pass is in flight, request a re-run rather than mutating flRows mid-flight
+                // (the running pass holds row refs; its trailing flAgain re-run picks up adds/removes/the empty state).
+                if (flBusy) { flAgain = true; return; }
                 if (friendList.Count == 0) { flRows.Clear(); flist.SetRows(new List<PlayerRow>()); hint.ForeColor = Theme.Dim; hint.Text = "No friends yet — add players from the Player Tracker (＋ Friend List)."; return; }
-                if (flBusy) { flAgain = true; return; }   // coalesce: a friend was added / tab re-entered mid-refresh → run once more after
                 flBusy = true;
                 try
                 {
