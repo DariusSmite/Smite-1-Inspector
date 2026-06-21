@@ -619,7 +619,7 @@ namespace SmiteGodLab
         public int StatusSort = 9;                               // for Friend List status sort (0 = in game … higher = offline)
         public string Avatar = "";                               // in-game avatar/icon URL (getplayer Avatar_URL) for the preview panel
         // Friend List live-poller scheduling (runtime only — never serialized to friendlist.json):
-        public int Tier = 1;                                     // refresh priority: 0 god-select · 1 online/lobby · 2 in-game · 3 offline · 5 offline >5d (slowest) · 4 unknown/error
+        public int Tier = 1;                                     // refresh priority: 0 god-select · 1 online/lobby · 2 in-game · 3 offline (backs off by days idle) · 4 unknown/error
         public DateTime NextDueUtc = DateTime.MinValue;          // when getplayerstatus is next eligible (MinValue = due now)
         public DateTime NextDetailUtc = DateTime.MinValue;       // when the slow getplayer (name/avatar/last-login) is next eligible
         public bool Polling;                                     // in-flight guard so a slow await spanning ticks can't double-schedule a row
@@ -2425,9 +2425,17 @@ namespace SmiteGodLab
             const int FlTickBudget = 16;       // max calls started per tick (burst cap; processed concurrently)
             const int FlConcurrency = 12;      // concurrent getplayerstatus requests per tick (parallel = fast sweep, not one-at-a-time)
             var flRng = new Random();
-            // tier cadences (seconds): 0 god-select · 1 online/lobby · 2 in-game · 3 offline · 5 offline >5d · 4 unknown
-            int TierInterval(int tier) => tier == 0 ? 10 : tier == 1 ? 15 : tier == 2 ? 20 : tier == 3 ? 60 : tier == 5 ? 300 : 90;
+            // tier cadences (seconds): 0 god-select · 1 online/lobby · 2 in-game · 3 offline (see OfflineSeconds) · 4 unknown
+            int TierInterval(int tier) => tier == 0 ? 10 : tier == 1 ? 15 : tier == 2 ? 20 : tier == 3 ? 60 : 90;
             int Jitter(int sec) => (int)((flRng.NextDouble() - 0.5) * 0.2 * sec);   // ±10% so rows don't all re-fire in lockstep
+            // Offline players back off the longer they've been gone: ~1 min per day (6 days → 6 min) up to a 10-min cap
+            // that holds through ~6 months, then ramps to 20 min at 1 year. They snap back to a fast tier the moment they log in.
+            int OfflineSeconds(PlayerRow r)
+            {
+                double d = r.LastLogin == DateTime.MinValue ? 0 : (DateTime.Now - r.LastLogin).TotalDays;
+                double mins = d <= 180 ? Math.Max(1, Math.Min(10, d)) : d <= 365 ? 10 + (d - 180) / 185.0 * 10 : 20;
+                return (int)Math.Round(mins * 60);
+            }
             // Compact "freshness" string for the status hint so it's obvious the list is live + when it last checked.
             string AgoShort(DateTime when)
             {
@@ -2466,9 +2474,8 @@ namespace SmiteGodLab
                 }
                 row.StatusSort = code == 3 ? 0 : (code == 1 || code == 2 || code == 4) ? 1 : code == 0 ? 2 : 3;   // drives the Status sort button
                 // refresh priority is separate: god-select (a match is forming) is the most time-sensitive, in-game the least (locked in).
-                // offline players who haven't logged in for >5 days are "deep idle" → checked far less often (tier 5).
-                bool deepIdle = row.LastLogin != DateTime.MinValue && (DateTime.Now - row.LastLogin).TotalDays > 5;
-                row.Tier = code == 2 ? 0 : (code == 1 || code == 4) ? 1 : code == 3 ? 2 : code == 0 ? (deepIdle ? 5 : 3) : 4;
+                // offline (tier 3) backs off by days-idle in OfflineSeconds(); status snapping to online moves them straight to a fast tier.
+                row.Tier = code == 2 ? 0 : (code == 1 || code == 4) ? 1 : code == 3 ? 2 : code == 0 ? 3 : 4;
                 return code;
             }
             // Slow, rarely-changing details: name self-heal + last login + avatar. Returns true if the display name changed.
@@ -2601,7 +2608,7 @@ namespace SmiteGodLab
                                 finally
                                 {
                                     row.Polling = false;
-                                    int iv = TierInterval(row.Tier);
+                                    int iv = row.Tier == 3 ? OfflineSeconds(row) : TierInterval(row.Tier);
                                     if (row.ErrBackoff > 0) iv = (int)Math.Min(600, iv * Math.Pow(2, row.ErrBackoff));   // back off a flapping/dead id
                                     row.NextDueUtc = DateTime.UtcNow.AddSeconds(iv + Jitter(iv));
                                     if (curMode == 2 && !IsDisposed && flRows.Contains(row)) flist.UpdateRow(row);
