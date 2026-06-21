@@ -28,7 +28,7 @@ dotnet publish -c Release -r win-x64 --self-contained true ^
   -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
 ```
 
-The result is `bin\Release\net8.0-windows\win-x64\publish\SmiteGodLab.exe` (~158 MB).
+The result is `bin\Release\net8.0-windows\win-x64\publish\SmiteInspector.exe` (~158 MB).
 `build.bat` runs the same publish.
 
 ## API key (Player Tracker)

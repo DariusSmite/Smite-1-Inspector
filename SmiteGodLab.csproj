@@ -6,10 +6,10 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>disable</Nullable>
-    <AssemblyName>SmiteGodLab</AssemblyName>
+    <AssemblyName>SmiteInspector</AssemblyName>
     <RootNamespace>SmiteGodLab</RootNamespace>
     <Version>0.1.0</Version>
-    <Product>SMITE God Lab</Product>
+    <Product>Smite 1 Inspector</Product>
     <!-- Publish hints; the build.bat passes these on the command line too. -->
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
