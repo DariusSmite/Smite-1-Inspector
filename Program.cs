@@ -2331,11 +2331,12 @@ namespace SmiteGodLab
             var dSeen = new Label { Location = new Point(S(132), S(84)), AutoSize = true, Font = Theme.F(9f), ForeColor = Theme.Dim, BackColor = Theme.Panel };
             var dPrompt = new Label { Location = new Point(S(22), S(134)), AutoSize = true, Font = Theme.F(9.5f), ForeColor = Theme.Dim, BackColor = Theme.Panel, Text = "Open this player's full profile?" };
             var dOpen = MkBtn("Open profile  →", 156, false, Theme.Blue, Color.White); dOpen.Location = new Point(S(22), S(160));
+            var dViewGame = MkBtn("● View current game", 184, false, Theme.Input, Theme.Green); dViewGame.Location = new Point(S(22), S(198));
             var dHint = new Label { Location = new Point(S(22), S(26)), AutoSize = true, Font = Theme.F(10f), ForeColor = Theme.Dim, BackColor = Theme.Panel, Text = "Click a friend to preview their profile." };
-            detail.Controls.Add(dAvatar); detail.Controls.Add(dName); detail.Controls.Add(dSub); detail.Controls.Add(dSeen); detail.Controls.Add(dPrompt); detail.Controls.Add(dOpen); detail.Controls.Add(dHint);
+            detail.Controls.Add(dAvatar); detail.Controls.Add(dName); detail.Controls.Add(dSub); detail.Controls.Add(dSeen); detail.Controls.Add(dPrompt); detail.Controls.Add(dOpen); detail.Controls.Add(dViewGame); detail.Controls.Add(dHint);
 
             string detailId = null;
-            void HideDetail() { detailId = null; dImg = null; dAvatar.Visible = dName.Visible = dSub.Visible = dSeen.Visible = dPrompt.Visible = dOpen.Visible = false; dHint.Visible = true; }
+            void HideDetail() { detailId = null; dImg = null; dAvatar.Visible = dName.Visible = dSub.Visible = dSeen.Visible = dPrompt.Visible = dOpen.Visible = dViewGame.Visible = false; dHint.Visible = true; }
             async void ShowDetail(PlayerRow r)   // async void → wrap the whole body so a stray throw can't crash the message loop
             {
                 try
@@ -2346,9 +2347,13 @@ namespace SmiteGodLab
                     dSub.Text = pc + "    ·    " + (string.IsNullOrEmpty(r.Status) || r.Status == "…" ? "—" : r.Status);
                     dSub.ForeColor = r.StatusCol;
                     dSeen.Text = r.LastLogin > DateTime.MinValue ? "Last seen " + RelTime(r.LastLogin) : "";
-                    dOpen.Tag = r;
+                    dOpen.Tag = r; dViewGame.Tag = r;
+                    bool inGame = r.StatusSort == 0;   // 0 = In Game (set in RefreshFriendList)
+                    dViewGame.Enabled = inGame;
+                    dViewGame.ForeColor = inGame ? Theme.Green : Color.FromArgb(95, 95, 95);
+                    dViewGame.Text = inGame ? "● View current game" : "Not in a game";
                     dHint.Visible = false;
-                    dAvatar.Visible = dName.Visible = dSub.Visible = dSeen.Visible = dPrompt.Visible = dOpen.Visible = true;
+                    dAvatar.Visible = dName.Visible = dSub.Visible = dSeen.Visible = dPrompt.Visible = dOpen.Visible = dViewGame.Visible = true;
                     dImg = null; dAvatar.Invalidate();
                     var img = await LoadAvatar(r.Avatar);
                     if (detailId == r.Id) { dImg = img; dAvatar.Invalidate(); }   // ignore if the user clicked a different friend meanwhile
@@ -2356,6 +2361,7 @@ namespace SmiteGodLab
                 catch { }
             }
             dOpen.Click += async (s, e) => { if (dOpen.Tag is PlayerRow rr) { SelectNav(1); if (_trkLoadPlayer != null) await _trkLoadPlayer(rr.Id, rr.Name); } };
+            dViewGame.Click += async (s, e) => { if (dViewGame.Enabled && dViewGame.Tag is PlayerRow rr) await ViewLiveGame(rr.Id); };
             HideDetail();
 
             body.Controls.Add(detail); body.Controls.Add(col);   // Fill (detail) added before the Left (col) so it fills the remainder
@@ -2474,7 +2480,7 @@ namespace SmiteGodLab
                 var subBar = new Panel { Dock = DockStyle.Top, Height = S(42), BackColor = Theme.Panel };
                 var subBarLine = new Panel { Dock = DockStyle.Bottom, Height = S(1), BackColor = Theme.Line };
                 var subFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, BackColor = Theme.Panel, Padding = new Padding(S(14), S(2), 0, 0) };
-                var primaryTabs = new[] { MkSubTab("Track"), MkSubTab("Favorites"), MkSubTab("Recent") };
+                var primaryTabs = new[] { MkSubTab("Track"), MkSubTab("Favorites"), MkSubTab("Recent"), MkSubTab("Hidden") };
                 foreach (var t in primaryTabs) subFlow.Controls.Add(t);
                 subBar.Controls.Add(subFlow); subBar.Controls.Add(subBarLine);
 
@@ -2579,6 +2585,7 @@ namespace SmiteGodLab
                 var plist = new PlayerList { Dock = DockStyle.Fill, Font = Theme.F(10.5f) };
                 var listCol = new Panel { Dock = DockStyle.Left, Width = S(740), BackColor = Theme.Bg, Visible = false, Padding = new Padding(S(14), S(8), 0, S(8)) };
                 listCol.Controls.Add(plist);
+                var hiddenHost = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg, Visible = false, AutoScroll = true };   // "Hidden" primary tab: nicknamed-hidden-player cards
                 card.Controls.Add(namePanel); card.Controls.Add(statusLbl); card.Controls.Add(statsLbl);
                 card.Resize += (s, e) => { statsLbl.Width = card.Width - S(28); statusLbl.Left = card.Width - S(180); namePanel.Width = Math.Max(S(200), card.Width - S(200)); namePanel.Invalidate(); };
 
@@ -2617,7 +2624,7 @@ namespace SmiteGodLab
                 matchFullHost.Controls.Add(matchLvFull); matchFullHost.Controls.Add(matchFullHdr);
 
                 var body = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg };
-                body.Controls.Add(listCol); body.Controls.Add(achPanel); body.Controls.Add(matchFullHost); body.Controls.Add(godFullHost); body.Controls.Add(splitHost);
+                body.Controls.Add(listCol); body.Controls.Add(hiddenHost); body.Controls.Add(achPanel); body.Controls.Add(matchFullHost); body.Controls.Add(godFullHost); body.Controls.Add(splitHost);
                 // Stage = the whole area below the search bar. Only Overview shows the profile card + masteries|matches split;
                 // every other tab hides the card and fills the area with one dedicated view.
                 // 0 Overview · 1 Masteries · 2 Matches · 3 Achievements · 4 List (search results / favorites / recents / friends)
@@ -2630,7 +2637,8 @@ namespace SmiteGodLab
                     matchFullHost.Visible = st == 2;
                     achPanel.Visible = st == 3;
                     listCol.Visible = st == 4;
-                    (st == 1 ? (Control)godFullHost : st == 2 ? matchFullHost : st == 3 ? achPanel : st == 4 ? listCol : splitHost).BringToFront();
+                    hiddenHost.Visible = st == 5;
+                    (st == 1 ? (Control)godFullHost : st == 2 ? matchFullHost : st == 3 ? achPanel : st == 4 ? listCol : st == 5 ? hiddenHost : splitHost).BringToFront();
                     if (st == 3) achPanel.Invalidate();
                 }
                 // Default split width is in S() space; a ClientSize-derived /2 reads device px under PerMonitorV2 and collapses the right pane, so we DON'T auto-resize — the Splitter lets the user adjust.
@@ -3118,6 +3126,53 @@ namespace SmiteGodLab
                     curSecondary = j; StyleSecondary(j);
                     switch (j) { case 0: ShowSearchView(); break; case 1: ShowExpanded(1); break; case 2: ShowExpanded(2); break; case 3: ShowAchievements(); break; case 4: _ = Guarded(ShowFriends); break; }
                 }
+                Control MakeHiddenCard(HiddenTag t, int y)
+                {
+                    int conf = HiddenConfidence(t);
+                    string lvl = conf >= 70 ? "High" : conf >= 45 ? "Medium" : "Low";
+                    Color cc = conf >= 70 ? Theme.Green : conf >= 45 ? Theme.Yellow : Color.FromArgb(210, 95, 95);
+                    var card = new Panel { Location = new Point(S(14), y), Size = new Size(S(620), S(104)), BackColor = Theme.Panel, Cursor = Cursors.Hand };
+                    var nick = new Label { Location = new Point(S(16), S(10)), AutoSize = true, Font = Theme.F(13f, FontStyle.Bold), ForeColor = Theme.Blue, BackColor = Theme.Panel, Text = "★ " + t.Nick };
+                    var pill = new Panel { Location = new Point(S(456), S(12)), Size = new Size(S(148), S(28)), BackColor = Theme.Panel };
+                    pill.Paint += (s, e) =>
+                    {
+                        var gg = e.Graphics; gg.SmoothingMode = SmoothingMode.AntiAlias;
+                        using (var pen = new Pen(cc, S(2))) gg.DrawRectangle(pen, S(1), S(1), pill.Width - S(3), pill.Height - S(3));
+                        TextRenderer.DrawText(gg, "Confidence " + conf + "%", Theme.F(9f, FontStyle.Bold), pill.ClientRectangle, cc, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                    };
+                    string clanTxt = string.IsNullOrEmpty(t.Clan) ? "no clan" : "[" + t.Clan + "]";
+                    var d1 = new Label { Location = new Point(S(16), S(44)), AutoSize = true, Font = Theme.F(9.5f), ForeColor = Theme.Text, BackColor = Theme.Panel, Text = clanTxt + "    ·    Level " + t.Level + "    ·    Mastery " + t.Mastery + "    ·    " + lvl + " confidence" };
+                    string godsTxt = (t.Gods != null && t.Gods.Count > 0) ? "Gods: " + string.Join(", ", t.Gods.Take(6)) : "Gods: —";
+                    var d2 = new Label { Location = new Point(S(16), S(66)), AutoSize = true, Font = Theme.F(9f), ForeColor = Theme.Dim, BackColor = Theme.Panel, Text = godsTxt };
+                    string comp = (t.Companions != null && t.Companions.Count > 0) ? "    ·    " + t.Companions.Count + " known party-mate" + (t.Companions.Count == 1 ? "" : "s") : "";
+                    var d3 = new Label { Location = new Point(S(16), S(84)), AutoSize = true, Font = Theme.F(8.5f), ForeColor = Theme.Dim, BackColor = Theme.Panel, Text = "Seen " + t.Seen + "×" + (string.IsNullOrEmpty(t.LastSeen) ? "" : "    ·    last " + t.LastSeen) + comp + "    ·    click to rename / clear" };
+                    EventHandler editIt = (s, e) =>
+                    {
+                        string n = PromptText("Rename hidden player “" + t.Nick + "”", "Edit the nickname, or clear the box to delete it.", t.Nick);
+                        if (n == null) return;
+                        if (string.IsNullOrWhiteSpace(n)) hiddenTags.Remove(t); else t.Nick = n.Trim();
+                        SaveHiddenTags(); ShowHidden();
+                    };
+                    card.Click += editIt; nick.Click += editIt; d1.Click += editIt; d2.Click += editIt; d3.Click += editIt;
+                    card.Controls.Add(nick); card.Controls.Add(pill); card.Controls.Add(d1); card.Controls.Add(d2); card.Controls.Add(d3);
+                    return card;
+                }
+                void ShowHidden()
+                {
+                    StylePrimary(3); subBar2.Visible = false;
+                    hiddenHost.Controls.Clear();
+                    if (hiddenTags.Count == 0)
+                    {
+                        hiddenHost.Controls.Add(new Label { Location = new Point(S(20), S(20)), AutoSize = true, ForeColor = Theme.Dim, Font = Theme.F(10.5f),
+                            Text = "No nicknamed hidden players yet.\r\n\r\nOpen a match scoreboard (double-click a Recent Match) or a live game, click a\r\n“Private” row, and give them a nickname — they'll show up here with a confidence score." });
+                        ShowStage(5); hint.ForeColor = Theme.Dim; hint.Text = "Hidden players you've nicknamed."; return;
+                    }
+                    int y = S(12);
+                    foreach (var t in hiddenTags.OrderByDescending(HiddenConfidence).ThenByDescending(x => x.Seen))
+                    { hiddenHost.Controls.Add(MakeHiddenCard(t, y)); y += S(116); }
+                    ShowStage(5);
+                    hint.ForeColor = Theme.Dim; hint.Text = hiddenTags.Count + " nicknamed hidden player" + (hiddenTags.Count == 1 ? "" : "s") + " — click a card to rename or clear.";
+                }
                 void SelectPrimary(int i)
                 {
                     StylePrimary(i);
@@ -3126,7 +3181,7 @@ namespace SmiteGodLab
                         subBar2.Visible = PlayerLoaded();
                         if (PlayerLoaded()) SelectSecondary(curSecondary); else ShowSearchView();
                     }
-                    else { subBar2.Visible = false; if (i == 1) ShowFavorites(); else ShowRecents(); }
+                    else { subBar2.Visible = false; if (i == 1) ShowFavorites(); else if (i == 2) ShowRecents(); else ShowHidden(); }
                 }
                 for (int i = 0; i < primaryTabs.Length; i++) { int k = i; primaryTabs[i].Click += (s, e) => SelectPrimary(k); }
                 for (int j = 0; j < secondaryTabs.Length; j++) { int k = j; secondaryTabs[j].Click += (s, e) => SelectSecondary(k); }
@@ -3471,6 +3526,11 @@ namespace SmiteGodLab
         //   each shared companion   +60    (2 shared party-mates can outweigh a clan change)
         //   god previously seen     +12
         // Threshold 60: same-clan always clears it (anchor); a clan change needs ≥2 shared companions to re-link.
+        // How reliably the heuristic can re-recognise this tagged hidden player (0–99). More sightings + cross-evidence
+        // (shared party-mates, gods seen) = higher; a lone first tag is modest.
+        int HiddenConfidence(HiddenTag t)
+            => Math.Min(99, 25 + t.Seen * 18 + Math.Min(t.Companions?.Count ?? 0, 4) * 8 + Math.Min(t.Gods?.Count ?? 0, 3) * 4);
+
         HiddenTag MatchHidden(int clanId, int level, int mastery, IReadOnlyCollection<string> companions = null, string god = null)
         {
             HiddenTag best = null; int bestScore = int.MinValue;
@@ -3678,7 +3738,7 @@ namespace SmiteGodLab
                 if (!priv)
                 {
                     nameLbl.ForeColor = tag != null ? Theme.Blue : Theme.Text;
-                    nameLbl.Text = god + "  —  " + nm;
+                    nameLbl.Text = nm;   // god is shown by the icon — drop the name prefix so the player name reads clearly
                     string gp = "KDA " + kda + "   ·   Lv " + GI(pl, "Final_Match_Level") + "   ·   " + GI(pl, "Gold_Earned").ToString("N0") + "g   ·   " + GI(pl, "Damage_Player").ToString("N0") + " dmg";
                     subLbl.ForeColor = tag != null ? Theme.Blue : Theme.Dim;
                     subLbl.Text = tag != null ? "tagged ★ " + tag.Nick + "   ·   " + gp : gp;
@@ -3687,7 +3747,7 @@ namespace SmiteGodLab
                 if (tag != null) UpdateSighting(tag, clan, acct, mast, companions, god);   // fold this sighting in (level/mastery/companions/gods)
                 string tail = clan.Length > 0 ? "  ·  [" + clan + "]" : "";
                 nameLbl.ForeColor = tag != null ? Theme.Blue : Theme.Yellow;
-                nameLbl.Text = god + "  —  " + (tag != null ? "★ " + tag.Nick + tail : "Private" + tail + "   (click to name)");
+                nameLbl.Text = tag != null ? "★ " + tag.Nick + tail : "Private" + tail + "   (click to name)";
                 subLbl.ForeColor = Theme.Dim;
                 string conf = tag != null && tag.Seen > 1 ? "   ·   seen " + tag.Seen + "×" : "";
                 subLbl.Text = "Acct Lv " + acct + "   ·   Mastery " + mast + "   ·   " + kda + conf;
@@ -3748,6 +3808,22 @@ namespace SmiteGodLab
             }
         }
 
+        // Open the live-match roster for a player IF they're in a game right now (used by the friend preview panel).
+        async Task ViewLiveGame(string id)
+        {
+            try
+            {
+                using var sdoc = JsonDocument.Parse(await SmiteApi.Call("getplayerstatus", id));
+                if (sdoc.RootElement.ValueKind == JsonValueKind.Array && sdoc.RootElement.GetArrayLength() > 0)
+                {
+                    var st = sdoc.RootElement[0]; string m = GS(st, "Match");
+                    if (GI(st, "status") == 3 && !string.IsNullOrEmpty(m) && m != "0") { await ShowLiveMatch(m); return; }
+                }
+                MessageBox.Show(this, "This player isn't in a live game right now.", "SMITE");
+            }
+            catch (Exception ex) { MessageBox.Show(this, "Couldn't load the live game: " + ex.Message, "SMITE", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        }
+
         async Task ShowLiveMatch(string matchId)
         {
             JsonDocument doc;
@@ -3800,10 +3876,36 @@ namespace SmiteGodLab
             string god = GS(pl, "GodName");
             row.Controls.Add(new PictureBox { Location = new Point(S(6), S(4)), Size = new Size(S(32), S(32)), SizeMode = PictureBoxSizeMode.Zoom, Image = GodListIcon(god) });
             string nm = GS(pl, "playerName"); bool priv = string.IsNullOrEmpty(nm);
-            row.Controls.Add(new Label { Location = new Point(S(46), S(3)), Size = new Size(S(380), S(18)), Font = Theme.F(9.5f, FontStyle.Bold), ForeColor = priv ? Theme.Dim : Theme.Text, Text = god + "  —  " + (priv ? "(private profile)" : nm) });
-            int tier = GI(pl, "Tier");
-            string sub = "Mastery " + GI(pl, "Mastery_Level") + "   ·   Account Lv " + GI(pl, "Account_Level") + "   ·   " + (tier > 0 ? "Ranked: " + TierName(tier) + " (" + GI(pl, "tierWins") + "-" + GI(pl, "tierLosses") + ")" : "Unranked");
-            row.Controls.Add(new Label { Location = new Point(S(46), S(21)), Size = new Size(S(620), S(16)), Font = Theme.F(8.5f), ForeColor = Theme.Dim, Text = sub });
+            int clanId = GI(pl, "TeamId"), acct = GI(pl, "Account_Level"), mast = GI(pl, "Mastery_Level"), tier = GI(pl, "Tier");
+            string clan = GS(pl, "Team_Name");
+            string tail = clan.Length > 0 ? "  ·  [" + clan + "]" : "";
+            var nameLbl = new Label { Location = new Point(S(46), S(3)), Size = new Size(S(560), S(18)), Font = Theme.F(9.5f, FontStyle.Bold), AutoEllipsis = true };
+            var subLbl = new Label { Location = new Point(S(46), S(21)), Size = new Size(S(620), S(16)), Font = Theme.F(8.5f), ForeColor = Theme.Dim };
+            void Paint()
+            {
+                var tag = priv ? MatchHidden(clanId, acct, mast, null, god) : null;
+                nameLbl.ForeColor = !priv ? Theme.Text : tag != null ? Theme.Blue : Theme.Yellow;
+                nameLbl.Text = !priv ? nm : tag != null ? "★ " + tag.Nick + tail : "Private profile" + tail + "   (click to name)";
+                string conf = priv && tag != null && tag.Seen > 1 ? "   ·   seen " + tag.Seen + "×" : "";
+                subLbl.Text = "Mastery " + mast + "   ·   Account Lv " + acct + "   ·   " + (tier > 0 ? "Ranked: " + TierName(tier) + " (" + GI(pl, "tierWins") + "-" + GI(pl, "tierLosses") + ")" : "Unranked") + conf;
+            }
+            Paint();
+            row.Controls.Add(nameLbl); row.Controls.Add(subLbl);
+            if (priv)   // hidden in a LIVE game → let the user name them (weaker fingerprint than a finished scoreboard, but it's the user's own tag)
+            {
+                EventHandler tagIt = (s, e) =>
+                {
+                    var cur = MatchHidden(clanId, acct, mast, null, god);
+                    string nick = PromptText("Name this hidden player",
+                        god + tail + "   ·   Acct Lv " + acct + "   ·   Mastery " + mast + "\r\n(matched by " + (clan.Length > 0 ? "clan + " : "") + "level + mastery; clear the box to remove)",
+                        cur?.Nick ?? "");
+                    if (nick == null) return;
+                    SetHiddenTag(clanId, clan, acct, mast, nick, null, god);
+                    Paint();
+                };
+                row.Cursor = nameLbl.Cursor = subLbl.Cursor = Cursors.Hand;
+                row.Click += tagIt; nameLbl.Click += tagIt; subLbl.Click += tagIt;
+            }
             return row;
         }
 
