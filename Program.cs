@@ -423,6 +423,17 @@ namespace SmiteGodLab
         static string _sid;
         static DateTime _sidUtc = DateTime.MinValue;
 
+        // Free, local-only tally of how many requests THIS app has made today (resets at local midnight). Costs no
+        // extra API calls — it just counts the ones we already make — so the Friend List poller can throttle itself
+        // before it nears the key's daily request cap. (It can't see calls from other tools sharing the same key.)
+        static int _reqCount;
+        static DateTime _reqDay = DateTime.MinValue;
+        // Roll the day on READ as well as on count, so a poller that throttled itself to silence still un-sticks at
+        // midnight (the reset can't depend on an outbound call, or hitting the cap would freeze it permanently).
+        static void RollDay() { var today = DateTime.Now.Date; if (today != _reqDay) { _reqDay = today; _reqCount = 0; } }
+        public static int RequestsToday { get { RollDay(); return _reqCount; } }
+        static void CountRequest() { RollDay(); _reqCount++; }
+
         static HttpClient MakeHttp()
         {
             var h = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
@@ -481,6 +492,7 @@ namespace SmiteGodLab
             if (_sid != null && (DateTime.UtcNow - _sidUtc).TotalMinutes < 13) return _sid;
             string t = Ts();
             string url = Base + "/createsessionJson/" + _dev + "/" + Md5(_dev + "createsession" + _auth + t) + "/" + t;
+            CountRequest();
             using var doc = JsonDocument.Parse(await _http.GetStringAsync(url));
             if (doc.RootElement.TryGetProperty("session_id", out var sid) && sid.ValueKind == JsonValueKind.String && sid.GetString().Length > 0)
             {
@@ -497,6 +509,7 @@ namespace SmiteGodLab
             string t = Ts();
             string url = Base + "/" + method + "Json/" + _dev + "/" + Md5(_dev + method + _auth + t) + "/" + sid + "/" + t;
             foreach (var a in args) url += "/" + Uri.EscapeDataString(a);
+            CountRequest();
             return await _http.GetStringAsync(url);
         }
     }
@@ -605,6 +618,12 @@ namespace SmiteGodLab
         public DateTime LastLogin = DateTime.MinValue;           // for Friend List "last seen" sort
         public int StatusSort = 9;                               // for Friend List status sort (0 = in game … higher = offline)
         public string Avatar = "";                               // in-game avatar/icon URL (getplayer Avatar_URL) for the preview panel
+        // Friend List live-poller scheduling (runtime only — never serialized to friendlist.json):
+        public int Tier = 1;                                     // 0 in-game · 1 online/lobby/queue · 2 offline · 3 unknown/error (= StatusSort)
+        public DateTime NextDueUtc = DateTime.MinValue;          // when getplayerstatus is next eligible (MinValue = due now)
+        public DateTime NextDetailUtc = DateTime.MinValue;       // when the slow getplayer (name/avatar/last-login) is next eligible
+        public bool Polling;                                     // in-flight guard so a slow await spanning ticks can't double-schedule a row
+        public int ErrBackoff;                                   // consecutive getplayerstatus failures → exponential backoff
         public static PlayerRow Section(string caption, string key = "") => new PlayerRow { Header = true, Name = caption, Key = key };
     }
 
@@ -932,7 +951,8 @@ namespace SmiteGodLab
         Button[] navBtns;                            // left rail: 0 God Inspector, 1 Player Tracker, 2 Friend List, 3 Settings (tracker Track/Saved/Favorites/Friends are sub-tabs inside the view)
         int navIdx;
         Panel settingsHost, friendListHost;          // Settings tab / Friend List tab content
-        Action _refreshFriendList;                   // re-fetch statuses for the Friend List tab
+        Action _flShow;                              // entering the Friend List tab: seed once, else resume the live poller
+        Action _flPause;                             // leaving the Friend List tab: pause the live poller
         Button friendAddBtn;                         // ＋ add-current-player-to-Friend-List toggle (tracker)
         readonly AppSettings settings = new AppSettings();
         readonly List<FavPlayer> friendList = new List<FavPlayer>();   // user buddy list w/ live status (friendlist.json)
@@ -1141,7 +1161,7 @@ namespace SmiteGodLab
             navIdx = idx;
             if (navBtns != null) for (int i = 0; i < navBtns.Length; i++) StyleNav(navBtns[i], i == idx);
             if (idx == 0) { SwitchMode(0); return; }
-            if (idx == 2) { SwitchMode(2); _refreshFriendList?.Invoke(); return; }
+            if (idx == 2) { SwitchMode(2); _flShow?.Invoke(); return; }
             if (idx == 3) { SwitchMode(3); return; }
             bool wasTracker = curMode == 1;
             SwitchMode(1);
@@ -1152,6 +1172,7 @@ namespace SmiteGodLab
         void SwitchMode(int mode)
         {
             curMode = mode;
+            if (mode != 2) _flPause?.Invoke();   // stop the Friend List live poller whenever another tab is showing (zero FL calls while hidden)
             bool insp = mode == 0, trk = mode == 1, fl = mode == 2, set = mode == 3;
             split.Visible = insp;
             trackerHost.Visible = trk;
@@ -2379,6 +2400,18 @@ namespace SmiteGodLab
             bool flBusy = false;
             bool flAgain = false;   // a refresh was requested while one was in flight → re-run once when it finishes
             bool sortPending = false;
+            // --- live poller state (continuous, priority-tiered, runs only while the Friend List tab is visible) ---
+            var flPoll = new System.Windows.Forms.Timer { Interval = 2000 };   // wakes every 2s; polls only rows that are actually due
+            bool flSeeded = false;     // the first full pass has completed at least once (so re-entry never rebuilds)
+            bool flTicking = false;    // re-entrancy guard: a tick's awaits can outlast the 2s interval
+            double flTokens = 0;       // token bucket: smooths + caps the call rate regardless of roster size
+            DateTime flLastFill = DateTime.UtcNow;
+            const double FlCallsPerMin = 40;   // sustained ceiling on getplayerstatus calls/min while the tab is open
+            const int FlTickBudget = 8;        // max calls started per 2s tick (burst cap)
+            var flRng = new Random();
+            // faster-than-snappy tier cadences (seconds): in-game / online / offline / unknown
+            int TierInterval(int tier) => tier == 0 ? 15 : tier == 1 ? 30 : tier == 2 ? 180 : 90;
+            int Jitter(int sec) => (int)((flRng.NextDouble() - 0.5) * 0.2 * sec);   // ±10% so rows don't all re-fire in lockstep
             // Re-sort live as statuses arrive so the list stays ordered in real time. Coalesced via a single
             // pending post (a burst of completions triggers at most one re-sort per message-pump cycle), and a
             // no-op for A-Z (a status change can't affect alphabetical order).
@@ -2386,7 +2419,37 @@ namespace SmiteGodLab
             {
                 if (flSort == 0 || sortPending || !flist.IsHandleCreated) return;
                 sortPending = true;
-                flist.BeginInvoke(new Action(() => { sortPending = false; if (flBusy && flist.IsHandleCreated && !flist.IsDisposed) ApplySort(); }));
+                flist.BeginInvoke(new Action(() => { sortPending = false; if ((flBusy || curMode == 2) && flist.IsHandleCreated && !flist.IsDisposed) ApplySort(); }));
+            }
+            // Cheap heartbeat: one getplayerstatus → sets Status/StatusCol/StatusSort/Tier. Returns the raw status code.
+            async Task<int> PullStatus(PlayerRow row)
+            {
+                int code = -1;
+                using (var sdoc = JsonDocument.Parse(await SmiteApi.Call("getplayerstatus", row.Id)))
+                {
+                    if (sdoc.RootElement.ValueKind == JsonValueKind.Array && sdoc.RootElement.GetArrayLength() > 0)
+                    { var st = sdoc.RootElement[0]; code = GI(st, "status"); var (t, c) = StatusInfo(code, GS(st, "status_string")); row.Status = t; row.StatusCol = c; }
+                    else { row.Status = "?"; row.StatusCol = Theme.Dim; }
+                }
+                row.StatusSort = code == 3 ? 0 : (code == 1 || code == 2 || code == 4) ? 1 : code == 0 ? 2 : 3;
+                row.Tier = row.StatusSort;
+                return code;
+            }
+            // Slow, rarely-changing details: name self-heal + last login + avatar. Returns true if the display name changed.
+            async Task<bool> PullPlayer(PlayerRow row)
+            {
+                bool nameChanged = false;
+                using var pdoc = JsonDocument.Parse(await SmiteApi.Call("getplayer", row.Id));
+                if (pdoc.RootElement.ValueKind == JsonValueKind.Array && pdoc.RootElement.GetArrayLength() > 0)
+                {
+                    var pp = pdoc.RootElement[0];
+                    var ig = GS(pp, "hz_player_name"); if (string.IsNullOrEmpty(ig)) ig = GS(pp, "Name");   // self-heal display name
+                    if (!string.IsNullOrEmpty(ig) && ig != row.Name)
+                    { row.Name = ig; var fe = friendList.FirstOrDefault(f => f.Id == row.Id); if (fe != null) fe.Name = ig; nameChanged = true; }
+                    row.LastLogin = ParseApiDate(GS(pp, "Last_Login_Datetime"));
+                    row.Avatar = GS(pp, "Avatar_URL");   // in-game icon for the preview panel
+                }
+                return nameChanged;
             }
             async Task RefreshFriendList()
             {
@@ -2409,30 +2472,12 @@ namespace SmiteGodLab
                         await sem.WaitAsync();
                         try
                         {
-                            int code = -1;
-                            using (var sdoc = JsonDocument.Parse(await SmiteApi.Call("getplayerstatus", row.Id)))
-                            {
-                                if (sdoc.RootElement.ValueKind == JsonValueKind.Array && sdoc.RootElement.GetArrayLength() > 0)
-                                { var st = sdoc.RootElement[0]; code = GI(st, "status"); var (t, c) = StatusInfo(code, GS(st, "status_string")); row.Status = t; row.StatusCol = c; }
-                                else { row.Status = "?"; row.StatusCol = Theme.Dim; }
-                            }
-                            row.StatusSort = code == 3 ? 0 : (code == 1 || code == 2 || code == 4) ? 1 : code == 0 ? 2 : 3;
-                            if (fetchDetails)
-                            {
-                                using var pdoc = JsonDocument.Parse(await SmiteApi.Call("getplayer", row.Id));
-                                if (pdoc.RootElement.ValueKind == JsonValueKind.Array && pdoc.RootElement.GetArrayLength() > 0)
-                                {
-                                    var pp = pdoc.RootElement[0];
-                                    var ig = GS(pp, "hz_player_name"); if (string.IsNullOrEmpty(ig)) ig = GS(pp, "Name");   // self-heal display name
-                                    if (!string.IsNullOrEmpty(ig) && ig != row.Name)
-                                    { row.Name = ig; var fe = friendList.FirstOrDefault(f => f.Id == row.Id); if (fe != null) fe.Name = ig; nameChanged = true; }
-                                    row.LastLogin = ParseApiDate(GS(pp, "Last_Login_Datetime"));
-                                    row.Avatar = GS(pp, "Avatar_URL");   // in-game icon for the preview panel
-                                    row.Extra = code == 0 ? RelTime(row.LastLogin) : "";   // show "last seen" only for offline friends
-                                }
-                            }
+                            int code = await PullStatus(row);
+                            row.ErrBackoff = 0;
+                            if (fetchDetails) { if (await PullPlayer(row)) nameChanged = true; row.NextDetailUtc = DateTime.UtcNow.AddMinutes(30); }
+                            row.Extra = code == 0 ? RelTime(row.LastLogin) : "";   // show "last seen" only for offline friends
                         }
-                        catch { if (string.IsNullOrEmpty(row.Status) || row.Status == "…") { row.Status = "?"; row.StatusCol = Theme.Dim; } }
+                        catch { row.ErrBackoff++; row.Tier = 3; if (string.IsNullOrEmpty(row.Status) || row.Status == "…") { row.Status = "?"; row.StatusCol = Theme.Dim; } }
                         finally { sem.Release(); }
                         flist.UpdateRow(row);   // repaint just this row (no whole-list flash) …
                         LiveSort();             // … and re-order live as statuses land (throttled; A-Z is a no-op)
@@ -2442,10 +2487,95 @@ namespace SmiteGodLab
                     ApplySort();
                     int online = flRows.Count(r => r.StatusSort <= 1);
                     hint.ForeColor = Theme.Dim; hint.Text = friendList.Count + " friends · " + online + " online · updated " + FmtNow();
+                    // hand off to the live poller: every row is due now (the bucket spreads them out) and gets its tier cadence
+                    flSeeded = true;
+                    var seedNow = DateTime.UtcNow;
+                    foreach (var r in flRows) { r.NextDueUtc = seedNow; if (r.NextDetailUtc == DateTime.MinValue) r.NextDetailUtc = seedNow.AddMinutes(30); }
+                    if (curMode == 2 && !flPoll.Enabled) flPoll.Start();
                 }
                 catch (Exception ex) { hint.ForeColor = Theme.AccentHi; hint.Text = "Status check failed: " + ex.Message; }
                 finally { flBusy = false; progBox.Visible = false; }
                 if (flAgain) { flAgain = false; await RefreshFriendList(); }   // pick up adds/removes that arrived during this pass
+            }
+            // Bring flRows into sync with friendList without a full network refresh: append new friends (due immediately),
+            // drop removed ones. Called on tab re-entry and at the top of every poll tick so adds/removes are seamless.
+            void ReconcileRows()
+            {
+                bool changed = false;
+                foreach (var f in friendList)
+                    if (!flRows.Any(r => r.Id == f.Id)) { flRows.Add(Row(f)); changed = true; }   // NextDueUtc = MinValue → polled next tick
+                if (flRows.RemoveAll(r => !r.Header && !friendList.Any(f => f.Id == r.Id)) > 0) changed = true;
+                if (changed) ApplySort();
+            }
+            // The continuous priority-tiered poller. Forms.Timer fires on the UI thread and awaits resume on it, so every
+            // flRows/flist access here is lock-free. Each tick: refill the bucket, free-refresh offline "last seen",
+            // reconcile adds/removes, then spend tokens on the most-overdue rows (in-game refreshes fastest, offline slowest).
+            flPoll.Tick += async (s, e) =>
+            {
+                if (curMode != 2 || IsDisposed) { flPoll.Stop(); return; }
+                if (flBusy || flTicking || friendList.Count == 0) return;   // a full manual pass owns the list; never overlap ticks
+                flTicking = true;
+                try
+                {
+                    var now = DateTime.UtcNow;
+                    // local daily-budget backstop (no extra API calls): throttle this app as it nears the key's request cap.
+                    // The embedded key is a 300k/day tier, so these only ever engage for an aberrant runaway — the per-tick
+                    // token bucket + pause-when-hidden are the real limiters. (A user on their own free key relies on the bucket.)
+                    double effRate = FlCallsPerMin;
+                    int usedToday = SmiteApi.RequestsToday;
+                    if (usedToday >= 295000) effRate = 0; else if (usedToday >= 270000) effRate = 2;
+                    double add = (now - flLastFill).TotalMinutes * effRate; flLastFill = now;
+                    flTokens = Math.Min(effRate, flTokens + (add > 0 ? add : 0));
+                    // free local refresh of offline "last seen" text — costs no API call (offline + errored-but-known rows)
+                    foreach (var r in flRows) if (!r.Header && r.Tier >= 2 && r.LastLogin != DateTime.MinValue)
+                    { var ex = RelTime(r.LastLogin); if (ex != r.Extra) { r.Extra = ex; flist.UpdateRow(r); } }
+                    ReconcileRows();
+                    // FlTickBudget is a per-tick CALL cap (status + detail counted together); flTokens is the per-minute cap.
+                    int callsLeft = Math.Min(FlTickBudget, (int)Math.Floor(flTokens));
+                    if (callsLeft <= 0) { if (usedToday >= 295000) { hint.ForeColor = Theme.Dim; hint.Text = "Daily API budget reached — live updates paused."; } return; }
+                    bool fetchDetails = friendList.Count <= 100;
+                    var due = flRows.Where(r => !r.Header && !r.Polling && r.NextDueUtc <= now).OrderBy(r => r.NextDueUtc).ToList();
+                    if (due.Count == 0) return;
+                    bool nameDirty = false;
+                    foreach (var row in due)
+                    {
+                        if (callsLeft <= 0) break;                        // spent this tick's call budget; rest stay due for next tick
+                        if (flBusy || !flRows.Contains(row)) continue;   // a manual pass started, or the row was removed
+                        row.Polling = true; flTokens -= 1; callsLeft--;
+                        int oldSort = row.StatusSort;
+                        try
+                        {
+                            int code = await PullStatus(row);
+                            row.ErrBackoff = 0;
+                            bool boundary = (oldSort <= 1) != (row.StatusSort <= 1);   // crossed the online/offline line
+                            if (fetchDetails && callsLeft > 0 && (boundary || now >= row.NextDetailUtc))
+                            { flTokens -= 1; callsLeft--; if (await PullPlayer(row)) nameDirty = true; row.NextDetailUtc = DateTime.UtcNow.AddMinutes(30); }
+                            row.Extra = code == 0 ? RelTime(row.LastLogin) : "";
+                        }
+                        catch { row.ErrBackoff++; row.Tier = 3; if (string.IsNullOrEmpty(row.Status) || row.Status == "…") { row.Status = "?"; row.StatusCol = Theme.Dim; } }
+                        finally
+                        {
+                            row.Polling = false;
+                            int iv = TierInterval(row.Tier);
+                            if (row.ErrBackoff > 0) iv = (int)Math.Min(600, iv * Math.Pow(2, row.ErrBackoff));   // back off a flapping/dead id
+                            row.NextDueUtc = DateTime.UtcNow.AddSeconds(iv + Jitter(iv));
+                            if (curMode == 2 && !IsDisposed && flRows.Contains(row)) { flist.UpdateRow(row); LiveSort(); }
+                        }
+                    }
+                    if (nameDirty) SaveFriendList();
+                    if (!IsDisposed && curMode == 2)
+                    { int online = flRows.Count(r => !r.Header && r.StatusSort <= 1); hint.ForeColor = Theme.Dim; hint.Text = friendList.Count + " friends · " + online + " online · live"; }
+                }
+                catch { }   // async-void handler: never let a stray error crash the app — the next tick retries
+                finally { flTicking = false; }
+            };
+            // Entering the Friend List tab: seed once (full pass), or just resume the poller on the persisted list — never rebuild.
+            void FlOnShow()
+            {
+                if (!flSeeded) { _ = RefreshFriendList(); return; }   // first visit: full pass seeds rows + starts the poller
+                ReconcileRows();                                     // catch adds/removes that happened while the tab was hidden
+                if (friendList.Count == 0) { hint.ForeColor = Theme.Dim; hint.Text = "No friends yet — add players from the Player Tracker (＋ Friend List)."; return; }
+                if (!flPoll.Enabled) flPoll.Start();
             }
 
             for (int i = 0; i < sortBtns.Length; i++) { int k = i; sortBtns[i].Click += (s, e) => { flSort = k; StyleSort(); ApplySort(); }; }
@@ -2467,7 +2597,9 @@ namespace SmiteGodLab
             }
             flist.Deleted += ConfirmDelete;
             refresh.Click += async (s, e) => await RefreshFriendList();
-            _refreshFriendList = () => { _ = RefreshFriendList(); };
+            _flShow = FlOnShow;
+            _flPause = () => flPoll.Stop();
+            this.FormClosed += (s, e) => { flPoll.Stop(); flPoll.Dispose(); };
             return host;
         }
 
@@ -3097,7 +3229,7 @@ namespace SmiteGodLab
                     if (IsFriendListed(curPid)) RemoveFriendList(curPid);
                     else { friendList.Add(new FavPlayer { Name = string.IsNullOrWhiteSpace(curName) ? curPid : curName, Id = curPid, Portal = curPortal }); SaveFriendList(); }
                     UpdateFriendBtn();
-                    _refreshFriendList?.Invoke();
+                    // no immediate fetch: the Friend List tab seeds/reconciles this add when it's next shown (it's hidden now)
                 };
                 addAllFriendsBtn.Click += (s, e) =>
                 {
@@ -3108,7 +3240,7 @@ namespace SmiteGodLab
                     if (ans != DialogResult.Yes) return;
                     foreach (var r in lastFriends)
                         if (!IsFriendListed(r.Id)) friendList.Add(new FavPlayer { Name = string.IsNullOrWhiteSpace(r.Name) ? r.Id : r.Name, Id = r.Id, Portal = r.Portal });
-                    SaveFriendList(); UpdateFriendBtn(); _refreshFriendList?.Invoke();
+                    SaveFriendList(); UpdateFriendBtn();   // shown/reconciled when the Friend List tab is next opened
                     hint.ForeColor = Theme.Dim; hint.Text = "Added " + newOnes + " friend" + (newOnes == 1 ? "" : "s") + " to your Friend List.";
                 };
                 // load a player into the tracker by (id, name) — used by the Friend List tab's row-click
