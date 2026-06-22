@@ -561,6 +561,9 @@ namespace SmiteGodLab
         public int StartupTab { get; set; }   // 0 = God Inspector, 1 = Player Tracker
         public int TimeFormat { get; set; }   // 0 = system default, 1 = 12-hour, 2 = 24-hour
         public bool ShowFriendUptime { get; set; }   // Friend List: show how long online friends have been logged in
+        public bool CheckUpdates { get; set; } = true;   // check GitHub for a newer release at startup (default on)
+        public bool AutoUpdate { get; set; }             // download + install new versions without asking (default off)
+        public string SkippedVersion { get; set; } = "";  // a version the user said "no" to → don't re-prompt for it
     }
 
     // One entry in the Codex table-of-contents tree (a section H2 or an indented sub-section H3).
@@ -1266,6 +1269,8 @@ namespace SmiteGodLab
             try { SetWindowTheme(trackGodLv.Handle, "DarkMode_Explorer", null); } catch { }
             try { SetWindowTheme(trackMatchLv.Handle, "DarkMode_Explorer", null); } catch { }
             try { SetWindowTheme(trackSuggest.Handle, "DarkMode_Explorer", null); } catch { }
+            CleanupOldExe();   // clear the renamed-aside exe a previous update left behind
+            if (settings.CheckUpdates && !_updateChecked) { _updateChecked = true; BeginInvoke(new Action(async () => await CheckForUpdate(false))); }
         }
 
         // --- control factories -------------------------------------------------
@@ -2554,7 +2559,17 @@ namespace SmiteGodLab
             clrTag.Click += (s, e) => { hiddenTags.Clear(); SaveHiddenTags(); clrTag.Text = "Tags cleared"; };
             Add(clrRec); Add(clrFav); Add(clrFrnd); Add(clrTag); y += S(50);
 
-            Add(Lbl("More options coming soon.  ·  Data folder: " + Theme.DataDir, Theme.Dim, 8.5f, y)); y += S(24);
+            // -- Updates --
+            Add(Lbl("UPDATES", Theme.Accent, 10f, y, FontStyle.Bold)); y += S(24);
+            Add(Lbl("Current version: v" + AppVersion + ".  Checks this app's GitHub releases.", Theme.Dim, 8.5f, y)); y += S(26);
+            var chkUpd = MkChk("Check for updates on startup", settings.CheckUpdates); chkUpd.BackColor = Theme.Bg; chkUpd.Location = new Point(S(2), y);
+            chkUpd.CheckedChanged += (s, e) => { settings.CheckUpdates = chkUpd.Checked; SaveSettings(); }; Add(chkUpd); y += S(28);
+            var chkAuto = MkChk("Install updates automatically (no prompt)", settings.AutoUpdate); chkAuto.BackColor = Theme.Bg; chkAuto.Location = new Point(S(2), y);
+            chkAuto.CheckedChanged += (s, e) => { settings.AutoUpdate = chkAuto.Checked; SaveSettings(); }; Add(chkAuto); y += S(34);
+            var btnUpd = MkBtn("Check for updates now", 184, false, Theme.Blue, Color.White); btnUpd.Location = new Point(S(2), y);
+            btnUpd.Click += async (s, e) => await CheckForUpdate(true); Add(btnUpd); y += S(52);
+
+            Add(Lbl("Data folder: " + Theme.DataDir, Theme.Dim, 8.5f, y)); y += S(24);
             return host;
         }
 
@@ -3967,13 +3982,117 @@ namespace SmiteGodLab
             {
                 if (!File.Exists(SettingsFile)) return;
                 var s = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsFile));
-                if (s != null) { settings.StartupTab = s.StartupTab; settings.TimeFormat = s.TimeFormat; settings.ShowFriendUptime = s.ShowFriendUptime; }
+                if (s != null) { settings.StartupTab = s.StartupTab; settings.TimeFormat = s.TimeFormat; settings.ShowFriendUptime = s.ShowFriendUptime; settings.CheckUpdates = s.CheckUpdates; settings.AutoUpdate = s.AutoUpdate; settings.SkippedVersion = s.SkippedVersion ?? ""; }
             }
             catch { }
         }
         void SaveSettings()
         {
             SaveJson(SettingsFile, settings);
+        }
+
+        // --- auto-update (checks the GitHub releases of this repo) ---
+        public const string AppVersion = "0.3.0";   // bump to match each release v-tag; drives the update check
+        const string ReleasesApi = "https://api.github.com/repos/DariusSmite/Smite-1-Inspector/releases/latest";
+        const string ReleasesPage = "https://github.com/DariusSmite/Smite-1-Inspector/releases/latest";
+        bool _updateChecked;   // startup check runs once per launch
+
+        static Version ParseVer(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return new Version(0, 0);
+            s = s.Trim().TrimStart('v', 'V');
+            int sp = s.IndexOfAny(new[] { ' ', '-' }); if (sp > 0) s = s.Substring(0, sp);
+            return Version.TryParse(s, out var v) ? v : new Version(0, 0);
+        }
+
+        // Checks GitHub for a newer release. userInitiated (Settings button) always prompts and reports "up to date";
+        // the startup check stays quiet unless there's an update the user hasn't already declined.
+        async Task CheckForUpdate(bool userInitiated)
+        {
+            try
+            {
+                string tag = null, assetUrl = null; long assetSize = 0;
+                using (var http = new HttpClient { Timeout = TimeSpan.FromSeconds(12) })
+                {
+                    http.DefaultRequestHeaders.Add("User-Agent", "Smite1Inspector");
+                    using var doc = JsonDocument.Parse(await http.GetStringAsync(ReleasesApi));
+                    if (doc.RootElement.TryGetProperty("tag_name", out var t)) tag = t.GetString();
+                    if (doc.RootElement.TryGetProperty("assets", out var assets) && assets.ValueKind == JsonValueKind.Array)
+                        foreach (var a in assets.EnumerateArray())
+                            if (GS(a, "name").EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                            { assetUrl = GS(a, "browser_download_url"); assetSize = a.TryGetProperty("size", out var sz) ? sz.GetInt64() : 0; }
+                }
+                if (string.IsNullOrEmpty(tag)) { if (userInitiated) MessageBox.Show(this, "Couldn't read the latest release.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                if (ParseVer(tag) <= ParseVer(AppVersion))
+                { if (userInitiated) MessageBox.Show(this, "You're on the latest version (v" + AppVersion + ").", "Up to date", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+                if (!userInitiated && settings.SkippedVersion == tag) return;   // already declined this version at startup
+                if (string.IsNullOrEmpty(assetUrl))
+                { if (userInitiated) MessageBox.Show(this, tag + " is available, but no exe was attached. Get it from the Releases page.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+                if (settings.AutoUpdate && !userInitiated) { await ApplyUpdate(assetUrl, assetSize, tag); return; }
+                string sizeTxt = assetSize > 0 ? "  (download ~" + (assetSize / 1048576) + " MB)" : "";
+                var r = MessageBox.Show(this, "A new version is available: " + tag + "\nYou have v" + AppVersion + "." + sizeTxt + "\n\nUpdate now?",
+                    "Update available", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                if (r != DialogResult.Yes) { settings.SkippedVersion = tag; SaveSettings(); return; }   // remember the "no"
+                await ApplyUpdate(assetUrl, assetSize, tag);
+            }
+            catch (Exception ex) { if (userInitiated) MessageBox.Show(this, "Update check failed: " + ex.Message, "Updates", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+        }
+
+        // Downloads the new exe (with a progress dialog) and swaps it in by renaming the running exe aside; takes effect on restart.
+        async Task ApplyUpdate(string url, long size, string tag)
+        {
+            string exe = Environment.ProcessPath, dir = Path.GetDirectoryName(exe ?? "");
+            if (string.IsNullOrEmpty(exe) || !exe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            { MessageBox.Show(this, "Auto-update only works on the packaged exe. Download " + tag + " from the Releases page.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+            string newExe = Path.Combine(dir, "SmiteInspector.update.exe");
+            bool ok = false;
+            using (var dlg = new Form { Text = "Updating", BackColor = Theme.Bg, ForeColor = Theme.Text, Font = Theme.F(9.5f), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MinimizeBox = false, MaximizeBox = false, ControlBox = false, ClientSize = new Size(S(430), S(96)) })
+            {
+                dlg.Controls.Add(new Label { Location = new Point(S(16), S(14)), AutoSize = true, ForeColor = Theme.Dim, Text = "Downloading " + tag + "…" });
+                var bar = new ProgressBar { Location = new Point(S(16), S(44)), Size = new Size(S(398), S(22)), Style = ProgressBarStyle.Continuous, Maximum = 100 };
+                dlg.Controls.Add(bar);
+                try { int on = 1; DwmSetWindowAttribute(dlg.Handle, 20, ref on, 4); } catch { }
+                var prog = new Progress<int>(p => bar.Value = Math.Min(100, Math.Max(0, p)));
+                dlg.Shown += async (s, e) => { try { ok = await DownloadFile(url, newExe, prog); } catch { ok = false; } dlg.Close(); };
+                dlg.ShowDialog(this);
+            }
+            if (!ok) { try { File.Delete(newExe); } catch { } MessageBox.Show(this, "Download failed. You can update manually from the Releases page.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+            try
+            {
+                string bak = Path.Combine(dir, "SmiteInspector.old.exe");
+                try { if (File.Exists(bak)) File.Delete(bak); } catch { }
+                File.Move(exe, bak);     // a running exe can be renamed on Windows, just not overwritten
+                File.Move(newExe, exe);
+            }
+            catch (Exception ex)
+            {
+                try { File.Delete(newExe); } catch { }
+                MessageBox.Show(this, "Couldn't replace the app (is it in a read-only folder?): " + ex.Message + "\n\nUpdate manually from the Releases page.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            if (settings.SkippedVersion == tag) { settings.SkippedVersion = ""; SaveSettings(); }
+            if (MessageBox.Show(this, tag + " installed. Restart now to use it?", "Update ready", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes)
+            { try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = true }); } catch { } Application.Exit(); }
+        }
+
+        async Task<bool> DownloadFile(string url, string dest, IProgress<int> progress)
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(15) };
+            http.DefaultRequestHeaders.Add("User-Agent", "Smite1Inspector");
+            using var resp = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+            resp.EnsureSuccessStatusCode();
+            long total = resp.Content.Headers.ContentLength ?? -1, read = 0;
+            using var src = await resp.Content.ReadAsStreamAsync();
+            using var dst = new FileStream(dest, FileMode.Create, FileAccess.Write, FileShare.None);
+            var buf = new byte[81920]; int n;
+            while ((n = await src.ReadAsync(buf, 0, buf.Length)) > 0)
+            { await dst.WriteAsync(buf, 0, n); read += n; if (total > 0) progress?.Report((int)(read * 100 / total)); }
+            return true;
+        }
+        // Remove the renamed-aside previous exe left by a successful update.
+        void CleanupOldExe()
+        {
+            try { var bak = Path.Combine(Path.GetDirectoryName(Environment.ProcessPath ?? "") ?? "", "SmiteInspector.old.exe"); if (File.Exists(bak)) File.Delete(bak); } catch { }
         }
         // Time-of-day per the preferred format (used for the "Updated …" stamp).
         string FmtNow()
