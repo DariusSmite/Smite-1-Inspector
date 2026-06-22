@@ -502,15 +502,447 @@ namespace SmiteGodLab
             throw new Exception("SMITE API session failed: " + msg);
         }
 
+        // Detects the intermittent "concatenation blob" the API returns under heavy concurrent load: a single
+        // row whose fields are space-joined across all players. player ids never contain spaces, so two digit
+        // runs separated by whitespace inside a *Id field is an unambiguous blob signature.
+        static bool LooksLikeBlob(string raw)
+            => !string.IsNullOrEmpty(raw)
+               && System.Text.RegularExpressions.Regex.IsMatch(raw, "\"(playerId|ActivePlayerId|Match)\"\\s*:\\s*\"?\\d+\\s+\\d+");
+
         // Calls a data method and returns the raw JSON string. args are appended (URL-escaped) to the path.
+        // Retries on the SAME session when the response comes back as the concatenation blob (a plain retry
+        // usually clears it) — deliberately not refreshing the session, so we don't burn the daily session cap.
         public static async Task<string> Call(string method, params string[] args)
         {
             string sid = await EnsureSession();
-            string t = Ts();
-            string url = Base + "/" + method + "Json/" + _dev + "/" + Md5(_dev + method + _auth + t) + "/" + sid + "/" + t;
-            foreach (var a in args) url += "/" + Uri.EscapeDataString(a);
-            CountRequest();
-            return await _http.GetStringAsync(url);
+            string raw = null;
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                string t = Ts();
+                string url = Base + "/" + method + "Json/" + _dev + "/" + Md5(_dev + method + _auth + t) + "/" + sid + "/" + t;
+                foreach (var a in args) url += "/" + Uri.EscapeDataString(a);
+                CountRequest();
+                raw = await _http.GetStringAsync(url);
+                if (!LooksLikeBlob(raw)) return raw;
+                await Task.Delay(300);
+            }
+            return raw;   // give back the last (still-blobbed) response; callers tolerate a bad parse
+        }
+    }
+
+    // EXPERIMENTAL (experiment/reveal-hidden-names): an auto-learned database that maps player fingerprints to
+    // real names so privacy-hidden players (playerId=0 / blank name in a completed getmatchdetails) can be
+    // revealed. Privacy is account-level, so a private account is anonymized in EVERY completed match — the only
+    // place their name leaks is the LIVE roster (getmatchplayerdetails). So we harvest names from every visible
+    // player we see (live rosters above all), key them by a fingerprint that survives anonymization
+    // (god + that god's mastery + account level + clan + named party-mates), and match completed hidden rows
+    // against it. Exact reveals come from matches we captured while live (by match id). Local only; never uploaded.
+    static class NameDb
+    {
+        public class Entry
+        {
+            public string Id { get; set; } = "";                       // hi-rez player_id
+            public string Name { get; set; } = "";
+            public int Portal { get; set; }
+            public int ClanId { get; set; }
+            public string Clan { get; set; } = "";
+            public int Level { get; set; }                             // latest account level seen
+            public Dictionary<string, int> GodMastery { get; set; } = new();   // god -> latest per-god mastery rank
+            public List<string> Companions { get; set; } = new();      // player_ids this player PREMADE with (shared PartyId — strong, immediate)
+            public Dictionary<string, int> NeighborCounts { get; set; } = new();   // named SAME-TEAM co-players -> times co-occurred (weak; trusted only after repeats)
+            public string LastSeen { get; set; } = "";
+            public int Seen { get; set; }
+        }
+        public class LiveCap   // exact reveal: the names captured from a specific live match, keyed by team|god
+        {
+            public Dictionary<string, string> ByGod { get; set; } = new();
+            public string At { get; set; } = "";
+        }
+        class Persist { public List<Entry> Players { get; set; } = new(); public Dictionary<string, LiveCap> Live { get; set; } = new(); }
+
+        static readonly int MaxEntries = MaxEntriesForRam();   // RAM-adaptive cap: lean on 4GB, richer on 16GB+
+        const int MaxLive = 20000;
+        static readonly object _lock = new object();
+        static Dictionary<string, Entry> _byId = new();
+        static Dictionary<string, LiveCap> _live = new();
+        const int NeighborTrust = 2;       // a same-team co-player becomes a trusted "neighbor" edge after this many co-occurrences
+        // inverted blocking indexes (postings of entry ids) so Resolve scores only plausible candidates, never the whole DB
+        static Dictionary<string, HashSet<string>> _byCompanion = new();
+        static Dictionary<string, HashSet<string>> _byGod = new();
+        static Dictionary<int, HashSet<string>> _byClan = new();
+        static Dictionary<string, HashSet<string>> _byNeighbor = new();   // trusted same-team co-player -> entries (only edges that cleared NeighborTrust)
+        static bool _dirty;
+        static DateTime _lastSave = DateTime.MinValue;
+
+        public static bool Enabled;        // gated by the "reveal hidden players" setting
+
+        static string DbFile => Path.Combine(Theme.DataDir, "namedb.json");
+        static string BakFile => DbFile + ".bak";
+        static string Today => DateTime.Now.ToString("yyyy-MM-dd");
+
+        public static int PlayerCount { get { lock (_lock) return _byId.Count; } }
+        public static int LiveCount { get { lock (_lock) return _live.Count; } }
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll")] static extern bool GetPhysicallyInstalledSystemMemory(out long totalMemoryInKilobytes);
+        static int MaxEntriesForRam()
+        {
+            long gb = 8;
+            try { if (GetPhysicallyInstalledSystemMemory(out var kb) && kb > 0) gb = kb / 1024 / 1024; } catch { }
+            return gb <= 4 ? 60000 : gb <= 8 ? 120000 : gb <= 16 ? 250000 : 400000;   // ~a few hundred bytes/entry
+        }
+        // --- inverted-index maintenance ---
+        static void Idx(Dictionary<string, HashSet<string>> ix, string key, string id) { if (string.IsNullOrEmpty(key)) return; if (!ix.TryGetValue(key, out var s)) ix[key] = s = new(); s.Add(id); }
+        static void IndexEntry(Entry e)
+        {
+            foreach (var g in e.GodMastery.Keys) Idx(_byGod, g, e.Id);
+            if (e.ClanId != 0) { if (!_byClan.TryGetValue(e.ClanId, out var sc)) _byClan[e.ClanId] = sc = new(); sc.Add(e.Id); }
+            foreach (var c in e.Companions) Idx(_byCompanion, c, e.Id);
+            foreach (var kv in e.NeighborCounts) if (kv.Value >= NeighborTrust) Idx(_byNeighbor, kv.Key, e.Id);   // only trusted edges
+        }
+        static void RebuildIndexes() { _byCompanion = new(); _byGod = new(); _byClan = new(); _byNeighbor = new(); foreach (var e in _byId.Values) IndexEntry(e); }
+        // Inverse document frequency of a party-mate: a teammate that partners with MANY distinct players (a popular pub
+        // or a streamer) carries little identity; a rare 2-3 stack partner pins hard. df = how many entries list them.
+        static double Idf(string companionId) { int n = Math.Max(2, _byId.Count); int df = (_byCompanion.TryGetValue(companionId, out var s) ? s.Count : 0) + 1; return Math.Log((double)(n + 1) / df); }
+        static double NIdf(string neighborId) { int n = Math.Max(2, _byId.Count); int df = (_byNeighbor.TryGetValue(neighborId, out var s) ? s.Count : 0) + 1; return Math.Log((double)(n + 1) / df); }
+
+        static Persist TryRead(string path)
+        {
+            try { if (File.Exists(path)) return JsonSerializer.Deserialize<Persist>(File.ReadAllText(path)); } catch { }
+            return null;
+        }
+        public static void Load()
+        {
+            lock (_lock)
+            {
+                _byId = new(); _live = new();
+                var p = TryRead(DbFile) ?? TryRead(BakFile);   // fall back to the backup if the main file is missing/corrupt
+                if (p != null)
+                {
+                    if (p.Players != null) foreach (var e in p.Players) if (e != null && !string.IsNullOrEmpty(e.Id)) { e.GodMastery ??= new(); e.Companions ??= new(); e.NeighborCounts ??= new(); _byId[e.Id] = e; }
+                    if (p.Live != null) _live = p.Live;
+                }
+                RebuildIndexes();
+            }
+        }
+        // Atomic save: write a temp file then swap it in (keeping the prior copy as .bak). A crash mid-write can no
+        // longer leave a truncated namedb.json that Load silently resets to empty (the old bare WriteAllText bug).
+        public static void Save(bool force = false)
+        {
+            lock (_lock)
+            {
+                if (!_dirty && !force) return;
+                if (!force && (DateTime.UtcNow - _lastSave).TotalSeconds < 8) return;   // debounce churn
+                try
+                {
+                    if (_byId.Count > MaxEntries) Evict(_byId.Count - MaxEntries);
+                    if (_live.Count > MaxLive)
+                        foreach (var k in _live.OrderBy(kv => kv.Value.At).Take(_live.Count - MaxLive).Select(kv => kv.Key).ToList()) _live.Remove(k);
+                    var p = new Persist { Players = _byId.Values.ToList(), Live = _live };
+                    string json = JsonSerializer.Serialize(p);
+                    string tmp = DbFile + ".tmp";
+                    File.WriteAllText(tmp, json);
+                    if (File.Exists(DbFile)) File.Replace(tmp, DbFile, BakFile); else File.Move(tmp, DbFile);
+                    _dirty = false; _lastSave = DateTime.UtcNow;
+                }
+                catch { }
+            }
+        }
+        // Value-aware eviction: never drop a rare PARTY-ANCHOR (someone referenced as a companion); otherwise prefer
+        // many sightings / many gods / recency. Sheds one-off pub rows, keeps the identifying anchors.
+        static void Evict(int n)
+        {
+            foreach (var id in _byId.Values.OrderBy(Value).Take(n).Select(e => e.Id).ToList())
+            {
+                if (_byId.TryGetValue(id, out var e))
+                {
+                    foreach (var g in e.GodMastery.Keys) if (_byGod.TryGetValue(g, out var s)) s.Remove(id);
+                    if (_byClan.TryGetValue(e.ClanId, out var sc)) sc.Remove(id);
+                    foreach (var c in e.Companions) if (_byCompanion.TryGetValue(c, out var s2)) s2.Remove(id);
+                    foreach (var kv in e.NeighborCounts) if (_byNeighbor.TryGetValue(kv.Key, out var s3)) s3.Remove(id);
+                }
+                _byId.Remove(id);
+            }
+        }
+        static double Value(Entry e)
+        {
+            double v = _byCompanion.ContainsKey(e.Id) ? 1e9 : 0;   // anchor → pin, never evict
+            v += Math.Log(1 + e.Seen) * 1000 + e.GodMastery.Count * 50;
+            if (DateTime.TryParse(e.LastSeen, out var d)) v += (d - new DateTime(2020, 1, 1)).TotalDays;   // recency
+            return v;
+        }
+
+        public static void Clear()
+        {
+            lock (_lock) { _byId = new(); _live = new(); _byCompanion = new(); _byGod = new(); _byClan = new(); _byNeighbor = new(); _dirty = true; }
+            Save(true);
+        }
+
+        // Record a VISIBLE player. god/mastery are optional (0/"" when learning from a profile/friend rather than a match row).
+        public static void Learn(string id, string name, int portal, int clanId, string clan, int level, string god, int godMastery, IEnumerable<string> companions = null, IEnumerable<string> neighbors = null)
+        {
+            if (string.IsNullOrEmpty(id) || id == "0" || string.IsNullOrEmpty(name)) return;
+            lock (_lock)
+            {
+                if (!_byId.TryGetValue(id, out var e)) { e = new Entry { Id = id, Seen = 0 }; _byId[id] = e; }
+                e.Name = name;
+                if (portal != 0) e.Portal = portal;
+                if (clanId != 0) { e.ClanId = clanId; if (!string.IsNullOrEmpty(clan)) e.Clan = clan; }
+                if (level > e.Level) e.Level = level;
+                if (!string.IsNullOrEmpty(god) && godMastery > 0)
+                    e.GodMastery[god] = Math.Max(godMastery, e.GodMastery.TryGetValue(god, out var gm) ? gm : 0);
+                if (companions != null)
+                    foreach (var c in companions) if (!string.IsNullOrEmpty(c) && c != "0" && c != id && !e.Companions.Contains(c)) e.Companions.Add(c);
+                if (e.Companions.Count > 60) e.Companions = e.Companions.OrderByDescending(Idf).Take(60).ToList();   // keep the rarest (highest-IDF) anchors, shed common pub teammates
+                // same-team co-players: tally co-plays (a trusted "neighbor" edge needs >=NeighborTrust repeats — guards against
+                // a coincidental one-off rare teammate). Premade party-mates are excluded (already the stronger Companions signal).
+                if (neighbors != null)
+                    foreach (var nb in neighbors)
+                        if (!string.IsNullOrEmpty(nb) && nb != "0" && nb != id && !e.Companions.Contains(nb))
+                            e.NeighborCounts[nb] = (e.NeighborCounts.TryGetValue(nb, out var cnt) ? cnt : 0) + 1;
+                if (e.NeighborCounts.Count > 80)
+                    e.NeighborCounts = e.NeighborCounts.OrderByDescending(kv => kv.Value).Take(80).ToDictionary(kv => kv.Key, kv => kv.Value);
+                if (e.LastSeen != Today) { e.LastSeen = Today; e.Seen++; }
+                IndexEntry(e);   // keep the blocking indexes current (HashSet.Add is idempotent)
+                _dirty = true;
+            }
+        }
+
+        // Record the exact roster of a LIVE match so the SAME match, once completed (and anonymized), reveals exactly.
+        // KEYED BY GodId (numeric) — verified identical across live getmatchplayerdetails and completed getmatchdetails.
+        // The god NAME is NOT safe as a key: live exposes it as "GodName" but completed as "Reference_Name" (different
+        // fields that can differ in spelling). Pass name="" / null to FORGET a slot (untag). taskForce is the team (1/2).
+        public static void LearnLiveSlot(string matchId, int taskForce, string godId, string name)
+        {
+            if (string.IsNullOrEmpty(matchId) || string.IsNullOrEmpty(godId) || godId == "0") return;
+            lock (_lock)
+            {
+                if (string.IsNullOrWhiteSpace(name))   // forget this slot (untag)
+                {
+                    if (_live.TryGetValue(matchId, out var ex)) { ex.ByGod.Remove(taskForce + "|" + godId); _dirty = true; }
+                    return;
+                }
+                if (!_live.TryGetValue(matchId, out var lc)) { lc = new LiveCap { At = Today }; _live[matchId] = lc; }
+                lc.ByGod[taskForce + "|" + godId] = name.Trim();
+                _dirty = true;
+            }
+        }
+        // Resolve a hidden completed-match slot to a name captured live. Try GodId (robust) first, then the legacy
+        // god-NAME key (entries captured before the GodId switch). DIRECT team+god lookup ONLY — no cross-team wildcard:
+        // taskForce(live) == TaskForce(completed) for a given match (verified), so a captured slot resolves exactly,
+        // while a god mirrored on both teams with only one side tagged can never reveal the untagged twin by mistake.
+        // If teams ever disagreed we'd show "Hidden" (safe) rather than a confident wrong name.
+        public static string ResolveExact(string matchId, int taskForce, string godId, string godName = null)
+        {
+            lock (_lock)
+            {
+                if (string.IsNullOrEmpty(matchId) || !_live.TryGetValue(matchId, out var lc)) return null;
+                foreach (var key in new[] { godId, godName })
+                {
+                    if (string.IsNullOrEmpty(key) || key == "0") continue;
+                    if (lc.ByGod.TryGetValue(taskForce + "|" + key, out var n)) return n;
+                }
+                return null;
+            }
+        }
+
+        // Honest, CORROBORATION-GATED reveal. A privacy-hidden record carries no identifier, so a name can only ever be
+        // a GUESS. We refuse blind stat-twin guesses: a candidate is only considered if it's corroborated by at least one
+        // shared NAMED party-mate, OR by an exact clan match together with the same god at near-identical mastery AND a
+        // near-identical account level (very unlikely to collide by chance). Everything else returns (null,0) → "Hidden".
+        // This catches privacy-TOGGLERS we saw while public + party-graph attribution; it can never name a permanently
+        // private account (it's not in the DB). The caller must present the result as a guess, never as fact.
+        public static (string name, string id, int conf) Resolve(int clanId, int level, int mastery, string god, IReadOnlyCollection<string> companions = null, IReadOnlyCollection<string> neighbors = null)
+        {
+            lock (_lock)
+            {
+                // Candidate set from the blocking indexes (lossless vs the corroboration gate): entries sharing a
+                // party-mate, OR in the same clan playing this god (statLock), OR sharing a trusted same-team neighbor.
+                var cand = new HashSet<string>();
+                if (companions != null) foreach (var c in companions) if (_byCompanion.TryGetValue(c, out var s)) cand.UnionWith(s);
+                if (neighbors != null) foreach (var n in neighbors) if (_byNeighbor.TryGetValue(n, out var sn)) cand.UnionWith(sn);
+                if (clanId != 0 && !string.IsNullOrEmpty(god) && _byClan.TryGetValue(clanId, out var sclan) && _byGod.TryGetValue(god, out var sgod))
+                    foreach (var id in sclan) if (sgod.Contains(id)) cand.Add(id);
+                var nameTop = new Dictionary<string, double>();   // best score per candidate NAME (for the top-2 margin guard)
+                var nameId = new Dictionary<string, string>();
+                foreach (var cid in cand)
+                {
+                    if (!_byId.TryGetValue(cid, out var e)) continue;
+                    int overlap = 0; double idfSum = 0;
+                    if (companions != null) foreach (var c in companions) if (e.Companions.Contains(c)) { overlap++; idfSum += Idf(c); }
+                    int nbOverlap = 0; double nbIdf = 0;   // shared TRUSTED same-team neighbors (the social-graph anchor)
+                    if (neighbors != null) foreach (var n in neighbors) if (e.NeighborCounts.TryGetValue(n, out var nc) && nc >= NeighborTrust) { nbOverlap++; nbIdf += NIdf(n); }
+                    bool clanExact = clanId != 0 && e.ClanId == clanId;
+                    bool playsGod = !string.IsNullOrEmpty(god) && e.GodMastery.ContainsKey(god);
+                    int dmSigned = playsGod ? mastery - e.GodMastery[god] : 0;       // observed − stored; <0 = regression (mastery only rises)
+                    int dlSigned = (level > 0 && e.Level > 0) ? level - e.Level : 0; // observed − stored; <0 = regression (level only rises)
+                    bool masteryRegress = playsGod && mastery > 0 && dmSigned < -2;
+                    bool levelRegress = level > 0 && e.Level > 0 && dlSigned < -3;
+                    bool statLock = clanExact && playsGod && mastery > 0 && Math.Abs(dmSigned) <= 2 && level > 0 && Math.Abs(dlSigned) <= 3;
+                    // CORROBORATION GATE: a premade party-mate, OR the stat-lock, OR >=2 trusted shared neighbors (a stable group)
+                    if (overlap == 0 && !statLock && nbOverlap < 2) continue;
+                    double score = idfSum * 5.0 + nbIdf * 2.0;   // party-mates strong; trusted neighbors weaker
+                    if (clanExact) score += 35; else if (clanId != 0 && e.ClanId != 0) score -= 20;   // three-state: missing clan = neutral
+                    if (playsGod) score += Math.Abs(dmSigned) <= 2 ? 30 - Math.Abs(dmSigned) * 5 : (dmSigned > 2 && dmSigned <= 12 ? 12 : 0);
+                    if (masteryRegress) score -= 40;           // mastery can't drop → likely a different person
+                    if (level > 0 && e.Level > 0)
+                        score += levelRegress ? -40 : (dlSigned <= 3 ? 18 - Math.Abs(dlSigned) * 3 : (dlSigned <= 30 ? 6 : 0));   // forward growth tolerated, regression punished
+                    if (score >= 20 && (!nameTop.TryGetValue(e.Name, out var ns) || score > ns)) { nameTop[e.Name] = score; nameId[e.Name] = e.Id; }   // soft floor + per-name best
+                }
+                if (nameTop.Count == 0) return (null, null, 0);
+                var ranked = nameTop.OrderByDescending(kv => kv.Value).ToList();
+                // top-2 MARGIN GUARD: if two DIFFERENT names are near-tied, it's ambiguous → show "Hidden" rather than risk the wrong one
+                if (ranked.Count > 1 && ranked[0].Value - ranked[1].Value < 12) return (null, null, 0);
+                int conf = (int)Math.Min(95, 30 + ranked[0].Value / 3);
+                return (ranked[0].Key, nameId[ranked[0].Key], conf);
+            }
+        }
+    }
+
+    // EXPERIMENTAL (experiment/reveal-hidden-names): crowdsourced hidden-player tags shared across all installs via
+    // the project's own GitHub repo as a zero-cost backend. READS pull a snapshot from the raw CDN (no auth). WRITES
+    // open a "[tag]" issue via the GitHub API using an obfuscated, issues-only token; a GitHub Action validates +
+    // de-dupes + merges into snapshot.json on the `tag-db` branch. All fuzzy matching + vote tallying happens here on
+    // the client (reusing the same weighted fingerprint), so the backend stays trivial. Local-only otherwise.
+    static class TagSync
+    {
+        // Anonymous, free, NO-ACCOUNT shared store (jsonblob.com) — nothing here is tied to anyone's identity (no GitHub,
+        // no repo, no personal account). The whole tag DB is one JSON document we read (GET) and update (PUT). The blob
+        // id is a read+write capability, XOR-obfuscated like the Hi-Rez key so it isn't casually extractable; swap stores
+        // by changing this one constant.
+        static readonly string _blob = Deob(0x5AC31B7F, "nfsTkqRRhrjIcfsYCfopKV4FJhD5QoZmkwNnPnYNlEYpVrSg");
+        static string BlobUrl => "https://jsonblob.com/api/jsonBlob/" + _blob;
+        public static bool ShareConfigured => _blob.Length > 20;
+
+        public static bool Enabled;                  // gated by the "community tags" setting
+        static readonly HttpClient _http = MakeHttp();
+        static string _clientId;
+        static DateTime _lastPull = DateTime.MinValue;
+        static DateTime _lastSubmit = DateTime.MinValue;
+        static readonly List<Shared> _shared = new();
+        static readonly object _lock = new object();
+
+        public class Shared { public string name; public long c; public int l; public List<string> g = new(); public List<string> p = new(); public string u; }
+        // wire format of the shared blob (lowercase keys keep it compact)
+        class TagRec { public string k { get; set; } public string u { get; set; } public string name { get; set; } public long c { get; set; } public int l { get; set; } public List<string> g { get; set; } = new(); public List<string> p { get; set; } = new(); public long t { get; set; } }
+        class Snap { public int version { get; set; } = 1; public long updated { get; set; } public int count { get; set; } public List<TagRec> tags { get; set; } = new(); }
+        static string Md5(string s) { using var m = System.Security.Cryptography.MD5.Create(); var b = m.ComputeHash(Encoding.UTF8.GetBytes(s)); var sb = new StringBuilder(); foreach (var x in b) sb.Append(x.ToString("x2")); return sb.ToString().Substring(0, 16); }
+
+        static string IdFile => Path.Combine(Theme.DataDir, "sync_id.txt");
+        static string CacheFile => Path.Combine(Theme.DataDir, "sharedtags.json");
+        public static int SharedCount { get { lock (_lock) return _shared.Count; } }
+
+        static HttpClient MakeHttp()
+        {
+            var h = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+            h.DefaultRequestHeaders.Add("User-Agent", "Smite1Inspector-TagSync/1.0");
+            return h;
+        }
+        static byte[] Pad(int seed, int n) { var p = new byte[n]; long s = seed & 0x7fffffff; for (int i = 0; i < n; i++) { s = (s * 1103515245 + 12345) & 0x7fffffff; p[i] = (byte)((s >> 16) & 0xFF); } return p; }
+        static string Deob(int seed, string b64) { try { var d = Convert.FromBase64String(b64); var p = Pad(seed, d.Length); for (int i = 0; i < d.Length; i++) d[i] ^= p[i]; return Encoding.UTF8.GetString(d); } catch { return ""; } }
+
+        public static void Init()
+        {
+            try
+            {
+                if (File.Exists(IdFile)) _clientId = File.ReadAllText(IdFile).Trim();
+                if (string.IsNullOrEmpty(_clientId) || _clientId.Length < 8) { _clientId = Guid.NewGuid().ToString("N"); File.WriteAllText(IdFile, _clientId); }
+            }
+            catch { _clientId = Guid.NewGuid().ToString("N"); }
+            try { if (File.Exists(CacheFile)) Parse(File.ReadAllText(CacheFile)); } catch { }
+        }
+
+        static void Parse(string json)
+        {
+            try
+            {
+                var snap = JsonSerializer.Deserialize<Snap>(json);
+                var list = new List<Shared>();
+                if (snap?.tags != null)
+                    foreach (var t in snap.tags)
+                        if (!string.IsNullOrEmpty(t.name))
+                            list.Add(new Shared { name = t.name, c = t.c, l = t.l, g = t.g ?? new(), p = t.p ?? new(), u = t.u });
+                lock (_lock) { _shared.Clear(); _shared.AddRange(list); }
+            }
+            catch { }
+        }
+
+        public static async Task Pull(bool force = false)
+        {
+            if (!Enabled) return;
+            if (!force && (DateTime.UtcNow - _lastPull).TotalMinutes < 10) return;
+            _lastPull = DateTime.UtcNow;
+            try
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get, BlobUrl);
+                req.Headers.TryAddWithoutValidation("Accept", "application/json");
+                using var resp = await _http.SendAsync(req);
+                if (!resp.IsSuccessStatusCode) return;
+                string json = await resp.Content.ReadAsStringAsync();
+                Parse(json);
+                try { File.WriteAllText(CacheFile, json); } catch { }
+            }
+            catch { }
+        }
+
+        // Share a user-confirmed tag: read the current blob, append (de-duped by a per-client key), write it back.
+        // Read-merge-write so concurrent submitters don't clobber the whole DB. Low write volume makes races rare.
+        public static async Task Submit(string name, long clan, int lvl, IEnumerable<string> gods, IEnumerable<string> comp)
+        {
+            if (!Enabled || !ShareConfigured || string.IsNullOrWhiteSpace(name)) return;
+            if ((DateTime.UtcNow - _lastSubmit).TotalSeconds < 3) return;   // local rate-limit
+            _lastSubmit = DateTime.UtcNow;
+            try
+            {
+                var gl = (gods ?? Enumerable.Empty<string>()).Where(x => !string.IsNullOrEmpty(x)).Distinct().Take(12).OrderBy(x => x).ToList();
+                var pl = (comp ?? Enumerable.Empty<string>()).Where(x => !string.IsNullOrEmpty(x) && x != "0").Distinct().Take(20).OrderBy(x => x).ToList();
+                string key = _clientId + ":" + Md5(name.Trim().ToLowerInvariant() + "|" + clan + "|" + string.Join(",", gl) + "|" + string.Join(",", pl));
+                string cur = null;
+                using (var g = new HttpRequestMessage(HttpMethod.Get, BlobUrl))
+                { g.Headers.TryAddWithoutValidation("Accept", "application/json"); using var gr = await _http.SendAsync(g); if (gr.IsSuccessStatusCode) cur = await gr.Content.ReadAsStringAsync(); }
+                Snap snap = null; try { snap = JsonSerializer.Deserialize<Snap>(cur); } catch { }
+                snap ??= new Snap(); snap.tags ??= new();
+                if (snap.tags.Any(t => t.k == key)) return;            // we already submitted this exact tag
+                if (snap.tags.Count >= 500000) return;
+                long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                snap.tags.Add(new TagRec { k = key, u = _clientId, name = name.Trim(), c = clan, l = lvl, g = gl, p = pl, t = now });
+                snap.version = 1; snap.count = snap.tags.Count; snap.updated = now;
+                string outp = JsonSerializer.Serialize(snap);
+                using var put = new HttpRequestMessage(HttpMethod.Put, BlobUrl) { Content = new StringContent(outp, Encoding.UTF8, "application/json") };
+                put.Headers.TryAddWithoutValidation("Accept", "application/json");
+                await _http.SendAsync(put);
+                Parse(outp);   // refresh local view immediately
+            }
+            catch { }
+        }
+
+        // Resolve a hidden player against the community snapshot. Returns the name with the most distinct submitters
+        // among fuzzy-matching tags, that submitter count (votes), and whether it clears the trust gate.
+        public static (string name, int votes, bool confirmed) Resolve(long clan, int lvl, int mastery, string god, IReadOnlyCollection<string> comp)
+        {
+            lock (_lock)
+            {
+                if (_shared.Count == 0) return (null, 0, false);
+                var byName = new Dictionary<string, HashSet<string>>();
+                foreach (var t in _shared)
+                {
+                    int overlap = 0;
+                    if (comp != null) foreach (var c in comp) if (t.p.Contains(c)) overlap++;
+                    bool clanSame = clan != 0 && t.c == clan;
+                    int dl = Math.Abs(t.l - lvl);
+                    if (overlap == 0 && clan != 0 && t.c != 0 && t.c != clan) continue;   // different clan, no party link
+                    if (overlap == 0 && dl > 30) continue;                                 // too far on level
+                    int score = overlap * 50;
+                    if (clanSame) score += 60; else if (clan == 0 && t.c == 0) score += 5; else score -= 50;
+                    if (lvl > 0) score += dl <= 6 ? 30 - dl * 3 : dl <= 20 ? 8 : -25;
+                    if (!string.IsNullOrEmpty(god) && t.g.Contains(god)) score += 15;
+                    if (score < 70) continue;
+                    if (!byName.TryGetValue(t.name, out var voters)) byName[t.name] = voters = new HashSet<string>();
+                    if (!string.IsNullOrEmpty(t.u)) voters.Add(t.u); else voters.Add(t.name + voters.Count);
+                }
+                if (byName.Count == 0) return (null, 0, false);
+                var best = byName.OrderByDescending(kv => kv.Value.Count).First();
+                return (best.Key, best.Value.Count, best.Value.Count >= 2);
+            }
         }
     }
 
@@ -564,6 +996,12 @@ namespace SmiteGodLab
         public bool CheckUpdates { get; set; } = true;   // check GitHub for a newer release at startup (default on)
         public bool AutoUpdate { get; set; }             // download + install new versions without asking (default off)
         public string SkippedVersion { get; set; } = "";  // a version the user said "no" to → don't re-prompt for it
+        public bool RevealHidden { get; set; }   // EXPERIMENT: auto-reveal privacy-hidden players from the learned name DB
+        public bool Harvest { get; set; }        // EXPERIMENT: run the background name harvester to grow the DB at scale
+        public bool CommunityTags { get; set; }  // EXPERIMENT: share + use crowdsourced hidden-player tags (TagSync)
+        public string MyProfileId { get; set; } = "";    // "My profile" tab: the user's own pinned account
+        public string MyProfileName { get; set; } = "";
+        public int MyProfilePortal { get; set; }
     }
 
     // One entry in the Codex table-of-contents tree (a section H2 or an indented sub-section H3).
@@ -980,9 +1418,10 @@ namespace SmiteGodLab
         readonly AppSettings settings = new AppSettings();
         readonly List<FavPlayer> friendList = new List<FavPlayer>();   // user buddy list w/ live status (friendlist.json)
         readonly List<FavPlayer> recents = new List<FavPlayer>();   // auto recent-lookups ("Saved"), recents.json
-        Action<int> _trkSubTab;                      // selects a PRIMARY tracker tab (0 Track, 1 Favorites, 2 Recent)
+        Action<int> _trkSubTab;                      // selects a PRIMARY tracker tab (0 My profile, 1 Track, 2 Favorites, 3 Recent Profiles, 4 Custom Hidden Tags)
         Action _trkPlayerLoaded;                      // called when a player finishes loading → reveal the secondary (Overview/Achievements/Friends) strip
         Func<string, string, Task> _trkLoadPlayer;   // load a player into the tracker by (id, name) — used by the Friend List
+        Action _trkResetSecondary;                    // reset the player-scoped sub-tab to Overview BEFORE navigating (so opening a profile never restores a stale Friends view that locks the loader)
         Label folderLbl, statusLbl, nameLbl, fileLbl;
         Panel headPanel, headIcon, bottomBar, trackerHost;
         TableLayoutPanel root, table;
@@ -1199,7 +1638,7 @@ namespace SmiteGodLab
             if (idx == 4) { SwitchMode(4); return; }
             bool wasTracker = curMode == 1;
             SwitchMode(1);
-            if (!wasTracker) _trkSubTab?.Invoke(0);   // entering the tracker → default to the Track sub-tab
+            if (!wasTracker) _trkSubTab?.Invoke(1);   // entering the tracker → default to the Track tab (index 1; 0 is My profile)
         }
 
         // mode visibility: 0 = God Inspector, 1 = Player Tracker, 2 = Friend List, 3 = Settings
@@ -1271,6 +1710,13 @@ namespace SmiteGodLab
             try { SetWindowTheme(trackSuggest.Handle, "DarkMode_Explorer", null); } catch { }
             CleanupOldExe();   // clear the renamed-aside exe a previous update left behind
             if (settings.CheckUpdates && !_updateChecked) { _updateChecked = true; BeginInvoke(new Action(async () => await CheckForUpdate(false))); }
+            // Test hook (no-op in production): open a scoreboard directly so verification can screenshot the reveal.
+            var tmid = Environment.GetEnvironmentVariable("SMITE_TEST_MATCHID");
+            if (!string.IsNullOrEmpty(tmid)) BeginInvoke(new Action(async () => { try { await ShowMatchDetails(tmid); } catch { } }));
+            var tprim = Environment.GetEnvironmentVariable("SMITE_TEST_PRIMARY");
+            if (!string.IsNullOrEmpty(tprim) && int.TryParse(tprim, out var tpi)) BeginInvoke(new Action(() => { try { SelectNav(1); _trkSubTab?.Invoke(tpi); } catch { } }));
+            var tnav = Environment.GetEnvironmentVariable("SMITE_TEST_NAV");
+            if (!string.IsNullOrEmpty(tnav) && int.TryParse(tnav, out var tni)) BeginInvoke(new Action(() => { try { SelectNav(tni); } catch { } }));
         }
 
         // --- control factories -------------------------------------------------
@@ -2569,6 +3015,21 @@ namespace SmiteGodLab
             var btnUpd = MkBtn("Check for updates now", 184, false, Theme.Blue, Color.White); btnUpd.Location = new Point(S(2), y);
             btnUpd.Click += async (s, e) => await CheckForUpdate(true); Add(btnUpd); y += S(52);
 
+            // -- Experimental: reveal privacy-hidden players (experiment/reveal-hidden-names) --
+            Add(Lbl("HIDDEN-PLAYER REVEAL  (EXPERIMENTAL)", Theme.Accent, 10f, y, FontStyle.Bold)); y += S(24);
+            Add(Lbl("Learns real names from live game rosters and fills them into scoreboards where players hide behind", Theme.Dim, 8.5f, y)); y += S(18);
+            Add(Lbl("the privacy flag. Exact reveals are marked ✔; fingerprint best-guesses show ≈ with a confidence %. Local only.", Theme.Dim, 8.5f, y)); y += S(26);
+            var chkReveal = MkChk("Reveal hidden players from learned names", settings.RevealHidden); chkReveal.BackColor = Theme.Bg; chkReveal.Location = new Point(S(2), y);
+            var chkHarv = MkChk("Run background name harvester (uses API quota to grow the DB)", settings.Harvest); chkHarv.BackColor = Theme.Bg; chkHarv.Enabled = settings.RevealHidden;
+            chkReveal.CheckedChanged += (s, e) => { settings.RevealHidden = chkReveal.Checked; NameDb.Enabled = chkReveal.Checked; chkHarv.Enabled = chkReveal.Checked; if (!chkReveal.Checked) { chkHarv.Checked = false; StopHarvester(); } SaveSettings(); };
+            Add(chkReveal); y += S(28);
+            chkHarv.Location = new Point(S(2), y);
+            chkHarv.CheckedChanged += (s, e) => { settings.Harvest = chkHarv.Checked; SaveSettings(); if (chkHarv.Checked && settings.RevealHidden) StartHarvester(); else StopHarvester(); };
+            Add(chkHarv); y += S(28);
+            Add(Lbl("Learned names: " + NameDb.PlayerCount.ToString("N0") + "   ·   live rosters cached: " + NameDb.LiveCount.ToString("N0"), Theme.Dim, 8.5f, y)); y += S(22);
+            var btnClrDb = MkBtn("Clear learned names", 184, false); btnClrDb.Location = new Point(S(2), y);
+            btnClrDb.Click += (s, e) => { NameDb.Clear(); btnClrDb.Text = "Cleared"; }; Add(btnClrDb); y += S(50);
+
             Add(Lbl("Data folder: " + Theme.DataDir, Theme.Dim, 8.5f, y)); y += S(24);
             return host;
         }
@@ -2705,7 +3166,7 @@ namespace SmiteGodLab
                 }
                 catch { }
             }
-            dOpen.Click += async (s, e) => { if (dOpen.Tag is PlayerRow rr) { SelectNav(1); if (_trkLoadPlayer != null) await _trkLoadPlayer(rr.Id, rr.Name); } };
+            dOpen.Click += async (s, e) => { if (dOpen.Tag is PlayerRow rr) { _trkResetSecondary?.Invoke(); SelectNav(1); if (_trkLoadPlayer != null) await _trkLoadPlayer(rr.Id, rr.Name); } };
             dViewGame.Click += async (s, e) => { if (dViewGame.Enabled && dViewGame.Tag is PlayerRow rr) await ViewLiveGame(rr.Id); };
             HideDetail();
 
@@ -2734,6 +3195,7 @@ namespace SmiteGodLab
             const double FlCallsPerMin = 120;  // sustained ceiling on getplayerstatus calls/min while the tab is open
             const int FlTickBudget = 16;       // max calls started per tick (burst cap; processed concurrently)
             const int FlConcurrency = 12;      // concurrent getplayerstatus requests per tick (parallel = fast sweep, not one-at-a-time)
+            const int FlSeedConcurrency = 20;  // first-boot status sweep runs hotter (a one-time burst) so the list is usable fast
             var flRng = new Random();
             // tier cadences (seconds): 0 god-select · 1 online/lobby · 2 in-game · 3 offline (see OfflineSeconds) · 4 unknown
             int TierInterval(int tier) => tier == 0 ? 10 : tier == 1 ? 15 : tier == 2 ? 20 : tier == 3 ? 60 : 90;
@@ -2833,36 +3295,51 @@ namespace SmiteGodLab
                     int progDone = 0, progTotal = flRows.Count; SetProgress(0, progTotal);
                     ApplySort();
                     hint.ForeColor = Theme.Dim; hint.Text = "Checking statuses…";
-                    bool nameChanged = false;
                     bool fetchDetails = friendList.Count <= 100;   // getplayer per friend (name + last login); skip for huge lists to spare the rate limit
-                    using var sem = new SemaphoreSlim(FlConcurrency);
-                    await Task.WhenAll(flRows.Select(async row =>
-                    {
-                        await sem.WaitAsync();
-                        try
+
+                    // PASS 1 — STATUS ONLY (one call/row, higher concurrency). This is the data the list exists to show, so
+                    // it goes first and alone: online/offline lands in roughly half the round-trips of a combined sweep that
+                    // also pulled the slow getplayer details. The list is usable the moment this finishes.
+                    using (var sem = new SemaphoreSlim(FlSeedConcurrency))
+                        await Task.WhenAll(flRows.Select(async row =>
                         {
-                            int code = await PullStatus(row);
-                            row.ErrBackoff = 0;
-                            if (fetchDetails) { if (await PullPlayer(row)) nameChanged = true; row.NextDetailUtc = DateTime.UtcNow.AddMinutes(30); }
-                            row.Extra = RowExtra(row);   // offline → last-seen; online → uptime (if enabled)
-                        }
-                        catch { row.ErrBackoff++; row.Tier = 4; if (string.IsNullOrEmpty(row.Status) || row.Status == "…") { row.Status = "?"; row.StatusCol = Theme.Dim; } }
-                        finally { sem.Release(); }
-                        flist.UpdateRow(row);   // repaint just this row (no whole-list flash) …
-                        LiveSort();             // … and re-order live as statuses land (throttled; A-Z is a no-op)
-                        progDone++; SetProgress(progDone, progTotal);   // "12/58" in the red box (continuation is on the UI thread)
-                    }));
-                    if (nameChanged) SaveFriendList();
+                            await sem.WaitAsync();
+                            try { await PullStatus(row); row.ErrBackoff = 0; row.Extra = RowExtra(row); }
+                            catch { row.ErrBackoff++; row.Tier = 4; if (string.IsNullOrEmpty(row.Status) || row.Status == "…") { row.Status = "?"; row.StatusCol = Theme.Dim; } }
+                            finally { sem.Release(); }
+                            flist.UpdateRow(row);   // repaint just this row (no whole-list flash) …
+                            LiveSort();             // … and re-order live as statuses land (throttled; A-Z is a no-op)
+                            progDone++; SetProgress(progDone, progTotal);
+                        }));
                     ApplySort();
-                    flLastPoll = DateTime.Now;
-                    SetFlHint();
-                    // hand off to the live poller: every row is due now (the bucket spreads them out) and gets its tier cadence
+                    flLastPoll = DateTime.Now; SetFlHint();
                     flSeeded = true;
+                    progBox.Visible = false;   // statuses are in → the list is usable now; details refine quietly below
+
+                    // hand off to the live poller now (it no-ops while flBusy is still set for pass 2, then takes over):
+                    // each row's next status check is per tier cadence, not immediately (which would re-scan the whole list).
                     var seedNow = DateTime.UtcNow;
-                    // every row was just polled by this pass — schedule the next check per tier cadence (not immediately,
-                    // which would re-scan the whole list a second time right after the seed).
                     foreach (var r in flRows) { r.NextDueUtc = seedNow.AddSeconds(TierInterval(r.Tier) + Jitter(TierInterval(r.Tier))); if (r.NextDetailUtc == DateTime.MinValue) r.NextDetailUtc = seedNow.AddMinutes(30); }
                     if (curMode == 2 && !flPoll.Enabled) flPoll.Start();
+
+                    // PASS 2 — SLOW DETAILS (name self-heal + last login + avatar). These only feed the "last seen"/uptime
+                    // text and the preview avatar, so they refine rows that are already showing live status rather than
+                    // blocking them. Runs after the list is usable; the poller waits on flBusy until this completes.
+                    if (fetchDetails)
+                    {
+                        bool nameChanged = false;
+                        using var sem2 = new SemaphoreSlim(FlConcurrency);
+                        await Task.WhenAll(flRows.Select(async row =>
+                        {
+                            await sem2.WaitAsync();
+                            try { if (await PullPlayer(row)) nameChanged = true; row.NextDetailUtc = DateTime.UtcNow.AddMinutes(30); row.Extra = RowExtra(row); }
+                            catch { }
+                            finally { sem2.Release(); }
+                            if (curMode == 2 && !IsDisposed && flRows.Contains(row)) flist.UpdateRow(row);
+                        }));
+                        if (nameChanged) SaveFriendList();
+                        ApplySort(); SetFlHint();
+                    }
                 }
                 catch (Exception ex) { hint.ForeColor = Theme.AccentHi; hint.Text = "Status check failed: " + ex.Message; }
                 finally { flBusy = false; progBox.Visible = false; }
@@ -2986,20 +3463,24 @@ namespace SmiteGodLab
             refresh.Click += async (s, e) => await RefreshFriendList();
             _flShow = FlOnShow;
             _flPause = () => flPoll.Stop();
-            this.FormClosed += (s, e) => { FlushNote(); flPoll.Stop(); flPoll.Dispose(); };
+            this.FormClosed += (s, e) => { FlushNote(); flPoll.Stop(); flPoll.Dispose(); NameDb.Save(true); };   // force-flush: don't lose captures/tags still inside the save debounce window
             return host;
         }
 
         Panel BuildTrackerPanel()
         {
             LoadFavs(); LoadHiddenTags(); LoadRecents();
+            NameDb.Load(); NameDb.Enabled = settings.RevealHidden;   // experiment/reveal-hidden-names
+            if (settings.RevealHidden && settings.Harvest) StartHarvester();
+            TagSync.Init(); TagSync.Enabled = settings.CommunityTags;   // crowdsourced shared tags
+            if (settings.CommunityTags) _ = TagSync.Pull(true);
             var host = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg };
             {
                 // --- primary tab strip (Track / Favorites / Recent) ---
                 var subBar = new Panel { Dock = DockStyle.Top, Height = S(42), BackColor = Theme.Panel };
                 var subBarLine = new Panel { Dock = DockStyle.Bottom, Height = S(1), BackColor = Theme.Line };
                 var subFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, BackColor = Theme.Panel, Padding = new Padding(S(14), S(2), 0, 0) };
-                var primaryTabs = new[] { MkSubTab("Track"), MkSubTab("Favorites"), MkSubTab("Recent"), MkSubTab("Hidden") };
+                var primaryTabs = new[] { MkSubTab("My profile"), MkSubTab("Track"), MkSubTab("Favorites"), MkSubTab("Recent Profiles"), MkSubTab("Custom Hidden Tags") };
                 foreach (var t in primaryTabs) subFlow.Controls.Add(t);
                 subBar.Controls.Add(subFlow); subBar.Controls.Add(subBarLine);
 
@@ -3007,8 +3488,9 @@ namespace SmiteGodLab
                 var subBar2 = new Panel { Dock = DockStyle.Top, Height = S(38), BackColor = Theme.Bg, Visible = false };
                 var subBar2Line = new Panel { Dock = DockStyle.Bottom, Height = S(1), BackColor = Theme.Line };
                 var subFlow2 = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, BackColor = Theme.Bg, Padding = new Padding(S(28), S(0), 0, 0) };
-                var secondaryTabs = new[] { MkSubTab("Overview"), MkSubTab("Masteries"), MkSubTab("Matches"), MkSubTab("Achievements"), MkSubTab("Friends") };
+                var secondaryTabs = new[] { MkSubTab("Overview"), MkSubTab("Masteries"), MkSubTab("Matches"), MkSubTab("Achievements"), MkSubTab("Friend List") };
                 foreach (var t in secondaryTabs) { t.Height = S(36); subFlow2.Controls.Add(t); }
+                int curPrimary = 1;   // 0 My profile · 1 Track · 2 Favorites · 3 Recent Profiles · 4 Custom Hidden Tags (declared early: used by Lookup/_trkLoadPlayer closures)
                 subBar2.Controls.Add(subFlow2); subBar2.Controls.Add(subBar2Line);
 
                 // --- search bar ---
@@ -3021,6 +3503,7 @@ namespace SmiteGodLab
                 favSaveBtn = MkBtn("☆ Save", 104, false, Theme.Input, Theme.Dim); favSaveBtn.Location = new Point(S(464), S(12)); favSaveBtn.Enabled = false;
                 friendAddBtn = MkBtn("＋ Friend List", 136, false, Theme.Input, Theme.Dim); friendAddBtn.Location = new Point(S(574), S(12)); friendAddBtn.Enabled = false;
                 var addAllFriendsBtn = MkBtn("＋ Add all to Friend List", 184, false, Theme.Input, Theme.Green); addAllFriendsBtn.Location = new Point(S(720), S(12)); addAllFriendsBtn.Visible = false;
+                var myProfBtn = MkBtn("＋ Set my profile", 184, false, Theme.Input, Theme.Blue); myProfBtn.Location = new Point(S(720), S(12)); myProfBtn.Visible = false;   // shown only on the "My profile" tab
                 var lastFriends = new List<PlayerRow>();   // the FRIENDS section of the currently-shown friends list (for "add all")
                 var friendCats = new List<(string key, string cap, List<PlayerRow> list)>();   // collapsible friend sections
                 var collapsedFriendSecs = new HashSet<string>();
@@ -3028,7 +3511,7 @@ namespace SmiteGodLab
                 // Status line: its own full-width strip docked just under the search bar. A fixed Location on the search
                 // row would land off-screen at high DPI (the row is already full to the window edge), so it lives here.
                 var hint = new Label { Dock = DockStyle.Top, Height = S(22), TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(S(14), 0, S(14), 0), ForeColor = Theme.Dim, Font = Theme.F(8.5f), BackColor = Theme.Panel, Text = "Live data from the official Hi-Rez SMITE API." };
-                top.Controls.Add(lbl); top.Controls.Add(bhost); top.Controls.Add(track); top.Controls.Add(favSaveBtn); top.Controls.Add(friendAddBtn); top.Controls.Add(addAllFriendsBtn);
+                top.Controls.Add(lbl); top.Controls.Add(bhost); top.Controls.Add(track); top.Controls.Add(favSaveBtn); top.Controls.Add(friendAddBtn); top.Controls.Add(addAllFriendsBtn); top.Controls.Add(myProfBtn);
 
                 // --- overview card ---
                 var card = new Panel { Dock = DockStyle.Top, Height = S(180), BackColor = Theme.Bg };
@@ -3231,6 +3714,20 @@ namespace SmiteGodLab
                     addAllFriendsBtn.Visible = false; ShowStage(0);
                     if (string.IsNullOrEmpty(curPid) || curPid == "0") { hint.ForeColor = Theme.Dim; hint.Text = "Search for a SMITE player above."; box.Focus(); }
                 }
+                // "My profile" tab: always loads the user's own pinned account (set only here). Not set → prompt to set it.
+                void ShowMyProfile()
+                {
+                    addAllFriendsBtn.Visible = false; subBar2.Visible = false;
+                    if (string.IsNullOrEmpty(settings.MyProfileId))
+                    {
+                        myProfBtn.Visible = true; myProfBtn.Text = "＋ Set my profile"; myProfBtn.BringToFront();
+                        ResetCard(); ShowStage(0);
+                        hint.ForeColor = Theme.Dim; hint.Text = "Set your own SMITE profile here — it'll always be one click away on this tab.";
+                        return;
+                    }
+                    myProfBtn.Visible = true; myProfBtn.Text = "↻ Change my profile"; myProfBtn.BringToFront();
+                    _ = Guarded(() => LoadKey(settings.MyProfileId, settings.MyProfileName));
+                }
                 void ShowAchievements()
                 {
                     addAllFriendsBtn.Visible = false; ShowStage(3);
@@ -3290,26 +3787,7 @@ namespace SmiteGodLab
                     if (!string.IsNullOrWhiteSpace(msg)) sb.AppendLine("“" + msg + "”");
                     statsLbl.Text = sb.ToString();
 
-                    // status chip
-                    try
-                    {
-                        using var sdoc = JsonDocument.Parse(await SmiteApi.Call("getplayerstatus", key));
-                        if (sdoc.RootElement.ValueKind == JsonValueKind.Array && sdoc.RootElement.GetArrayLength() > 0)
-                        {
-                            var st = sdoc.RootElement[0]; int code = GI(st, "status"); string ss = GS(st, "status_string");
-                            Color chip = code == 3 ? Color.FromArgb(60, 180, 90) : code == 4 || code == 1 ? Theme.Blue : code == 2 ? Theme.Yellow : Color.FromArgb(70, 70, 70);
-                            statusLbl.BackColor = chip; statusLbl.ForeColor = (code == 2) ? Color.Black : Color.White;
-                            string lm = GS(st, "Match");
-                            bool inGame = code == 3 && !string.IsNullOrEmpty(lm) && lm != "0";   // live match → chip is clickable
-                            curLiveMatch = inGame ? lm : "";
-                            string label = string.IsNullOrEmpty(ss) ? ("Status " + code) : ss.ToUpperInvariant();
-                            statusLbl.Text = inGame ? "● " + label + "  ▸" : label;
-                            statusLbl.Cursor = inGame ? Cursors.Hand : Cursors.Default;
-                            tip.SetToolTip(statusLbl, inGame ? "Click to view the live match roster (reveals player names)" : null);
-                            statusLbl.Visible = true;
-                        }
-                    }
-                    catch { }
+                    await ApplyStatus(key);   // status chip (also re-run live by statusTimer while this profile is on screen)
 
                     // god masteries (sorted by worshippers desc) — with god icon + god_id (for queue stats)
                     try
@@ -3443,7 +3921,7 @@ namespace SmiteGodLab
                 {
                     string name = box.Text.Trim();
                     if (name.Length == 0) return;
-                    StylePrimary(0);   // searching belongs to the Track tab
+                    StylePrimary(1); curPrimary = 1;   // searching belongs to the Track tab
                     track.Enabled = false; hint.ForeColor = Theme.Dim; hint.Text = "Looking up " + name + "…";
                     listCol.Visible = false; ResetCard();
                     try
@@ -3501,6 +3979,7 @@ namespace SmiteGodLab
                     try
                     {
                         using var fdoc = JsonDocument.Parse(await SmiteApi.Call("getfriends", pid));
+                        if (curPid != pid) return;   // the player changed while this was loading → don't render a stale friends list over the new profile
                         // friend_flags decoded by reciprocity + the user's ground truth (CORRECTED direction):
                         //   1 = confirmed friend
                         //   2 = OUTGOING — the VIEWED player sent a request to this person (e.g. tinkerbell52→them)
@@ -3583,7 +4062,7 @@ namespace SmiteGodLab
 
                 track.Click += async (s, e) => await Guarded(Lookup);
                 box.KeyDown += async (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; await Guarded(Lookup); } };
-                plist.Activated += async r => { if (trackBusy) return; listCol.Visible = false; StylePrimary(0); box.Text = r.Name.StartsWith("(hidden") ? "" : r.Name; await Guarded(() => LoadKey(r.Id, r.Name)); };   // loading a row shows a Track profile
+                plist.Activated += async r => { if (trackBusy) return; listCol.Visible = false; StylePrimary(1); curPrimary = 1; box.Text = r.Name.StartsWith("(hidden") ? "" : r.Name; await Guarded(() => LoadKey(r.Id, r.Name)); };   // loading a row shows a Track profile
                 plist.Deleted += r =>   // trash (Favorites): remove from favorites — confirm first (Recents use ☆, no trash)
                 {
                     if (MessageBox.Show(this, "Remove “" + r.Name + "” from your Favorites?", "Remove favorite",
@@ -3618,6 +4097,40 @@ namespace SmiteGodLab
                     UpdateFriendBtn();
                     // no immediate fetch: the Friend List tab seeds/reconciles this add when it's next shown (it's hidden now)
                 };
+                // "My profile" tab: set/change the user's own pinned account (the only place a profile is pinned).
+                myProfBtn.Click += async (s, e) =>
+                {
+                    string name = PromptText("Set my profile", "Enter your SMITE in-game name (the account you play).", settings.MyProfileName ?? "");
+                    if (string.IsNullOrWhiteSpace(name) || trackBusy) return;
+                    await Guarded(async () =>
+                    {
+                        hint.ForeColor = Theme.Dim; hint.Text = "Looking up " + name + "…";
+                        try
+                        {
+                            string id = null, disp = name.Trim(); int portal = 0;
+                            using (var pdoc = JsonDocument.Parse(await SmiteApi.Call("getplayer", name.Trim())))
+                                if (pdoc.RootElement.ValueKind == JsonValueKind.Array && pdoc.RootElement.GetArrayLength() > 0 && !IsPrivateRow(pdoc.RootElement[0]))
+                                {
+                                    var p0 = pdoc.RootElement[0];
+                                    id = GS(p0, "Id"); if (string.IsNullOrEmpty(id) || id == "0") id = GS(p0, "ActivePlayerId");
+                                    string ig = GS(p0, "hz_player_name"); disp = string.IsNullOrEmpty(ig) ? GS(p0, "Name") : ig;
+                                    portal = PortalFromName(GS(p0, "Platform"));
+                                }
+                            if (string.IsNullOrEmpty(id))   // no exact hit → first forgiving search result
+                                using (var qdoc = JsonDocument.Parse(await SmiteApi.Call("searchplayers", name.Trim())))
+                                    if (qdoc.RootElement.ValueKind == JsonValueKind.Array)
+                                        foreach (var r in qdoc.RootElement.EnumerateArray())
+                                        {
+                                            string rid = GS(r, "player_id"), rdisp = GS(r, "hz_player_name"); if (string.IsNullOrEmpty(rdisp)) rdisp = GS(r, "Name");
+                                            if (!string.IsNullOrEmpty(rid) && rid != "0" && !string.IsNullOrEmpty(rdisp)) { id = rid; disp = rdisp; portal = GI(r, "portal_id"); break; }
+                                        }
+                            if (string.IsNullOrEmpty(id)) { hint.ForeColor = Theme.AccentHi; hint.Text = "Couldn't find \"" + name.Trim() + "\"."; return; }
+                            settings.MyProfileId = id; settings.MyProfileName = disp; settings.MyProfilePortal = portal; SaveSettings();
+                        }
+                        catch (Exception ex) { hint.ForeColor = Theme.AccentHi; hint.Text = "Lookup failed: " + ex.Message; return; }
+                    });
+                    if (!string.IsNullOrEmpty(settings.MyProfileId)) { curPrimary = 0; ShowMyProfile(); }
+                };
                 addAllFriendsBtn.Click += (s, e) =>
                 {
                     if (lastFriends.Count == 0) return;
@@ -3631,7 +4144,7 @@ namespace SmiteGodLab
                     hint.ForeColor = Theme.Dim; hint.Text = "Added " + newOnes + " friend" + (newOnes == 1 ? "" : "s") + " to your Friend List.";
                 };
                 // load a player into the tracker by (id, name) — used by the Friend List tab's row-click
-                _trkLoadPlayer = (id, name) => Guarded(async () => { box.Text = name; StylePrimary(0); await LoadKey(id, name); });
+                _trkLoadPlayer = (id, name) => Guarded(async () => { box.Text = name; StylePrimary(1); curPrimary = 1; await LoadKey(id, name); });
                 // PRIMARY tabs (Track / Favorites / Recent) drive the top-level view; the SECONDARY strip
                 // (Overview / Achievements / Friends) is player-scoped and only shows while a player is loaded.
                 bool PlayerLoaded() => !string.IsNullOrEmpty(curPid) && curPid != "0";
@@ -3678,7 +4191,7 @@ namespace SmiteGodLab
                 }
                 void ShowHidden()
                 {
-                    StylePrimary(3); subBar2.Visible = false;
+                    StylePrimary(4); subBar2.Visible = false;
                     hiddenHost.Controls.Clear();
                     if (hiddenTags.Count == 0)
                     {
@@ -3694,20 +4207,25 @@ namespace SmiteGodLab
                 }
                 void SelectPrimary(int i)
                 {
+                    curPrimary = i;
                     StylePrimary(i);
-                    if (i == 0)   // Track: show the player-context strip + the current player view (or the idle search)
+                    if (i != 0) myProfBtn.Visible = false;
+                    if (i == 0) ShowMyProfile();           // My profile: the user's own pinned account (set only here)
+                    else if (i == 1)                        // Track: player-context strip + current player view (or idle search)
                     {
                         subBar2.Visible = PlayerLoaded();
                         if (PlayerLoaded()) SelectSecondary(curSecondary); else ShowSearchView();
                     }
-                    else { subBar2.Visible = false; if (i == 1) ShowFavorites(); else if (i == 2) ShowRecents(); else ShowHidden(); }
+                    else { subBar2.Visible = false; if (i == 2) ShowFavorites(); else if (i == 3) ShowRecents(); else ShowHidden(); }
                 }
                 for (int i = 0; i < primaryTabs.Length; i++) { int k = i; primaryTabs[i].Click += (s, e) => SelectPrimary(k); }
                 for (int j = 0; j < secondaryTabs.Length; j++) { int k = j; secondaryTabs[j].Click += (s, e) => SelectSecondary(k); }
-                // when a player finishes loading, reveal the secondary strip and default it to Overview
-                _trkPlayerLoaded = () => { StylePrimary(0); subBar2.Visible = true; curSecondary = 0; StyleSecondary(0); ShowStage(0); };
+                // when a player finishes loading, reveal the secondary strip and default it to Overview; highlight My profile
+                // if the load was initiated from that tab (curPrimary==0), otherwise Track (1).
+                _trkPlayerLoaded = () => { int hp = curPrimary == 0 ? 0 : 1; StylePrimary(hp); myProfBtn.Visible = hp == 0; subBar2.Visible = true; curSecondary = 0; StyleSecondary(0); ShowStage(0); };
+                _trkResetSecondary = () => { curSecondary = 0; StyleSecondary(0); };   // so SelectNav restores Overview (non-blocking), not a stale Guarded Friends view
                 _trkSubTab = SelectPrimary;
-                StylePrimary(0); StyleSecondary(0);
+                StylePrimary(1); StyleSecondary(0);
                 godLv.DoubleClick += async (s, e) =>
                 {
                     if (trackBusy || godLv.SelectedItems.Count == 0 || string.IsNullOrEmpty(curPid)) return;
@@ -3745,6 +4263,47 @@ namespace SmiteGodLab
                 };
 
                 UpdateFavStar(); UpdateFriendBtn();
+
+                // Fetches getplayerstatus(key) and paints the profile status chip. Re-runnable: ShowPlayer calls
+                // it on load; statusTimer re-runs it on a cadence so Overview / My profile reflect online/in-game
+                // changes live (same idea as the Friend List poller, scoped to the one viewed player).
+                async Task ApplyStatus(string key)
+                {
+                    if (string.IsNullOrEmpty(key)) return;
+                    string forPid = curPid;   // guard: don't clobber the chip if the user switches players mid-await
+                    try
+                    {
+                        using var sdoc = JsonDocument.Parse(await SmiteApi.Call("getplayerstatus", key));
+                        if (curPid != forPid) return;
+                        if (sdoc.RootElement.ValueKind == JsonValueKind.Array && sdoc.RootElement.GetArrayLength() > 0)
+                        {
+                            var st = sdoc.RootElement[0]; int code = GI(st, "status"); string ss = GS(st, "status_string");
+                            Color chip = code == 3 ? Color.FromArgb(60, 180, 90) : code == 4 || code == 1 ? Theme.Blue : code == 2 ? Theme.Yellow : Color.FromArgb(70, 70, 70);
+                            statusLbl.BackColor = chip; statusLbl.ForeColor = (code == 2) ? Color.Black : Color.White;
+                            string lm = GS(st, "Match");
+                            bool inGame = code == 3 && !string.IsNullOrEmpty(lm) && lm != "0";   // live match → chip is clickable
+                            curLiveMatch = inGame ? lm : "";
+                            string label = string.IsNullOrEmpty(ss) ? ("Status " + code) : ss.ToUpperInvariant();
+                            statusLbl.Text = inGame ? "● " + label + "  ▸" : label;
+                            statusLbl.Cursor = inGame ? Cursors.Hand : Cursors.Default;
+                            tip.SetToolTip(statusLbl, inGame ? "Click to view the live match roster (reveals player names)" : null);
+                            statusLbl.Visible = true;
+                        }
+                    }
+                    catch { }
+                }
+
+                // Live status refresh: while a profile is on screen, re-poll its chip on a cadence.
+                var statusTimer = new System.Windows.Forms.Timer { Interval = 15000 };
+                statusTimer.Tick += async (s, e) =>
+                {
+                    if (!host.Visible || trackBusy) return;                      // not viewing the tracker, or a load is in flight
+                    if (string.IsNullOrEmpty(curPid) || curPid == "0") return;   // no real player loaded
+                    if (!statusLbl.Visible) return;                              // chip not shown (search view / hidden player)
+                    await ApplyStatus(curPid);
+                };
+                statusTimer.Start();
+                host.Disposed += (s, e) => statusTimer.Dispose();
             }
             return host;
         }
@@ -3982,7 +4541,7 @@ namespace SmiteGodLab
             {
                 if (!File.Exists(SettingsFile)) return;
                 var s = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsFile));
-                if (s != null) { settings.StartupTab = s.StartupTab; settings.TimeFormat = s.TimeFormat; settings.ShowFriendUptime = s.ShowFriendUptime; settings.CheckUpdates = s.CheckUpdates; settings.AutoUpdate = s.AutoUpdate; settings.SkippedVersion = s.SkippedVersion ?? ""; }
+                if (s != null) { settings.StartupTab = s.StartupTab; settings.TimeFormat = s.TimeFormat; settings.ShowFriendUptime = s.ShowFriendUptime; settings.CheckUpdates = s.CheckUpdates; settings.AutoUpdate = s.AutoUpdate; settings.SkippedVersion = s.SkippedVersion ?? ""; settings.RevealHidden = s.RevealHidden; settings.Harvest = s.Harvest; settings.CommunityTags = s.CommunityTags; settings.MyProfileId = s.MyProfileId ?? ""; settings.MyProfileName = s.MyProfileName ?? ""; settings.MyProfilePortal = s.MyProfilePortal; }
             }
             catch { }
         }
@@ -3992,7 +4551,7 @@ namespace SmiteGodLab
         }
 
         // --- auto-update (checks the GitHub releases of this repo) ---
-        public const string AppVersion = "0.3.0";   // bump to match each release v-tag; drives the update check
+        public const string AppVersion = "0.4.0";   // bump to match each release v-tag; drives the update check
         const string ReleasesApi = "https://api.github.com/repos/DariusSmite/Smite-1-Inspector/releases/latest";
         const string ReleasesPage = "https://github.com/DariusSmite/Smite-1-Inspector/releases/latest";
         bool _updateChecked;   // startup check runs once per launch
@@ -4192,6 +4751,7 @@ namespace SmiteGodLab
             {
                 existing.Nick = nick.Trim();
                 UpdateSighting(existing, clan, level, mastery, companions, god);   // also saves
+                _ = TagSync.Submit(nick.Trim(), clanId, level, new[] { god }, companions);   // share with the community
                 return;
             }
             var t = new HiddenTag { ClanId = clanId, Clan = clan, Level = level, Mastery = mastery, Nick = nick.Trim(), Seen = 1, LastSeen = DateTime.Now.ToString("yyyy-MM-dd") };
@@ -4199,6 +4759,7 @@ namespace SmiteGodLab
             if (!string.IsNullOrEmpty(god) && !t.Gods.Contains(god)) t.Gods.Add(god);
             hiddenTags.Add(t);
             SaveHiddenTags();
+            _ = TagSync.Submit(nick.Trim(), clanId, level, new[] { god }, companions);   // share with the community
         }
         // On every confident sighting, fold the new evidence back into the tag so it tracks the player as they evolve:
         // advance level/mastery FORWARD (players only gain), refresh the clan, and accumulate companions + gods (capped).
@@ -4274,6 +4835,96 @@ namespace SmiteGodLab
             return 1;
         }
 
+        // --- experiment/reveal-hidden-names: background name harvester ---------
+        // Scrapes LIVE rosters (getmatchplayerdetails) across queues. The live roster exposes names that completed
+        // matches anonymize, so this grows the name DB "at scale". Self-throttles well under the daily request cap.
+        System.Threading.CancellationTokenSource _harvestCts;
+        static readonly int[] HarvestQueues = { 426, 451, 504, 448, 450, 503, 440, 502, 445, 435, 459, 466 };
+        void StartHarvester()
+        {
+            if (_harvestCts != null) return;
+            _harvestCts = new System.Threading.CancellationTokenSource();
+            var ct = _harvestCts.Token;
+            _ = Task.Run(() => HarvestLoop(ct));
+        }
+        void StopHarvester()
+        {
+            try { _harvestCts?.Cancel(); } catch { }
+            _harvestCts = null;
+        }
+        async Task HarvestLoop(System.Threading.CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    if (SmiteApi.RequestsToday > 285000) { await Task.Delay(TimeSpan.FromMinutes(10), ct); continue; }
+                    var now = DateTime.UtcNow;
+                    // Collect every recent match id (blob-proof: ignore active_flag, just gather Match tokens). The
+                    // newest ids are the most likely to still be live; getmatchplayerdetails returns [] for finished
+                    // ones, so probing them is self-selecting for live matches.
+                    var seen = new HashSet<long>();
+                    foreach (var q in HarvestQueues)
+                    {
+                        if (ct.IsCancellationRequested) break;
+                        try
+                        {
+                            using var qd = JsonDocument.Parse(await SmiteApi.Call("getmatchidsbyqueue", q.ToString(), now.ToString("yyyyMMdd"), now.ToString("HH")));
+                            if (qd.RootElement.ValueKind == JsonValueKind.Array)
+                                foreach (var row in qd.RootElement.EnumerateArray())
+                                    foreach (var tok in GS(row, "Match").Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                                        if (long.TryParse(tok, out var lv) && lv > 0) seen.Add(lv);
+                        }
+                        catch { }
+                        await Task.Delay(120, ct);
+                    }
+                    var ids = seen.OrderByDescending(v => v).Take(120).Select(v => v.ToString()).ToList();
+                    foreach (var mid in ids)
+                    {
+                        if (ct.IsCancellationRequested) break;
+                        if (SmiteApi.RequestsToday > 292000) break;
+                        try
+                        {
+                            // Scrape COMPLETED match details: only these carry PartyId (the party graph) + portal ids, which
+                            // power corroborated reveals. Learn every visible player with their named party-mates as companions.
+                            using var md = JsonDocument.Parse(await SmiteApi.Call("getmatchdetails", mid));
+                            if (md.RootElement.ValueKind == JsonValueKind.Array && md.RootElement.GetArrayLength() > 1)
+                            {
+                                var rows = md.RootElement.EnumerateArray().ToList();
+                                var partyNamed = new Dictionary<int, List<string>>();   // named ids per PartyId (premade — strong)
+                                var teamNamed = new Dictionary<int, List<string>>();    // named ids per TaskForce (same-team — weak)
+                                foreach (var p in rows)
+                                {
+                                    string id2 = GS(p, "playerId"); if (string.IsNullOrEmpty(id2) || id2 == "0") continue;
+                                    int pp = GI(p, "PartyId");
+                                    if (pp != 0) { if (!partyNamed.TryGetValue(pp, out var l)) partyNamed[pp] = l = new List<string>(); l.Add(id2); }
+                                    int tf = GI(p, "TaskForce");
+                                    if (tf != 0) { if (!teamNamed.TryGetValue(tf, out var tl)) teamNamed[tf] = tl = new List<string>(); tl.Add(id2); }
+                                }
+                                foreach (var p in rows)
+                                {
+                                    string ppid = GS(p, "playerId"); if (string.IsNullOrEmpty(ppid) || ppid == "0") continue;
+                                    string nm = GS(p, "playerName"); if (string.IsNullOrEmpty(nm)) nm = GS(p, "hz_player_name");
+                                    if (string.IsNullOrEmpty(nm)) continue;
+                                    string god = GS(p, "Reference_Name");
+                                    int pp = GI(p, "PartyId"), tf = GI(p, "TaskForce");
+                                    List<string> comp = (pp != 0 && partyNamed.TryGetValue(pp, out var l)) ? l.Where(x => x != ppid).ToList() : null;
+                                    List<string> nbrs = (tf != 0 && teamNamed.TryGetValue(tf, out var tl)) ? tl.Where(x => x != ppid).ToList() : null;
+                                    NameDb.Learn(ppid, nm, 0, GI(p, "TeamId"), GS(p, "Team_Name"), GI(p, "Account_Level"), god, GI(p, "Mastery_Level"), comp, nbrs);
+                                }
+                            }
+                        }
+                        catch { }
+                        await Task.Delay(80, ct);
+                    }
+                    NameDb.Save(true);
+                }
+                catch (OperationCanceledException) { break; }
+                catch { }
+                try { await Task.Delay(TimeSpan.FromSeconds(45), ct); } catch { break; }
+            }
+        }
+
         // --- match scoreboard (getmatchdetails) --------------------------------
         async Task ShowMatchDetails(string matchId)
         {
@@ -4303,6 +4954,15 @@ namespace SmiteGodLab
                     string pidv = GS(pl, "playerId");
                     if (!string.IsNullOrEmpty(pn) && !string.IsNullOrEmpty(pidv) && pidv != "0")
                     { if (!partyNamed.TryGetValue(pp, out var l)) partyNamed[pp] = l = new List<string>(); l.Add(pidv); }
+                }
+                // same-team social graph: the NAMED players on each TaskForce (the hidden node's neighborhood, survives PartyId stripping)
+                var teamNamed = new Dictionary<int, List<string>>();
+                foreach (var pl in players)
+                {
+                    int tf2 = GI(pl, "TaskForce"); if (tf2 == 0) continue;
+                    string pidv = GS(pl, "playerId");
+                    if (!string.IsNullOrEmpty(pidv) && pidv != "0")
+                    { if (!teamNamed.TryGetValue(tf2, out var tl)) teamNamed[tf2] = tl = new List<string>(); tl.Add(pidv); }
                 }
                 string queue = GS(first, "name"); if (string.IsNullOrEmpty(queue)) queue = GS(first, "Queue");
                 int minutes = GI(first, "Minutes");
@@ -4334,18 +4994,19 @@ namespace SmiteGodLab
                             Text = "TEAM " + tf + "    " + (won ? "VICTORY" : "DEFEAT") + "    ·    " + kills + " kills"
                         });
                         y += S(34);
-                        foreach (var pl in team) { body.Controls.Add(MakeScoreRow(pl, y, rowW, dtip, partyColors.TryGetValue(GI(pl, "PartyId"), out var pc) ? pc : Color.Empty, partyNamed.TryGetValue(GI(pl, "PartyId"), out var comp) ? comp : null)); y += S(46); }
+                        foreach (var pl in team) { body.Controls.Add(MakeScoreRow(pl, y, rowW, dtip, partyColors.TryGetValue(GI(pl, "PartyId"), out var pc) ? pc : Color.Empty, partyNamed.TryGetValue(GI(pl, "PartyId"), out var comp) ? comp : null, matchId, teamNamed.TryGetValue(GI(pl, "TaskForce"), out var nbr) ? nbr : null)); y += S(46); }
                         y += S(10);
                     }
                     try { int on = 1; if (DwmSetWindowAttribute(dlg.Handle, 20, ref on, 4) != 0) DwmSetWindowAttribute(dlg.Handle, 19, ref on, 4); } catch { }
                     dlg.ShowDialog(this);
+                    if (NameDb.Enabled) NameDb.Save();   // persist names harvested from this scoreboard
                 }
                 }
                 catch (Exception ex) { MessageBox.Show(this, "Match details failed: " + ex.Message, "SMITE", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
             }
         }
 
-        Control MakeScoreRow(JsonElement pl, int y, int rowW, ToolTip dtip, Color partyCol = default, List<string> companions = null)
+        Control MakeScoreRow(JsonElement pl, int y, int rowW, ToolTip dtip, Color partyCol = default, List<string> companions = null, string matchId = null, List<string> neighbors = null)
         {
             var row = new Panel { Location = new Point(S(4), y), Size = new Size(rowW, S(42)), BackColor = Theme.Panel };
             if (partyCol != Color.Empty)   // premade-party accent bar on the left
@@ -4360,6 +5021,23 @@ namespace SmiteGodLab
             string clan = GS(pl, "Team_Name");
             int clanId = GI(pl, "TeamId"), acct = GI(pl, "Account_Level"), mast = GI(pl, "Mastery_Level");
             string kda = GI(pl, "Kills_Player") + "/" + GI(pl, "Deaths") + "/" + GI(pl, "Assists");
+            string pid = GS(pl, "playerId"); int tf = GI(pl, "TaskForce");
+            // experiment/reveal-hidden-names: harvest every visible player into the name DB, and reveal hidden ones from it.
+            var nbrSelf = neighbors?.Where(x => x != pid).ToList();
+            if (NameDb.Enabled && !priv && !string.IsNullOrEmpty(pid) && pid != "0")
+                NameDb.Learn(pid, nm, 0, clanId, clan, acct, god, mast, companions, nbrSelf);
+            string revName = null; int revConf = 0; bool revExact = false;
+            if (NameDb.Enabled && priv)
+            {
+                revName = NameDb.ResolveExact(matchId, tf, GS(pl, "GodId"), god);   // GodId primary; Reference_Name = legacy fallback
+                if (!string.IsNullOrEmpty(revName)) { revExact = true; revConf = 100; }
+                else { var rv = NameDb.Resolve(clanId, acct, mast, god, companions, neighbors); revName = rv.name; revConf = rv.conf; }
+            }
+            string cName = null; int cVotes = 0; bool cConf = false;
+            if (TagSync.Enabled && priv)
+            { var cr = TagSync.Resolve(clanId, acct, mast, god, companions); cName = cr.name; cVotes = cr.votes; cConf = cr.confirmed; }
+            Color revCol = revExact ? Color.FromArgb(120, 210, 140) : Color.FromArgb(110, 200, 210);
+            Color comCol = Color.FromArgb(186, 156, 232);   // community tag = violet
             // Name line + sub line, both repainted by PaintName():
             //  - hidden + saved tag  -> "God — ★ Nick [clan]" (blue)
             //  - hidden, no tag      -> "God — Private [clan] (click to name)" (gold)
@@ -4380,11 +5058,29 @@ namespace SmiteGodLab
                 }
                 if (tag != null) UpdateSighting(tag, clan, acct, mast, companions, god);   // fold this sighting in (level/mastery/companions/gods)
                 string tail = clan.Length > 0 ? "  ·  [" + clan + "]" : "";
-                nameLbl.ForeColor = tag != null ? Theme.Blue : Theme.Yellow;
-                nameLbl.Text = tag != null ? "★ " + tag.Nick + tail : "Private" + tail + "   (click to name)";
-                subLbl.ForeColor = Theme.Dim;
+                // Priority: your tag ★ > local exact ✔ > community-confirmed ⚑ > local fingerprint ≈ > community-unconfirmed ⚑ > Hidden
+                if (tag != null)
+                { nameLbl.ForeColor = Theme.Blue; nameLbl.Text = "★ " + tag.Nick + tail; }
+                else if (revExact)
+                { nameLbl.ForeColor = revCol; nameLbl.Text = "✔ " + revName + tail; }
+                else if (cConf)
+                { nameLbl.ForeColor = comCol; nameLbl.Text = "⚑ " + cName + "?" + tail; }
+                else if (!string.IsNullOrEmpty(revName))
+                { nameLbl.ForeColor = revCol; nameLbl.Text = "≈ " + revName + "?" + tail; }
+                else if (!string.IsNullOrEmpty(cName))
+                { nameLbl.ForeColor = comCol; nameLbl.Text = "⚑ " + cName + "?" + tail; }
+                else
+                { nameLbl.ForeColor = Theme.Yellow; nameLbl.Text = "Hidden" + tail + "   (click to name)"; }
+                string note; Color noteCol = Theme.Dim;
+                if (tag != null) note = !string.IsNullOrEmpty(revName) ? "   ·   maybe " + revName : (!string.IsNullOrEmpty(cName) ? "   ·   community: " + cName : "");
+                else if (revExact) { note = "   ·   matched live capture"; noteCol = revCol; }
+                else if (cConf) { note = "   ·   community · " + cVotes + " taggers"; noteCol = comCol; }
+                else if (!string.IsNullOrEmpty(revName)) { note = "   ·   possible · " + revConf + "% (guess)"; noteCol = revCol; }
+                else if (!string.IsNullOrEmpty(cName)) { note = "   ·   community · unconfirmed"; noteCol = comCol; }
+                else note = "";
                 string conf = tag != null && tag.Seen > 1 ? "   ·   seen " + tag.Seen + "×" : "";
-                subLbl.Text = "Acct Lv " + acct + "   ·   Mastery " + mast + "   ·   " + kda + conf;
+                subLbl.ForeColor = noteCol;
+                subLbl.Text = "Acct Lv " + acct + "   ·   Mastery " + mast + "   ·   " + kda + conf + note;
             }
             PaintName();
             row.Controls.Add(nameLbl); row.Controls.Add(subLbl);
@@ -4394,14 +5090,23 @@ namespace SmiteGodLab
                 EventHandler tagIt = (s, e) =>
                 {
                     var cur = MatchHidden(clanId, acct, mast, companions, god);
-                    string head = priv ? "Name this hidden player" : "Edit the tag for " + nm;
+                    // ACTIVE LEARNING: if the algorithm guessed a name (✔ exact / ≈ / ⚑), pre-fill it so one Save CONFIRMS it
+                    // into a ground-truth user tag (★, which outranks every guess afterwards). Otherwise the box is blank to name fresh.
+                    string suggested = cur?.Nick ?? (string.IsNullOrEmpty(revName) ? "" : revName);
+                    bool isGuess = cur == null && !string.IsNullOrEmpty(revName);
+                    string head = priv ? (isGuess ? "Confirm or correct this player" : "Name this hidden player") : "Edit the tag for " + nm;
                     int compCount = companions?.Count ?? 0;
-                    string matchNote = compCount > 0 ? "matched by clan + level + mastery + " + compCount + " party-mate" + (compCount == 1 ? "" : "s") : "matched by clan + level + mastery";
+                    string matchNote = isGuess ? "suggested name pre-filled — Save to confirm, edit to correct, or clear to dismiss"
+                        : (compCount > 0 ? "matched by clan + level + mastery + " + compCount + " party-mate" + (compCount == 1 ? "" : "s") : "matched by clan + level + mastery");
                     string nick = PromptText(head,
-                        god + (clan.Length > 0 ? "  ·  [" + clan + "]" : "") + "   ·   Acct Lv " + acct + "   ·   Mastery " + mast + "\r\n(" + matchNote + "; clear the box to remove)",
-                        cur?.Nick ?? "");
+                        god + (clan.Length > 0 ? "  ·  [" + clan + "]" : "") + "   ·   Acct Lv " + acct + "   ·   Mastery " + mast + "\r\n(" + matchNote + ")",
+                        suggested);
                     if (nick == null) return;
                     SetHiddenTag(clanId, clan, acct, mast, nick, companions, god);
+                    // Keep the exact per-match slot in sync from the completed view too: naming a hidden row PINS the
+                    // matchId+team+GodId slot, clearing it FORGETS the slot — otherwise a tag captured live couldn't be
+                    // removed here (ResolveExact would keep showing ✔). Only hidden rows have an exact slot.
+                    if (priv && !string.IsNullOrEmpty(matchId)) { NameDb.LearnLiveSlot(matchId, tf, GS(pl, "GodId"), nick); NameDb.Save(true); }
                     PaintName();
                 };
                 row.Cursor = nameLbl.Cursor = subLbl.Cursor = Cursors.Hand;
@@ -4493,10 +5198,11 @@ namespace SmiteGodLab
                                 Text = "TEAM " + tf + "    ·    " + team.Count + " players"
                             });
                             y += S(34);
-                            foreach (var pl in team) { body.Controls.Add(MakeLiveRow(pl, y, rowW)); y += S(44); }
+                            foreach (var pl in team) { body.Controls.Add(MakeLiveRow(pl, y, rowW, matchId)); y += S(44); }
                             y += S(10);
                         }
                         try { int on = 1; if (DwmSetWindowAttribute(dlg.Handle, 20, ref on, 4) != 0) DwmSetWindowAttribute(dlg.Handle, 19, ref on, 4); } catch { }
+                        if (NameDb.Enabled) NameDb.Save();   // persist names captured from this live roster
                         dlg.ShowDialog(this);
                     }
                 }
@@ -4504,7 +5210,7 @@ namespace SmiteGodLab
             }
         }
 
-        Control MakeLiveRow(JsonElement pl, int y, int rowW)
+        Control MakeLiveRow(JsonElement pl, int y, int rowW, string matchId = null)
         {
             var row = new Panel { Location = new Point(S(4), y), Size = new Size(rowW, S(40)), BackColor = Theme.Panel };
             string god = GS(pl, "GodName");
@@ -4512,6 +5218,13 @@ namespace SmiteGodLab
             string nm = GS(pl, "playerName"); bool priv = string.IsNullOrEmpty(nm);
             int clanId = GI(pl, "TeamId"), acct = GI(pl, "Account_Level"), mast = GI(pl, "Mastery_Level"), tier = GI(pl, "Tier");
             string clan = GS(pl, "Team_Name");
+            // experiment/reveal-hidden-names: the live roster exposes names a completed match anonymizes — capture them.
+            if (NameDb.Enabled && !priv)
+            {
+                NameDb.LearnLiveSlot(matchId, GI(pl, "taskForce"), GS(pl, "GodId"), nm);   // exact reveal once this match completes (keyed by GodId)
+                string lpid = GS(pl, "playerId");
+                if (!string.IsNullOrEmpty(lpid) && lpid != "0") NameDb.Learn(lpid, nm, GI(pl, "portal_id"), clanId, clan, acct, god, mast);
+            }
             string tail = clan.Length > 0 ? "  ·  [" + clan + "]" : "";
             var nameLbl = new Label { Location = new Point(S(46), S(3)), Size = new Size(S(560), S(18)), Font = Theme.F(9.5f, FontStyle.Bold), AutoEllipsis = true };
             var subLbl = new Label { Location = new Point(S(46), S(21)), Size = new Size(S(620), S(16)), Font = Theme.F(8.5f), ForeColor = Theme.Dim };
@@ -4535,6 +5248,12 @@ namespace SmiteGodLab
                         cur?.Nick ?? "");
                     if (nick == null) return;
                     SetHiddenTag(clanId, clan, acct, mast, nick, null, god);
+                    // EXACT reveal for THIS match once it completes: live carries no clan and its Mastery_Level differs
+                    // from the completed value, so the fingerprint tag alone can't re-match the finished scoreboard. Pin
+                    // the exact slot by matchId + team + GodId (empty nick forgets it), and Save now — the roster Save
+                    // already ran before this click, so the new tag would otherwise sit only in memory.
+                    NameDb.LearnLiveSlot(matchId, GI(pl, "taskForce"), GS(pl, "GodId"), nick);
+                    NameDb.Save(true);   // FORCE: the roster Save ran <8s ago, so a debounced Save() here would be a no-op and lose the tag
                     Paint();
                 };
                 row.Cursor = nameLbl.Cursor = subLbl.Cursor = Cursors.Hand;
