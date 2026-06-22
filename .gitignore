@@ -5,6 +5,9 @@ obj/
 # Hi-Rez SMITE Partner Program media kit (~9.4 GB, copyrighted — local working reference only)
 For use/
 
+# Hi-Rez API developer guide PDF (copyrighted reference — local only, not for distribution)
+docs/
+
 # Dev scratch: ad-hoc capture/test scripts, screenshots, sandbox data, and the API
 # contract test (which embeds plaintext credentials). Not for distribution.
 _work/
