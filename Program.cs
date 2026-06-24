@@ -121,8 +121,9 @@ namespace SmiteGodLab
                 Directory.CreateDirectory(dir);
                 string reg = Path.Combine(dir, "Montserrat-Regular.ttf");
                 string bold = Path.Combine(dir, "Montserrat-Bold.ttf");
-                EnsureFile(reg, "https://github.com/JulietaUla/Montserrat/raw/master/fonts/ttf/Montserrat-Regular.ttf");
-                EnsureFile(bold, "https://github.com/JulietaUla/Montserrat/raw/master/fonts/ttf/Montserrat-Bold.ttf");
+                Task.WhenAll(   // download both concurrently (halves the worst-case first-launch stall)
+                    EnsureFileAsync(reg, "https://github.com/JulietaUla/Montserrat/raw/master/fonts/ttf/Montserrat-Regular.ttf"),
+                    EnsureFileAsync(bold, "https://github.com/JulietaUla/Montserrat/raw/master/fonts/ttf/Montserrat-Bold.ttf")).GetAwaiter().GetResult();
 
                 _pfc = new PrivateFontCollection();
                 bool any = false;
@@ -142,12 +143,15 @@ namespace SmiteGodLab
             UsingMontserrat = false;
         }
 
-        static void EnsureFile(string path, string url)
+        static async Task EnsureFileAsync(string path, string url)
         {
             if (File.Exists(path) && new FileInfo(path).Length > 1024) return;
             try
             {
-                byte[] data = _http.GetByteArrayAsync(url).GetAwaiter().GetResult();
+                // short timeout: the shared HttpClient's default is 100s, and this runs (awaited) BEFORE the window shows —
+                // a slow/unreachable network must not hang startup. On timeout we just fall back to Segoe UI and retry next launch.
+                using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(6));
+                byte[] data = await _http.GetByteArrayAsync(url, cts.Token);
                 if (data != null && data.Length > 1024) File.WriteAllBytes(path, data);
             }
             catch { }
@@ -205,19 +209,25 @@ namespace SmiteGodLab
                 using var doc = JsonDocument.Parse(json);
                 foreach (var god in doc.RootElement.EnumerateObject())
                 {
-                    var slots = new Dictionary<string, AbilityInfo>(StringComparer.OrdinalIgnoreCase);
-                    foreach (var ab in god.Value.EnumerateArray())
+                    try   // one malformed god/ability entry must not abort the whole loop (dropping all remaining gods)
                     {
-                        string slot = ab.GetProperty("slot").GetString();
-                        if (string.IsNullOrEmpty(slot)) continue;
-                        slots[slot] = new AbilityInfo
+                        var slots = new Dictionary<string, AbilityInfo>(StringComparer.OrdinalIgnoreCase);
+                        if (god.Value.ValueKind != JsonValueKind.Array) { _map[god.Name] = slots; continue; }
+                        foreach (var ab in god.Value.EnumerateArray())
                         {
-                            Slot = slot,
-                            Name = ab.TryGetProperty("name", out var n) ? n.GetString() : null,
-                            Slug = ab.TryGetProperty("slug", out var s) ? s.GetString() : null,
-                        };
+                            if (!ab.TryGetProperty("slot", out var slotE)) continue;
+                            string slot = slotE.GetString();
+                            if (string.IsNullOrEmpty(slot)) continue;
+                            slots[slot] = new AbilityInfo
+                            {
+                                Slot = slot,
+                                Name = ab.TryGetProperty("name", out var n) ? n.GetString() : null,
+                                Slug = ab.TryGetProperty("slug", out var s) ? s.GetString() : null,
+                            };
+                        }
+                        _map[god.Name] = slots;
                     }
-                    _map[god.Name] = slots;
+                    catch { }
                 }
             }
             catch { }
@@ -591,7 +601,7 @@ namespace SmiteGodLab
 
         static string DbFile => Path.Combine(Theme.DataDir, "namedb.json");
         static string BakFile => DbFile + ".bak";
-        static string Today => DateTime.Now.ToString("yyyy-MM-dd");
+        static string Today => DateTime.Now.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
 
         public static int PlayerCount { get { lock (_lock) return _byId.Count; } }
         public static int LiveCount { get { lock (_lock) return _live.Count; } }
@@ -633,7 +643,7 @@ namespace SmiteGodLab
                 var p = TryRead(DbFile) ?? TryRead(BakFile);   // fall back to the backup if the main file is missing/corrupt
                 if (p != null)
                 {
-                    if (p.Players != null) foreach (var e in p.Players) if (e != null && !string.IsNullOrEmpty(e.Id)) { e.GodMastery ??= new(); e.Companions ??= new(); e.NeighborCounts ??= new(); e.RankTier ??= new(); e.RankMmr ??= new(); _byId[e.Id] = e; }
+                    if (p.Players != null) foreach (var e in p.Players) if (e != null && !string.IsNullOrEmpty(e.Id)) { e.GodMastery ??= new(); e.GodSkin ??= new(); e.Companions ??= new(); e.NeighborCounts ??= new(); e.RankTier ??= new(); e.RankMmr ??= new(); _byId[e.Id] = e; }
                     if (p.Live != null) _live = p.Live;
                 }
                 RebuildIndexes();
@@ -661,13 +671,13 @@ namespace SmiteGodLab
                 };
                 _dirty = false; _lastSave = DateTime.UtcNow;
             }
+            string tmp = DbFile + "." + Environment.CurrentManagedThreadId + ".tmp";   // unique per thread → UI + watcher saves don't collide on one .tmp
             try
             {
-                string tmp = DbFile + ".tmp";
                 File.WriteAllText(tmp, JsonSerializer.Serialize(p));
                 if (File.Exists(DbFile)) File.Replace(tmp, DbFile, BakFile); else File.Move(tmp, DbFile);
             }
-            catch { lock (_lock) _dirty = true; }   // failed write → retry on the next change
+            catch { lock (_lock) _dirty = true; try { if (File.Exists(tmp)) File.Delete(tmp); } catch { } }   // failed write → retry next change; don't leave an orphan .tmp
         }
         // Value-aware eviction: never drop a rare PARTY-ANCHOR (someone referenced as a companion); otherwise prefer
         // many sightings / many gods / recency. Sheds one-off pub rows, keeps the identifying anchors.
@@ -689,7 +699,7 @@ namespace SmiteGodLab
         {
             double v = _byCompanion.ContainsKey(e.Id) ? 1e9 : 0;   // anchor → pin, never evict
             v += Math.Log(1 + e.Seen) * 1000 + e.GodMastery.Count * 50;
-            if (DateTime.TryParse(e.LastSeen, out var d)) v += (d - new DateTime(2020, 1, 1)).TotalDays;   // recency
+            if (DateTime.TryParse(e.LastSeen, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var d)) v += (d - new DateTime(2020, 1, 1)).TotalDays;   // recency (invariant: LastSeen is written yyyy-MM-dd)
             return v;
         }
 
@@ -708,7 +718,7 @@ namespace SmiteGodLab
                 if (!_byId.TryGetValue(id, out var e)) { e = new Entry { Id = id, Seen = 0 }; _byId[id] = e; }
                 e.Name = name;
                 if (portal != 0) e.Portal = portal;
-                if (clanId != 0) { e.ClanId = clanId; if (!string.IsNullOrEmpty(clan)) e.Clan = clan; }
+                if (clanId != 0) { if (e.ClanId != 0 && e.ClanId != clanId && _byClan.TryGetValue(e.ClanId, out var oldClanSet)) oldClanSet.Remove(e.Id); e.ClanId = clanId; if (!string.IsNullOrEmpty(clan)) e.Clan = clan; }   // purge stale _byClan posting on a clan change
                 if (level > e.Level) e.Level = level;
                 if (!string.IsNullOrEmpty(god) && godMastery > 0)
                     e.GodMastery[god] = Math.Max(godMastery, e.GodMastery.TryGetValue(god, out var gm) ? gm : 0);
@@ -807,14 +817,19 @@ namespace SmiteGodLab
                     foreach (var id in sclan) if (sgod.Contains(id)) cand.Add(id);
                 var nameTop = new Dictionary<string, double>();   // best score per candidate NAME (for the top-2 margin guard)
                 var nameId = new Dictionary<string, string>();
+                // The IDF of a given query companion/neighbor is constant across all candidates within this (locked) call, so
+                // memoize it once rather than recomputing the log + dictionary lookup for every candidate that shares it.
+                Dictionary<string, double> idfC = null, idfN = null;
+                if (companions != null) { idfC = new(); foreach (var c in companions) idfC[c] = Idf(c); }
+                if (neighbors != null) { idfN = new(); foreach (var n in neighbors) idfN[n] = NIdf(n); }
                 foreach (var cid in cand)
                 {
                     if (!_byId.TryGetValue(cid, out var e)) continue;
                     if (exclude != null && (exclude.Contains(cid) || exclude.Contains(e.Name))) continue;   // can't be a player already VISIBLE in this same match
                     int overlap = 0; double idfSum = 0;
-                    if (companions != null) foreach (var c in companions) if (e.Companions.Contains(c)) { overlap++; idfSum += Idf(c); }
+                    if (companions != null) foreach (var c in companions) if (e.Companions.Contains(c)) { overlap++; idfSum += idfC[c]; }
                     int nbOverlap = 0; double nbIdf = 0;   // shared TRUSTED same-team neighbors (the social-graph anchor)
-                    if (neighbors != null) foreach (var n in neighbors) if (e.NeighborCounts.TryGetValue(n, out var nc) && nc >= NeighborTrust) { nbOverlap++; nbIdf += NIdf(n); }
+                    if (neighbors != null) foreach (var n in neighbors) if (e.NeighborCounts.TryGetValue(n, out var nc) && nc >= NeighborTrust) { nbOverlap++; nbIdf += idfN[n]; }
                     bool clanExact = clanId != 0 && e.ClanId == clanId;
                     bool playsGod = !string.IsNullOrEmpty(god) && e.GodMastery.ContainsKey(god);
                     int dmSigned = playsGod ? mastery - e.GodMastery[god] : 0;       // observed − stored; <0 = regression (mastery only rises)
@@ -882,7 +897,7 @@ namespace SmiteGodLab
                     // STALE-ENTRY penalty: an old snapshot is a weaker anchor than a fresh one, so a recently-corroborated
                     // candidate outranks a stale stat-twin whose year-old stats happen to still match. Mild — the gate +
                     // margin guard already block most stale false reveals.
-                    if (DateTime.TryParse(e.LastSeen, out var ls)) { double months = (DateTime.Now - ls).TotalDays / 30.0; if (months > 8) score -= 12; else if (months > 4) score -= 6; }
+                    if (DateTime.TryParse(e.LastSeen, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var ls)) { double months = (DateTime.Now - ls).TotalDays / 30.0; if (months > 8) score -= 12; else if (months > 4) score -= 6; }
                     if (score >= 20 && (!nameTop.TryGetValue(e.Name, out var ns) || score > ns)) { nameTop[e.Name] = score; nameId[e.Name] = e.Id; }   // soft floor + per-name best
                 }
                 if (nameTop.Count == 0) return (null, null, 0);
@@ -906,7 +921,7 @@ namespace SmiteGodLab
         public static bool Enabled;
         public sealed class Slot { public string Id { get; set; } = ""; public string Name { get; set; } = ""; public string GodId { get; set; } = ""; public int Team { get; set; } }
         public sealed class Roster { public List<Slot> Players { get; set; } = new(); public string At { get; set; } = ""; }
-        sealed class Persist { public Dictionary<string, string> IdName { get; set; } = new(); public List<Roster> Rosters { get; set; } = new(); public string SkipLogUpTo { get; set; } = ""; }
+        sealed class Persist { public Dictionary<string, string> IdName { get; set; } = new(); public List<Roster> Rosters { get; set; } = new(); public string SkipLogPath { get; set; } = ""; public long SkipLogLen { get; set; } = -1; }
 
         const int MaxRosters = 400;
         static readonly object _lock = new object();
@@ -915,7 +930,7 @@ namespace SmiteGodLab
         // After a "nuke", suppress re-ingesting the combat log that's currently on disk (SMITE's last match) until the game
         // writes a NEWER one — otherwise opening that match's scoreboard would re-read the live log and instantly undo the
         // wipe. Stored as the log's UTC write time at nuke; cleared the moment a newer log appears. Persisted across restarts.
-        static DateTime _skipLogUpTo = DateTime.MinValue;
+        static string _skipLogPath = ""; static long _skipLogLen = -1;   // post-nuke: suppress this exact log file (path+length) until it's replaced/truncated by a new match (NOT keyed on the mutable write-time, which the game bumps with every append)
         static bool _dirty;
         static long _lastIngestTick = -100000;
         static FileSystemWatcher _watch;
@@ -974,7 +989,7 @@ namespace SmiteGodLab
             lock (_lock)
             {
                 _idName = new(); _rosters = new();
-                try { string f = CurrentLog(); _skipLogUpTo = File.Exists(f) ? File.GetLastWriteTimeUtc(f) : DateTime.UtcNow; } catch { _skipLogUpTo = DateTime.UtcNow; }
+                try { string f = CurrentLog(); if (File.Exists(f)) { _skipLogPath = f; _skipLogLen = new FileInfo(f).Length; } else { _skipLogPath = ""; _skipLogLen = -1; } } catch { _skipLogPath = ""; _skipLogLen = -1; }
                 _dirty = true;
             }
             Save();
@@ -1015,9 +1030,9 @@ namespace SmiteGodLab
         {
             lock (_lock)
             {
-                _idName = new(); _rosters = new(); _skipLogUpTo = DateTime.MinValue;
+                _idName = new(); _rosters = new(); _skipLogPath = ""; _skipLogLen = -1;
                 var p = TryRead(StoreFile) ?? TryRead(BakFile);
-                if (p != null) { if (p.IdName != null) _idName = p.IdName; if (p.Rosters != null) _rosters = p.Rosters; if (!string.IsNullOrEmpty(p.SkipLogUpTo) && DateTime.TryParse(p.SkipLogUpTo, null, System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal, out var sk)) _skipLogUpTo = sk; }
+                if (p != null) { if (p.IdName != null) _idName = p.IdName; if (p.Rosters != null) _rosters = p.Rosters; _skipLogPath = p.SkipLogPath ?? ""; _skipLogLen = p.SkipLogLen; }
             }
         }
         static Persist TryRead(string path) { try { if (File.Exists(path)) return JsonSerializer.Deserialize<Persist>(File.ReadAllText(path)); } catch { } return null; }
@@ -1031,16 +1046,16 @@ namespace SmiteGodLab
                 if (_rosters.Count > MaxRosters) _rosters.RemoveRange(0, _rosters.Count - MaxRosters);
                 // snapshot under the lock; serialize + write OUTSIDE it so a watcher-thread Save never blocks the UI thread's
                 // CorrelateMatch on the lock (Slots are immutable once created, so copying the lists is enough).
-                p = new Persist { IdName = new Dictionary<string, string>(_idName), Rosters = _rosters.Select(r => new Roster { At = r.At, Players = new List<Slot>(r.Players) }).ToList(), SkipLogUpTo = _skipLogUpTo == DateTime.MinValue ? "" : _skipLogUpTo.ToString("o") };
+                p = new Persist { IdName = new Dictionary<string, string>(_idName), Rosters = _rosters.Select(r => new Roster { At = r.At, Players = new List<Slot>(r.Players) }).ToList(), SkipLogPath = _skipLogPath, SkipLogLen = _skipLogLen };
                 _dirty = false;
             }
+            string tmp = StoreFile + "." + Environment.CurrentManagedThreadId + ".tmp";   // unique per thread → UI + watcher saves don't collide
             try
             {
-                string tmp = StoreFile + ".tmp";
                 File.WriteAllText(tmp, JsonSerializer.Serialize(p));
                 if (File.Exists(StoreFile)) File.Replace(tmp, StoreFile, BakFile); else File.Move(tmp, StoreFile);
             }
-            catch { lock (_lock) _dirty = true; }   // failed write → retry on the next change
+            catch { lock (_lock) _dirty = true; try { if (File.Exists(tmp)) File.Delete(tmp); } catch { } }   // failed write → retry next change; no orphan .tmp
         }
 
         // Read the top of the (possibly still-being-written-by-the-game) combat log without locking the game out.
@@ -1070,13 +1085,14 @@ namespace SmiteGodLab
             lock (_lock) { long n = Environment.TickCount64; if (!force && n - _lastIngestTick < 2000) return; _lastIngestTick = n; }
             string logFile = CurrentLog();   // re-resolve each ingest: the newest CombatLog_* can change between matches
             if (!File.Exists(logFile)) return;
-            // post-nuke suppression: ignore the log that was on disk at nuke time (SMITE's last match) until the game writes
-            // a NEWER one, so a wipe isn't instantly undone by re-opening that match. A newer log clears the marker.
-            if (_skipLogUpTo != DateTime.MinValue)
+            // post-nuke suppression: ignore the EXACT log file present at nuke time (SMITE's last match) — even as the game keeps
+            // APPENDING to it — until that file is REPLACED by a newer log or TRUNCATED (a brand-new match). Keying on path+length
+            // (not the write-time, which every append bumps) stops a wipe from being instantly undone by the game's own writes.
+            if (_skipLogLen >= 0)
             {
-                DateTime w; try { w = File.GetLastWriteTimeUtc(logFile); } catch { w = DateTime.MaxValue; }
-                if (w <= _skipLogUpTo) return;
-                lock (_lock) { _skipLogUpTo = DateTime.MinValue; _dirty = true; }
+                long curLen; try { curLen = new FileInfo(logFile).Length; } catch { curLen = long.MaxValue; }
+                if (string.Equals(logFile, _skipLogPath, StringComparison.OrdinalIgnoreCase) && curLen >= _skipLogLen) return;   // same file, only grown → still the nuked match
+                lock (_lock) { _skipLogPath = ""; _skipLogLen = -1; _dirty = true; }   // a different / truncated log appeared → the wipe is safe to lift
             }
             // Read generously (the 10 initial spawns sit at the top, but read past interleaved early events so a pushed-down
             // spawn isn't missed — a single dropped player would fail CorrelateMatch's full-lineup gate and kill the reveal),
@@ -1338,6 +1354,10 @@ namespace SmiteGodLab
         public int ParamCount;
     }
 
+    // A named group of account names for the Encounters tab — e.g. all the smurfs of one person (persisted to enc_presets.json).
+    class EncPreset { public string Name { get; set; } = ""; public List<string> Accounts { get; set; } = new(); }
+    class EncPresetFile { public List<EncPreset> Presets { get; set; } = new(); }
+
     // A saved favorite player (persisted to favorites.json next to the exe).
     class FavPlayer
     {
@@ -1472,6 +1492,9 @@ namespace SmiteGodLab
     class PlayerList : ListBox
     {
         readonly List<PlayerRow> _rows = new List<PlayerRow>();
+        // shared row-background brushes (fixed colors) — cached so DrawRow doesn't allocate a SolidBrush per row per paint
+        static readonly SolidBrush _brSel = new SolidBrush(Color.FromArgb(50, 50, 60)), _brHov = new SolidBrush(Color.FromArgb(34, 34, 42)),
+            _brNorm = new SolidBrush(Color.FromArgb(20, 20, 20)), _brAccent = new SolidBrush(Color.FromArgb(193, 30, 31)), _brHdrBg = new SolidBrush(Color.FromArgb(13, 13, 13));
         Font _glyph, _chip, _hdr;
         int _hoverAction = -1;   // index of the row whose action glyph (trash/☆) the cursor is over → highlight it
         int _hoverRow = -1;      // index of the row the cursor is over (whole-row hover highlight)
@@ -1541,7 +1564,7 @@ namespace SmiteGodLab
 
             if (r.Header)   // clickable section divider: ▼/▶ collapse arrow + accent caption
             {
-                using (var hb = new SolidBrush(Color.FromArgb(13, 13, 13))) g.FillRectangle(hb, bounds);
+                g.FillRectangle(_brHdrBg, bounds);
                 if (_hdr == null) _hdr = new Font(Font.FontFamily, Font.Size, FontStyle.Bold);
                 var arrow = new Rectangle(bounds.Left + Sc(6), bounds.Top, Sc(16), bounds.Height);
                 TextRenderer.DrawText(g, r.Collapsed ? "▶" : "▼", Font, arrow, Color.FromArgb(193, 30, 31), TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
@@ -1552,9 +1575,8 @@ namespace SmiteGodLab
 
             bool sel = index == SelectedIndex;
             bool hov = index == _hoverRow && !sel;   // whole-row hover highlight
-            Color bgc = sel ? Color.FromArgb(50, 50, 60) : hov ? Color.FromArgb(34, 34, 42) : Color.FromArgb(20, 20, 20);
-            using (var bg = new SolidBrush(bgc)) g.FillRectangle(bg, bounds);
-            if (sel) using (var ab = new SolidBrush(Color.FromArgb(193, 30, 31))) g.FillRectangle(ab, bounds.Left, bounds.Top, Sc(3), bounds.Height);   // red accent bar = selected
+            g.FillRectangle(sel ? _brSel : hov ? _brHov : _brNorm, bounds);
+            if (sel) g.FillRectangle(_brAccent, bounds.Left, bounds.Top, Sc(3), bounds.Height);   // red accent bar = selected
             g.SmoothingMode = SmoothingMode.AntiAlias;
 
             if (_chip == null) _chip = new Font(Font.FontFamily, Math.Max(6f, Font.Size - 1.5f), FontStyle.Bold);
@@ -1758,7 +1780,41 @@ namespace SmiteGodLab
         public sealed class Match { [System.Text.Json.Serialization.JsonPropertyName("match_id")] public string MatchId { get; set; } [System.Text.Json.Serialization.JsonPropertyName("queue_id")] public int QueueId { get; set; } [System.Text.Json.Serialization.JsonPropertyName("time")] public string Time { get; set; } [System.Text.Json.Serialization.JsonPropertyName("winning_team")] public int WinningTeam { get; set; } [System.Text.Json.Serialization.JsonPropertyName("duration")] public int Duration { get; set; } [System.Text.Json.Serialization.JsonPropertyName("players")] public List<Player> Players { get; set; } = new(); }
         sealed class Cursor { [System.Text.Json.Serialization.JsonPropertyName("current")] public int Current { get; set; } [System.Text.Json.Serialization.JsonPropertyName("max")] public int Max { get; set; } }
         sealed class Wrapper { [System.Text.Json.Serialization.JsonPropertyName("cursor")] public Cursor Cursor { get; set; } [System.Text.Json.Serialization.JsonPropertyName("data")] public List<Match> Data { get; set; } = new(); }
-        sealed class CacheFile { public int CursorMax { get; set; } public string FetchedAt { get; set; } = ""; public List<Match> Matches { get; set; } = new(); }
+        sealed class CacheFile { public int CursorMax { get; set; } public int DeepestPage { get; set; } public string FetchedAt { get; set; } = ""; public List<Match> Matches { get; set; } = new(); public Dictionary<int, int> SeasonDone { get; set; } = new(); }
+        // GetHistory result: the matches + how deep the scan reached (Deepest of Max reachable pages). Complete == every game
+        // smite.guru exposes was pulled (false only when a hyper-active CURRENT season exceeds the ~179-page offset cap).
+        public sealed class History { public List<Match> Matches { get; set; } = new(); public int Deepest { get; set; } public int Max { get; set; } public bool Complete { get; set; } }
+        // Full match detail from api.smite.guru/v3/matches/pc/<id> — has per-player stats (KDA/damage/gold/build) and survives
+        // for ALL ages (Hi-Rez getmatchdetails only retains a few weeks), so it powers the click-a-row scoreboard for old games.
+        public sealed class MPlayer
+        {
+            [System.Text.Json.Serialization.JsonPropertyName("id")] public long Id { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("name")] public string Name { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("champion")] public int Champion { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("team")] public int Team { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("level")] public int Level { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("account_level")] public int AccountLevel { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("kills")] public int Kills { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("assists")] public int Assists { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("deaths")] public int Deaths { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("damage")] public int Damage { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("mitigated")] public int Mitigated { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("taken")] public int Taken { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("healing")] public int Healing { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("gold")] public int Gold { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("structure_damage")] public int StructureDamage { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("party")] public int Party { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("build")] public Dictionary<string, int> Build { get; set; } = new();
+        }
+        public sealed class MDetail
+        {
+            [System.Text.Json.Serialization.JsonPropertyName("match_id")] public string MatchId { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("queue_id")] public int QueueId { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("time")] public string Time { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("winning_team")] public int WinningTeam { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("duration")] public int Duration { get; set; }
+            [System.Text.Json.Serialization.JsonPropertyName("players")] public List<MPlayer> Players { get; set; } = new();
+        }
 
         readonly Form _owner;
         Microsoft.Web.WebView2.WinForms.WebView2 _wv;
@@ -1766,6 +1822,7 @@ namespace SmiteGodLab
         readonly SemaphoreSlim _gate = new(1, 1);
         static readonly JsonSerializerOptions JOpt = new() { PropertyNameCaseInsensitive = true };
         Form _host;
+        Microsoft.Web.WebView2.Core.CoreWebView2Environment _env;
         string _lastTitle = "";
         public string LastDiag => _lastTitle;
 
@@ -1785,9 +1842,30 @@ namespace SmiteGodLab
                 _host.Show();
             }
             // persistent profile dir → keep the cf_clearance cookie between page loads + runs (skip the CF challenge)
-            var env = await Microsoft.Web.WebView2.Core.CoreWebView2Environment.CreateAsync(null, Path.Combine(Theme.DataDir, "webview2"), null);
-            await _wv.EnsureCoreWebView2Async(env);
+            _env = await Microsoft.Web.WebView2.Core.CoreWebView2Environment.CreateAsync(null, Path.Combine(Theme.DataDir, "webview2"), null);
+            await _wv.EnsureCoreWebView2Async(_env);
             try { _wv.CoreWebView2.Settings.AreDevToolsEnabled = false; _wv.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false; _wv.CoreWebView2.Settings.IsStatusBarEnabled = false; } catch { }
+            // SPEED + courtesy: block everything we don't need. The match data is INLINE in the SSR'd document (window.__NUXT__),
+            // so we only need smite.guru's HTML + Cloudflare's challenge — block all third-party hosts (ads/analytics/trackers)
+            // and all images/media/fonts/css. Pages then load in a fraction of the time and we stop pulling their ad partners.
+            try
+            {
+                _wv.CoreWebView2.AddWebResourceRequestedFilter("*", Microsoft.Web.WebView2.Core.CoreWebView2WebResourceContext.All);
+                _wv.CoreWebView2.WebResourceRequested += (s, e) =>
+                {
+                    try
+                    {
+                        string host = new Uri(e.Request.Uri).Host;
+                        bool allowHost = host.EndsWith("smite.guru", StringComparison.OrdinalIgnoreCase) || host.EndsWith("cloudflare.com", StringComparison.OrdinalIgnoreCase);
+                        var c = e.ResourceContext;
+                        bool heavy = c == Microsoft.Web.WebView2.Core.CoreWebView2WebResourceContext.Image || c == Microsoft.Web.WebView2.Core.CoreWebView2WebResourceContext.Media
+                                  || c == Microsoft.Web.WebView2.Core.CoreWebView2WebResourceContext.Font || c == Microsoft.Web.WebView2.Core.CoreWebView2WebResourceContext.Stylesheet;
+                        if (!allowHost || heavy) e.Response = _env.CreateWebResourceResponse(null, 204, "No Content", "");
+                    }
+                    catch { }
+                };
+            }
+            catch { }
             _ready = true;
         }
 
@@ -1802,62 +1880,344 @@ namespace SmiteGodLab
         static string CacheFilePath(long id) => Path.Combine(Theme.DataDir, "sguru_" + id + ".json");
         public static bool HasCache(long id) => File.Exists(CacheFilePath(id));
 
-        // Navigate to a match page and poll for the SSR'd matches data (rides out the one-time CF challenge).
-        async Task<Wrapper> FetchPage(long id, int page, CancellationToken ct)
+        // Navigate the WebView straight to the JSON API URL (page 1). This (a) clears api.smite.guru's OWN Cloudflare challenge
+        // — its cf_clearance is separate from smite.guru's, and WebView2 solves it like any browser — and (b) gives page 1 +
+        // cursor.max from the document body. After this returns, fetch()es to api.smite.guru are SAME-ORIGIN + cleared, so the
+        // parallel batches just work. Polls until the body is JSON (i.e., past the CF interstitial).
+        async Task<Wrapper> NavigateApi(long id, CancellationToken ct)
         {
             await EnsureReady();
-            _wv.CoreWebView2.Navigate("https://smite.guru/profile/" + id + "/matches?page=" + page);
-            var deadline = DateTime.UtcNow.AddSeconds(45);
-            // only accept data once __NUXT__ reports the requested page (guards against reading a stale previous render)
-            string script = "(function(){try{var m=window.__NUXT__&&window.__NUXT__.data&&window.__NUXT__.data[0]&&window.__NUXT__.data[0].matches;if(!m||!m.cursor||m.cursor.current!==" + page + ")return null;return JSON.stringify(m);}catch(e){return null;}})()";
+            _wv.CoreWebView2.Navigate("https://api.smite.guru/v3/profiles/" + id + "/matches?page=1");
+            var deadline = DateTime.UtcNow.AddSeconds(30);   // generous: one-time CF challenge for the api subdomain
+            string script = "(function(){try{var t=document.body?document.body.innerText:'';if(!t||t.charAt(0)!=='{')return null;var j=JSON.parse(t);if(j&&j.matches&&j.matches.cursor)return JSON.stringify(j.matches);return null;}catch(e){return null;}})()";
             while (DateTime.UtcNow < deadline)
             {
                 ct.ThrowIfCancellationRequested();
-                await Task.Delay(700, ct);
+                await Task.Delay(300, ct);
                 var r = await Eval(script, 5000);
                 if (!string.IsNullOrEmpty(r) && r != "null")
                 {
-                    // r is a JSON string literal (ExecuteScriptAsync re-encodes our JSON.stringify result) → unwrap once.
                     try { var inner = JsonSerializer.Deserialize<string>(r); return JsonSerializer.Deserialize<Wrapper>(inner, JOpt); } catch { }
                 }
-                else { var t = await Eval("document.title", 2500); if (!string.IsNullOrEmpty(t)) _lastTitle = t.Trim('"'); }
             }
             return null;
         }
 
-        // Full history for a player id, disk-cached + incrementally refreshed. progress(page, max). Returns newest-first.
-        public async Task<List<Match>> GetHistory(long id, int maxPages, Action<int, int> progress, CancellationToken ct)
+        // Fetch a BATCH of pages CONCURRENTLY via smite.guru's own JSON API (api.smite.guru/v3/profiles/<id>/matches?page=N
+        // — the endpoint their SPA uses). fetch()+r.json() needs no eval (CSP allows connect to api.smite.guru since the site
+        // itself calls it), so it runs in WebView2 and parallelizes. Returns (cursorMax, pages-that-returned, matches).
+        async Task<(int max, List<int> got, List<Match> matches)> FetchJsonBatch(long id, IReadOnlyList<int> pages, int season, CancellationToken ct)
+        {
+            string list = string.Join(",", pages);
+            string seasonQ = season > 0 ? "season=" + season + "&" : "";   // season=N&page=M paginates WITHIN a season → reaches past the global ~179-page offset cap
+            // FIRE the async fetch and stash the result in a global — ExecuteScriptAsync does NOT await a returned Promise
+            // (it serializes the unresolved promise → empty), so we kick it off (returns "true") then POLL the global.
+            string fire =
+                "window.__sgB=null;(async()=>{const ps=[" + list + "];let mx=0;const got=[];const out=[];" +
+                "await Promise.all(ps.map(async pg=>{try{" +
+                "const r=await fetch('https://api.smite.guru/v3/profiles/" + id + "/matches?" + seasonQ + "page='+pg,{credentials:'include'});" +
+                "if(!r.ok)return;const j=await r.json();const m=j&&j.matches;if(!m)return;" +
+                "if(m.cursor&&m.cursor.max>mx)mx=m.cursor.max;" +
+                // count a page as 'got' only if it returned games OR is a legit empty tail (pg>=cursor.max); a transient empty-200
+                // on an interior page is left ungot so it gets retried and never permanently marks a season complete.
+                "if(Array.isArray(m.data)){if(m.data.length>0||(m.cursor&&pg>=m.cursor.max))got.push(pg);out.push.apply(out,m.data);}" +
+                "}catch(e){}}));window.__sgB=JSON.stringify({max:mx,got:got,data:out});})();true";
+            await Eval(fire, 5000);
+            var deadline = DateTime.UtcNow.AddSeconds(25);
+            while (DateTime.UtcNow < deadline)
+            {
+                ct.ThrowIfCancellationRequested();
+                await Task.Delay(250, ct);
+                var r = await Eval("window.__sgB", 5000);
+                if (string.IsNullOrEmpty(r) || r == "null") continue;
+                try
+                {
+                    var inner = JsonSerializer.Deserialize<string>(r);
+                    using var doc = JsonDocument.Parse(inner);
+                    int mx = doc.RootElement.GetProperty("max").GetInt32();
+                    var got = doc.RootElement.GetProperty("got").EnumerateArray().Select(e => e.GetInt32()).ToList();
+                    var matches = JsonSerializer.Deserialize<List<Match>>(doc.RootElement.GetProperty("data").GetRawText(), JOpt) ?? new();
+                    return (mx, got, matches);
+                }
+                catch { return (0, new(), new()); }
+            }
+            return (0, new(), new());
+        }
+
+        // FULL-history scan via the JSON API in PARALLEL batches — typically the whole history in a few seconds. Navigate once
+        // (page 1) to establish Cloudflare clearance + a smite.guru page context, read cursor.max, then concurrently pull every
+        // remaining page from the JSON API (retrying any that didn't come back, so it's complete — every game, first→last).
+        // Disk-cached + deduped; a repeat compare with no new games returns instantly. Returns History (matches + Deepest/Max).
+        // DIAGNOSTIC ONLY: navigate (clear CF) then fetch specific pages, reporting per-page match counts + date range, to
+        // tell a hard offset cap (pages return empty) from a transient rate-limit. Used by the SMITE_TEST_DEEPPAGE hook.
+        public async Task<string> ProbePages(long id, IReadOnlyList<int> pages, CancellationToken ct)
         {
             await _gate.WaitAsync(ct);
             try
             {
-                var cache = LoadCache(id);
-                var have = new HashSet<string>(cache.Matches.Where(m => m.MatchId != null).Select(m => m.MatchId));
-                var merged = new List<Match>(cache.Matches);
-                bool fresh = cache.Matches.Count == 0;
-                int max = cache.CursorMax > 0 ? cache.CursorMax : maxPages;
-                for (int page = 1; page <= Math.Min(max, maxPages); page++)
+                var w1 = await NavigateApi(id, ct);
+                if (w1 == null) return "NavigateApi failed (CF?)";
+                int max = w1.Cursor?.Max ?? 0;
+                var sb = new System.Text.StringBuilder($"cursorMax={max}; page1={w1.Data.Count} games\n");
+                foreach (var pg in pages)
                 {
-                    progress?.Invoke(page, Math.Min(max, maxPages));
-                    var w = await FetchPage(id, page, ct);
-                    if (w == null) break;
-                    if (w.Cursor != null && w.Cursor.Max > 0) max = w.Cursor.Max;
-                    int newCount = 0;
-                    foreach (var m in w.Data) if (m?.MatchId != null && have.Add(m.MatchId)) { merged.Add(m); newCount++; }
-                    if (page >= Math.Min(max, maxPages)) break;
-                    if (!fresh && newCount == 0) break;   // refresh: reached already-cached history → stop
-                    await Task.Delay(1200, ct);           // respectful pacing
+                    var (mx, got, ms) = await FetchJsonBatch(id, new[] { pg }, 0, ct);
+                    string range = ms.Count > 0 ? (ms[ms.Count - 1].Time + " .. " + ms[0].Time) : "-";
+                    sb.Append($"page {pg}: got={string.Join(",", got)} count={ms.Count} range={range}\n");
+                    await Task.Delay(400, ct);
                 }
-                merged.Sort((a, b) => string.CompareOrdinal(b.Time ?? "", a.Time ?? ""));
-                SaveCache(id, new CacheFile { CursorMax = max, FetchedAt = DateTime.UtcNow.ToString("o"), Matches = merged });
-                return merged;
+                return sb.ToString();
             }
             finally { _gate.Release(); }
         }
 
-        CacheFile LoadCache(long id) { try { var f = CacheFilePath(id); if (File.Exists(f)) return JsonSerializer.Deserialize<CacheFile>(File.ReadAllText(f), JOpt) ?? new(); } catch { } return new(); }
+        // DIAGNOSTIC ONLY: clear CF for api.smite.guru (via id's page 1) then fetch an ARBITRARY api url, to test whether some
+        // alternate pagination param (cursor/before/offset) reaches past the ~179-page offset cap. Returns a short summary.
+        public async Task<string> RawFetch(long clearId, string url, CancellationToken ct)
+        {
+            await _gate.WaitAsync(ct);
+            try
+            {
+                var w1 = await NavigateApi(clearId, ct);
+                if (w1 == null) return "NavigateApi failed (CF?)";
+                string u = url.Replace("\\", "");
+                string fire =
+                    "window.__rf=null;(async()=>{try{const r=await fetch(" + JsonSerializer.Serialize(u) + ",{credentials:'include'});" +
+                    "const t=await r.text();let n=-1,first='',last='',cmax=-1;try{const j=JSON.parse(t);const m=j&&j.matches?j.matches:j;" +
+                    "if(m&&Array.isArray(m.data)){n=m.data.length;if(n>0){first=m.data[0].time;last=m.data[n-1].time;}}" +
+                    "if(m&&m.cursor)cmax=m.cursor.max;}catch(e){}" +
+                    "window.__rf=JSON.stringify({status:r.status,ok:r.ok,n:n,first:first,last:last,cmax:cmax,head:t.slice(0,200)});" +
+                    "}catch(e){window.__rf=JSON.stringify({err:String(e)});}})();true";
+                await Eval(fire, 5000);
+                var deadline = DateTime.UtcNow.AddSeconds(20);
+                while (DateTime.UtcNow < deadline)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await Task.Delay(250, ct);
+                    var r = await Eval("window.__rf", 5000);
+                    if (string.IsNullOrEmpty(r) || r == "null") continue;
+                    try { return JsonSerializer.Deserialize<string>(r); } catch { return r; }
+                }
+                return "(timeout)";
+            }
+            finally { _gate.Release(); }
+        }
+
+        // DIAGNOSTIC ONLY: navigate (clear CF) then fetch specific pages, reporting per-page match counts + date range, to
+        // tell a hard offset cap (pages return empty) from a transient rate-limit. Used by the SMITE_TEST_DEEPPAGE hook.
+        // Probe which SMITE seasons have data for this player (season=N&page=1 → cursor.max>0), one concurrent burst with a
+        // per-fetch retry. Seasons are global, so 1..MAX covers everyone; empty seasons return nothing and are skipped.
+        async Task<Dictionary<int, int>> DiscoverSeasons(long id, CancellationToken ct)
+        {
+            const int MAXS = 15;
+            string fire =
+                "window.__sgS=null;(async()=>{const out={};await Promise.all(Array.from({length:" + (MAXS + 1) + "},(_,i)=>i).map(async s=>{" +   // seasons 0..MAXS (0 = a small misc bucket; smite.guru data starts ~2020 for everyone)
+                "for(let a=0;a<2;a++){try{const r=await fetch('https://api.smite.guru/v3/profiles/" + id + "/matches?season='+s+'&page=1',{credentials:'include'});" +
+                "if(!r.ok){await new Promise(z=>setTimeout(z,250));continue;}const j=await r.json();const m=j&&j.matches;" +
+                "if(m&&m.cursor&&m.cursor.max>0)out[s]=m.cursor.max;break;}catch(e){await new Promise(z=>setTimeout(z,250));}}}));" +
+                "window.__sgS=JSON.stringify(out);})();true";
+            await Eval(fire, 5000);
+            var deadline = DateTime.UtcNow.AddSeconds(30);
+            while (DateTime.UtcNow < deadline)
+            {
+                ct.ThrowIfCancellationRequested();
+                await Task.Delay(300, ct);
+                var r = await Eval("window.__sgS", 5000);
+                if (string.IsNullOrEmpty(r) || r == "null") continue;
+                try
+                {
+                    var inner = JsonSerializer.Deserialize<string>(r);
+                    using var doc = JsonDocument.Parse(inner);
+                    var d = new Dictionary<int, int>();
+                    foreach (var p in doc.RootElement.EnumerateObject()) if (int.TryParse(p.Name, out var s)) d[s] = p.Value.GetInt32();
+                    return d;
+                }
+                catch { return new(); }
+            }
+            return new();
+        }
+
+        // FULL-history scan, SEASON BY SEASON. The global ?page=N endpoint 500-errors past ~179 pages (~4,475 games), so a very
+        // active player's older matches are unreachable that way. But ?season=N&page=M paginates within each season (each tiny:
+        // ≤~40 pages), so iterating seasons reaches a player's COMPLETE history back to 2020 — only a sliver of a hyper-active
+        // CURRENT season (its pages past the 179 cap) stays out of reach. Disk-cached per season (old seasons are immutable →
+        // fetched once; the current season is re-checked for new games). Dedup by match_id. Returns History (Complete=nothing capped).
+        public async Task<History> GetHistory(long id, int maxPages, Action<int, int> progress, CancellationToken ct)
+        {
+            await _gate.WaitAsync(ct);
+            try
+            {
+                const int CAP = 179;   // per-season offset cap (page 180+ → HTTP 500)
+                const int CONC = 8;
+                var cache = LoadCache(id);
+                cache.SeasonDone ??= new();
+                var have = new HashSet<string>(cache.Matches.Where(m => m.MatchId != null).Select(m => m.MatchId));
+                var merged = new List<Match>(cache.Matches);
+                bool incremental = cache.Matches.Count > 0;
+                // navigate once → clears api.smite.guru CF + leaves the WebView same-origin so the season fetch()es just work
+                progress?.Invoke(1, 1);
+                var w1 = await NavigateApi(id, ct);
+                if (w1 == null) { merged.Sort((a, b) => string.CompareOrdinal(b.Time ?? "", a.Time ?? "")); return new History { Matches = merged, Deepest = cache.DeepestPage, Max = cache.CursorMax, Complete = false }; }
+                int globalMax = (w1.Cursor != null && w1.Cursor.Max > 0) ? w1.Cursor.Max : cache.CursorMax;
+                foreach (var m in w1.Data) if (m?.MatchId != null && have.Add(m.MatchId)) merged.Add(m);   // newest games (current season top)
+                var seasons = await DiscoverSeasons(id, ct);
+                if (seasons.Count == 0)   // season param unavailable for this profile → fall back to global pagination (capped)
+                {
+                    int limit = Math.Min(globalMax > 0 ? globalMax : 1, maxPages);
+                    var gotG = new HashSet<int> { 1 };
+                    for (int start = 2; start <= limit; start += CONC)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        var batch = Enumerable.Range(start, Math.Min(CONC, limit - start + 1)).ToList();
+                        progress?.Invoke(batch[batch.Count - 1], limit);
+                        var (mx, gp, ms) = await FetchJsonBatch(id, batch, 0, ct);
+                        if (mx > 0) { globalMax = mx; limit = Math.Min(mx, maxPages); }
+                        foreach (var p in gp) gotG.Add(p);
+                        foreach (var m in ms) if (m?.MatchId != null && have.Add(m.MatchId)) merged.Add(m);
+                        await Task.Delay(120, ct);
+                    }
+                    int deepG = 1; while (gotG.Contains(deepG + 1)) deepG++;
+                    merged.Sort((a, b) => string.CompareOrdinal(b.Time ?? "", a.Time ?? ""));
+                    SaveCache(id, new CacheFile { CursorMax = globalMax, DeepestPage = deepG, FetchedAt = DateTime.UtcNow.ToString("o"), Matches = merged, SeasonDone = cache.SeasonDone });
+                    return new History { Matches = merged, Deepest = deepG, Max = globalMax, Complete = globalMax > 0 && deepG >= globalMax };
+                }
+                int curSeason = seasons.Keys.Max();
+                int totalPages = seasons.Sum(kv => Math.Min(kv.Value, CAP));   // reachable pages across all seasons
+                int donePages = 0, fetchedPages = 0, cappedSeasons = 0;
+                bool anyGap = false;   // a fully-scanned season left pages unfetched after retries → NOT "full history"
+                foreach (var s in seasons.Keys.OrderByDescending(s => s))   // newest season first → fresh results appear soonest
+                {
+                    int cm = seasons[s];
+                    int sLimit = Math.Min(cm, CAP);
+                    if (cm > CAP) cappedSeasons++;
+                    bool isCurrent = (s == curSeason);
+                    // skip OLD seasons already fully fetched (they never change); the current season is always re-checked for new games
+                    if (!isCurrent && cache.SeasonDone.TryGetValue(s, out var doneCm) && doneCm >= cm) { donePages += sLimit; progress?.Invoke(Math.Min(donePages, totalPages), totalPages); continue; }
+                    var gotS = new HashSet<int>();
+                    bool brokeEarly = false; int reached = sLimit;   // reached = deepest page actually ATTEMPTED (the early-out stops short)
+                    for (int start = 1; start <= sLimit; start += CONC)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        var batch = Enumerable.Range(start, Math.Min(CONC, sLimit - start + 1)).ToList();
+                        donePages += batch.Count; fetchedPages += batch.Count;
+                        progress?.Invoke(Math.Min(donePages, totalPages), totalPages);
+                        var (mx, gp, ms) = await FetchJsonBatch(id, batch, s, ct);
+                        reached = batch[batch.Count - 1];
+                        foreach (var p in gp) gotS.Add(p);
+                        int before = merged.Count;
+                        foreach (var m in ms) if (m?.MatchId != null && have.Add(m.MatchId)) merged.Add(m);
+                        // current-season incremental: once a batch adds nothing new, we've reached already-cached games → stop deepening
+                        if (incremental && isCurrent && start > 1 && merged.Count == before && gp.Count == batch.Count) { brokeEarly = true; break; }
+                        await Task.Delay(120, ct);
+                    }
+                    // retry ONLY pages we actually attempted (NOT the ones the incremental early-out intentionally skipped — else it refetches the whole season)
+                    var missing = Enumerable.Range(1, reached).Where(p => !gotS.Contains(p)).ToList();
+                    for (int attempt = 0; attempt < 2 && missing.Count > 0; attempt++)
+                    {
+                        for (int k = 0; k < missing.Count; k += 6)
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            var batch = missing.Skip(k).Take(6).ToList();
+                            progress?.Invoke(-1, totalPages);
+                            var (mx, gp, ms) = await FetchJsonBatch(id, batch, s, ct);
+                            foreach (var p in gp) gotS.Add(p);
+                            foreach (var m in ms) if (m?.MatchId != null && have.Add(m.MatchId)) merged.Add(m);
+                            await Task.Delay(150, ct);
+                        }
+                        missing = Enumerable.Range(1, reached).Where(p => !gotS.Contains(p)).ToList();
+                    }
+                    int deepS = 0; while (gotS.Contains(deepS + 1)) deepS++;
+                    if (deepS >= sLimit && cm <= CAP) cache.SeasonDone[s] = cm;   // fully fetched, non-capped → immutable, mark done
+                    else if (!brokeEarly && deepS < sLimit) anyGap = true;        // pages genuinely failed after retries (not an early-out) → don't claim complete
+                }
+                merged.Sort((a, b) => string.CompareOrdinal(b.Time ?? "", a.Time ?? ""));
+                bool complete = cappedSeasons == 0 && !anyGap;   // full history ONLY if nothing capped AND no season left pages unfetched
+                SaveCache(id, new CacheFile { CursorMax = globalMax, DeepestPage = totalPages, FetchedAt = DateTime.UtcNow.ToString("o"), Matches = merged, SeasonDone = cache.SeasonDone });
+                return new History { Matches = merged, Deepest = totalPages, Max = totalPages, Complete = complete };
+            }
+            finally { _gate.Release(); }
+        }
+
+        Dictionary<int, string> _champs, _items;
+        // same-origin fetch of one api.smite.guru URL → response text (assumes NavigateApi/NavigateMatch already cleared CF).
+        async Task<string> FetchOne(string url, CancellationToken ct)
+        {
+            string fire = "window.__sg1=null;(async()=>{try{const r=await fetch(" + JsonSerializer.Serialize(url) + ",{credentials:'include'});window.__sg1=await r.text();}catch(e){window.__sg1='__ERR__';}})();true";
+            await Eval(fire, 5000);
+            var deadline = DateTime.UtcNow.AddSeconds(15);
+            while (DateTime.UtcNow < deadline)
+            {
+                ct.ThrowIfCancellationRequested();
+                await Task.Delay(200, ct);
+                var r = await Eval("window.__sg1", 5000);
+                if (string.IsNullOrEmpty(r) || r == "null") continue;
+                try { var s = JsonSerializer.Deserialize<string>(r); return s == "__ERR__" ? null : s; } catch { return null; }
+            }
+            return null;
+        }
+
+        // id→name maps for gods (champions) and items, fetched once from smite.guru's static endpoints and cached to disk.
+        async Task<Dictionary<int, string>> LoadIdNameMap(string which, string url, CancellationToken ct)
+        {
+            string f = Path.Combine(Theme.DataDir, "sguru_" + which + ".json");
+            try { if (File.Exists(f)) { var d = JsonSerializer.Deserialize<Dictionary<int, string>>(File.ReadAllText(f)); if (d != null && d.Count > 0) return d; } } catch { }
+            var txt = await FetchOne(url, ct);
+            if (string.IsNullOrEmpty(txt)) return null;   // fetch failed/timed out → return null so the caller retries (don't cache an empty map for the session)
+            var map = new Dictionary<int, string>();
+            try
+            {
+                using var doc = JsonDocument.Parse(txt);
+                foreach (var p in doc.RootElement.EnumerateObject())
+                    if (p.Value.ValueKind == JsonValueKind.Object && p.Value.TryGetProperty("id", out var idE) && idE.ValueKind == JsonValueKind.Number && p.Value.TryGetProperty("name", out var nmE))
+                        map[idE.GetInt32()] = nmE.GetString();
+            }
+            catch { return null; }
+            if (map.Count == 0) return null;
+            try { File.WriteAllText(f, JsonSerializer.Serialize(map)); } catch { }
+            return map;
+        }
+
+        // Full scoreboard for ONE match (any age) from api.smite.guru/v3/matches/pc/<id>, plus the god/item name maps to render it.
+        public async Task<(MDetail match, Dictionary<int, string> gods, Dictionary<int, string> items)> GetMatchFull(string matchId, CancellationToken ct)
+        {
+            await _gate.WaitAsync(ct);
+            try
+            {
+                await EnsureReady();
+                _wv.CoreWebView2.Navigate("https://api.smite.guru/v3/matches/pc/" + matchId);   // clears CF + body = the match JSON
+                MDetail md = null;
+                var deadline = DateTime.UtcNow.AddSeconds(30);
+                string script = "(function(){try{var t=document.body?document.body.innerText:'';if(!t||t.charAt(0)!=='{')return null;var j=JSON.parse(t);if(j&&j.players&&j.match_id)return t;return null;}catch(e){return null;}})()";
+                while (DateTime.UtcNow < deadline)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await Task.Delay(300, ct);
+                    var r = await Eval(script, 5000);
+                    if (string.IsNullOrEmpty(r) || r == "null") continue;
+                    try { var inner = JsonSerializer.Deserialize<string>(r); md = JsonSerializer.Deserialize<MDetail>(inner, JOpt); if (md != null) break; } catch { }
+                }
+                if (md == null) return (null, null, null);
+                _champs ??= await LoadIdNameMap("champions", "https://api.smite.guru/v3/champions", ct);
+                _items ??= await LoadIdNameMap("items", "https://api.smite.guru/v3/items", ct);
+                return (md, _champs, _items);
+            }
+            finally { _gate.Release(); }
+        }
+
+        CacheFile LoadCache(long id) { try { var f = CacheFilePath(id); if (File.Exists(f)) { var c = JsonSerializer.Deserialize<CacheFile>(File.ReadAllText(f), JOpt) ?? new(); c.Matches = (c.Matches ?? new()).Where(m => m != null).ToList(); return c; } } catch { } return new(); }
         void SaveCache(long id, CacheFile c) { try { File.WriteAllText(CacheFilePath(id), JsonSerializer.Serialize(c)); } catch { } }
         public void Wipe(long id) { try { var f = CacheFilePath(id); if (File.Exists(f)) File.Delete(f); } catch { } }
+        // gated wipe — serialized through _gate so a forced refresh can't race an in-flight GetHistory's SaveCache
+        public async Task WipeAsync(long id, CancellationToken ct = default) { await _gate.WaitAsync(ct); try { var f = CacheFilePath(id); if (File.Exists(f)) File.Delete(f); } catch { } finally { _gate.Release(); } }
+        // Tear down the WebView2 + host form on app exit (must run on the UI thread, which FormClosed does), so the
+        // msedgewebview2.exe child process and the webview2 profile-dir lock are released instead of lingering.
+        public void Shutdown()
+        {
+            try { _wv?.Dispose(); } catch { }
+            try { _host?.Dispose(); } catch { }
+            try { _gate?.Dispose(); } catch { }
+            _wv = null; _host = null; _env = null; _ready = false;
+        }
     }
 
     class MainForm : Form
@@ -1888,6 +2248,7 @@ namespace SmiteGodLab
         string folderPath;
         List<GodFile> gods = new List<GodFile>();
         GodFile current;
+        bool suppressGodSel;   // re-entrancy guard while we programmatically revert/repopulate godBox selection
         List<Param> prms = new List<Param>();
         Dictionary<string, string> defaults = new Dictionary<string, string>();   // "SectionKey" -> pristine value
         readonly Dictionary<string, Image> iconCache = new Dictionary<string, Image>(StringComparer.OrdinalIgnoreCase);
@@ -2057,7 +2418,7 @@ namespace SmiteGodLab
 
             // ---- bottom bar (Inspector mode only) ----
             bottomBar = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Panel };
-            statusLbl = new Label { Dock = DockStyle.Fill, ForeColor = Theme.Dim, TextAlign = ContentAlignment.MiddleRight, Font = Theme.F(9f), Padding = new Padding(0, 0, S(14), 0), Text = "Pick your SMITE Config folder to start." };
+            statusLbl = new Label { Dock = DockStyle.Fill, UseMnemonic = false, ForeColor = Theme.Dim, TextAlign = ContentAlignment.MiddleRight, Font = Theme.F(9f), Padding = new Padding(0, 0, S(14), 0), Text = "Pick your SMITE Config folder to start." };
             var btnFlow = new FlowLayoutPanel { Dock = DockStyle.Left, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, AutoSize = true, BackColor = Theme.Panel, Padding = new Padding(S(10), S(9), 0, S(8)) };
             applyBtn   = MkBtn("Apply changes", 132, true);  applyBtn.Enabled = false;
             reloadBtn  = MkBtn("Reload file", 100, false);   reloadBtn.Enabled = false;
@@ -2110,7 +2471,7 @@ namespace SmiteGodLab
 
             // events
             openBtn.Click   += (s, e) => OpenFolder();
-            rescanBtn.Click += (s, e) => { if (folderPath != null) Scan(); };
+            rescanBtn.Click += (s, e) => { if (folderPath != null && ConfirmDiscardEdits()) Scan(); };
             inspectBtn.Click += (s, e) => ShowSdkInspector();
             applyBtn.Click  += (s, e) => Apply();
             reloadBtn.Click += (s, e) => ReloadFile();
@@ -2119,7 +2480,16 @@ namespace SmiteGodLab
             searchBox.TextChanged      += (s, e) => RenderList();
             showAllChk.CheckedChanged  += (s, e) => RenderList();
             showHelpChk.CheckedChanged += (s, e) => { if (current != null) RenderRows(); };
-            godBox.SelectedIndexChanged += (s, e) => { if (godBox.SelectedItem is GodFile g) LoadGod(g); };
+            godBox.SelectedIndexChanged += (s, e) =>
+            {
+                if (suppressGodSel) return;
+                if (godBox.SelectedItem is GodFile g)
+                {
+                    if (g == current) return;   // re-select of the same god (e.g. after filtering) → nothing to discard
+                    if (!ConfirmDiscardEdits()) { suppressGodSel = true; try { godBox.SelectedItem = current; } catch { } finally { suppressGodSel = false; } return; }
+                    LoadGod(g);
+                }
+            };
 
             SelectNav(settings.StartupTab == 1 ? 1 : 0);   // honor the "open on startup" preference (settings already loaded)
         }
@@ -2220,6 +2590,64 @@ namespace SmiteGodLab
             var tsec = Environment.GetEnvironmentVariable("SMITE_TEST_SECONDARY");
             if (!string.IsNullOrEmpty(tsec) && int.TryParse(tsec, out var tsi))
                 BeginInvoke(new Action(() => { try { SelectNav(1); _trkSubTab?.Invoke(0); var tt = new System.Windows.Forms.Timer { Interval = 6000 }; tt.Tick += (s, e) => { tt.Stop(); tt.Dispose(); try { _trkSubTab2?.Invoke(tsi); var vs = Environment.GetEnvironmentVariable("SMITE_TEST_ENCVS"); if (tsi == 5 && !string.IsNullOrEmpty(vs)) _trkEncCompare?.Invoke(vs); } catch { } }; tt.Start(); } catch { } }));
+            // SMITE_TEST_SGMATCH="<matchId>": verify the SmiteGuru scoreboard fetch end-to-end (parse + god/item name maps).
+            var tsm = Environment.GetEnvironmentVariable("SMITE_TEST_SGMATCH");
+            if (!string.IsNullOrEmpty(tsm))
+                BeginInvoke(new Action(async () =>
+                {
+                    string outp = Path.Combine(Theme.DataDir, "sgmatch_test.txt");
+                    try
+                    {
+                        File.WriteAllText(outp, "started");
+                        _sguru ??= new SmiteGuru(this);
+                        var (md, gods, items) = await _sguru.GetMatchFull(tsm, System.Threading.CancellationToken.None);
+                        if (md == null) { File.WriteAllText(outp, "match null (not loaded)"); return; }
+                        var sb = new System.Text.StringBuilder();
+                        sb.AppendLine($"match {md.MatchId} q{md.QueueId} win-team {md.WinningTeam} dur {md.Duration} {md.Time}  gods:{gods?.Count} items:{items?.Count}");
+                        foreach (var p in md.Players.OrderBy(p => p.Team).ThenByDescending(p => p.Kills))
+                        {
+                            string gn = gods != null && gods.TryGetValue(p.Champion, out var n) ? n : ("god" + p.Champion);
+                            string itms = p.Build != null ? string.Join("/", p.Build.OrderBy(kv => kv.Key).Select(kv => items != null && items.TryGetValue(kv.Value, out var inm) ? inm : ("?" + kv.Value))) : "";
+                            sb.AppendLine($"T{p.Team} {(string.IsNullOrWhiteSpace(p.Name) ? "<hidden>" : p.Name),-18} {gn,-14} {p.Kills}/{p.Deaths}/{p.Assists} dmg {p.Damage} gold {p.Gold} | {itms}");
+                        }
+                        File.WriteAllText(outp, sb.ToString());
+                    }
+                    catch (Exception ex) { try { File.WriteAllText(outp, "ERR " + ex.GetType().Name + ": " + ex.Message); } catch { } }
+                }));
+            // SMITE_TEST_RAWFETCH="clearId|url": test alternate pagination params past the offset cap. Diagnostic only.
+            var trf = Environment.GetEnvironmentVariable("SMITE_TEST_RAWFETCH");
+            if (!string.IsNullOrEmpty(trf))
+                BeginInvoke(new Action(async () =>
+                {
+                    string outp = Path.Combine(Theme.DataDir, "rawfetch_test.txt");
+                    try
+                    {
+                        File.WriteAllText(outp, "started");
+                        var pr = trf.Split(new[] { '|' }, 2); long cid = long.Parse(pr[0]);
+                        var urls = pr[1].Split('\n').Where(u => u.Trim().Length > 0).ToList();
+                        _sguru ??= new SmiteGuru(this);
+                        var sb = new System.Text.StringBuilder();
+                        foreach (var u in urls) { sb.AppendLine("URL: " + u.Trim()); sb.AppendLine(await _sguru.RawFetch(cid, u.Trim(), System.Threading.CancellationToken.None)); sb.AppendLine(); File.WriteAllText(outp, sb.ToString()); }
+                    }
+                    catch (Exception ex) { try { File.WriteAllText(outp, "ERR " + ex.GetType().Name + ": " + ex.Message); } catch { } }
+                }));
+            // SMITE_TEST_DEEPPAGE="id:p1,p2,p3": probe whether deep pages are reachable (hard cap vs rate-limit). Diagnostic only.
+            var tdp = Environment.GetEnvironmentVariable("SMITE_TEST_DEEPPAGE");
+            if (!string.IsNullOrEmpty(tdp))
+                BeginInvoke(new Action(async () =>
+                {
+                    string outp = Path.Combine(Theme.DataDir, "deeppage_test.txt");
+                    try
+                    {
+                        File.WriteAllText(outp, "started");
+                        var pr = tdp.Split(':'); long id = long.Parse(pr[0]);
+                        var pages = pr[1].Split(',').Select(int.Parse).ToList();
+                        _sguru ??= new SmiteGuru(this);
+                        var res = await _sguru.ProbePages(id, pages, System.Threading.CancellationToken.None);
+                        File.WriteAllText(outp, res);
+                    }
+                    catch (Exception ex) { try { File.WriteAllText(outp, "ERR " + ex.GetType().Name + ": " + ex.Message); } catch { } }
+                }));
             // SMITE_TEST_SGURU="aId:bId": prove the SmiteGuru WebView2 fetch end-to-end — pull a few pages of player aId and
             // count encounters with bId, writing the result to sguru_test.txt. Verification only.
             var tsg = Environment.GetEnvironmentVariable("SMITE_TEST_SGURU");
@@ -2231,13 +2659,44 @@ namespace SmiteGodLab
                     {
                         File.WriteAllText(sgOut, "step: hook started");
                         var pr = tsg.Split(':'); long aId = long.Parse(pr[0]); long bId = pr.Length > 1 ? long.Parse(pr[1]) : 0;
+                        string bNameSearch = pr.Length > 2 ? pr[2] : null;
                         _sguru ??= new SmiteGuru(this);
                         var sw = System.Diagnostics.Stopwatch.StartNew();
-                        var matches = await _sguru.GetHistory(aId, 4, (p, m) => { try { File.WriteAllText(sgOut, $"step: fetching page {p}/{m} ({sw.Elapsed.TotalSeconds:0}s)"); } catch { } }, System.Threading.CancellationToken.None);
+                        var histA = await _sguru.GetHistory(aId, 400, (p, m) => { try { File.WriteAllText(sgOut, $"step: A page {p}/{m} ({sw.Elapsed.TotalSeconds:0}s)"); } catch { } }, System.Threading.CancellationToken.None);
+                        var matches = histA.Matches;
                         int enc = 0, allied = 0, against = 0; string firstD = null, lastD = null;
                         foreach (var mt in matches) { var a = mt.Players.FirstOrDefault(p => p.Id == aId); var b = mt.Players.FirstOrDefault(p => p.Id == bId); if (a != null && b != null) { enc++; if (a.Team == b.Team) allied++; else against++; lastD ??= mt.Time; firstD = mt.Time; } }
+                        // scan span + per-year histogram (matches are newest-first → [0]=newest, last=oldest)
+                        string newest = matches.Count > 0 ? matches[0].Time : "(none)";
+                        string oldest = matches.Count > 0 ? matches[matches.Count - 1].Time : "(none)";
+                        var byYear = matches.Where(mm => !string.IsNullOrEmpty(mm.Time) && mm.Time.Length >= 4).GroupBy(mm => mm.Time.Substring(0, 4)).OrderBy(gr => gr.Key).Select(gr => gr.Key + ":" + gr.Count());
+                        // hidden-slot analysis (privacy-flagged players appear as id==0/empty name) — tests "was B private back then?"
+                        int hidAll = matches.Count(mm => mm.Players != null && mm.Players.Any(p => p.Id == 0));
+                        var m2024 = matches.Where(mm => (mm.Time ?? "").StartsWith("2024")).ToList();
+                        int hid2024 = m2024.Count(mm => mm.Players != null && mm.Players.Any(p => p.Id == 0));
+                        string r2024 = m2024.Count > 0 ? (m2024[m2024.Count - 1].Time + " .. " + m2024[0].Time) : "(none)";
+                        // NAME-based search across A's whole history (catches an id mismatch the id-match would miss)
+                        string nameHits = "(no name given)";
+                        if (!string.IsNullOrEmpty(bNameSearch))
+                        {
+                            var rows = matches.Where(mm => mm.Players != null && mm.Players.Any(p => !string.IsNullOrWhiteSpace(p.Name) && string.Equals(p.Name.Trim(), bNameSearch, StringComparison.OrdinalIgnoreCase))).ToList();
+                            var idsUnder = rows.SelectMany(mm => mm.Players).Where(p => !string.IsNullOrWhiteSpace(p.Name) && string.Equals(p.Name.Trim(), bNameSearch, StringComparison.OrdinalIgnoreCase)).Select(p => p.Id).Distinct().ToList();
+                            nameHits = $"{rows.Count} games contain name '{bNameSearch}'; ids under that name: [{string.Join(",", idsUnder)}]; dates: {string.Join(", ", rows.Take(6).Select(mm => mm.Time))}";
+                        }
                         string sample = matches.Count > 0 ? string.Join(", ", matches[0].Players.Select(p => p.Id + "/" + p.Name + "/T" + p.Team)) : "(none)";
-                        File.WriteAllText(sgOut, $"matches fetched: {matches.Count}\nelapsed: {sw.Elapsed.TotalSeconds:0}s\nencounters {aId} vs {bId}: {enc}  (allied {allied}, against {against})\nfirst {firstD}  last {lastD}\nlast page title: {_sguru.LastDiag}\npage1 match0 roster: {sample}");
+                        // B's OWN full history → depth (how far back smite.guru has B) + every distinct name
+                        string bNames = "(bId=0, skipped)";
+                        if (bId > 0)
+                        {
+                            var bh = (await _sguru.GetHistory(bId, 400, (p, m) => { try { File.WriteAllText(sgOut, $"step: B page {p}/{m}"); } catch { } }, System.Threading.CancellationToken.None));
+                            var bm = bh.Matches;
+                            var distinct = bm.Where(mm => mm.Players != null).SelectMany(mm => mm.Players).Where(p => p.Id == bId && !string.IsNullOrWhiteSpace(p.Name)).Select(p => p.Name.Trim()).Where(n => n.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                            int aInB = bm.Count(mm => mm.Players != null && mm.Players.Any(p => p.Id == aId));
+                            string bOldest = bm.Count > 0 ? bm[bm.Count - 1].Time : "(none)";
+                            string bNewest = bm.Count > 0 ? bm[0].Time : "(none)";
+                            bNames = $"{bm.Count} games (cursorMax {bh.Max}, deepest {bh.Deepest}, complete {bh.Complete}), span {bOldest} -> {bNewest}; A({aId}) appears in {aInB} of B's games; names: " + (distinct.Count > 0 ? string.Join(", ", distinct) : "(none)");
+                        }
+                        File.WriteAllText(sgOut, $"A({aId}) matches: {matches.Count}  (cursorMax {histA.Max}, deepest {histA.Deepest}, complete {histA.Complete})\nelapsed: {sw.Elapsed.TotalSeconds:0}s\nA scan span: {oldest}  ->  {newest}\nA games per year: {string.Join("  ", byYear)}\nhidden-slot games: {hidAll} of {matches.Count} total; 2024: {hid2024} of {m2024.Count} 2024-games (2024 range {r2024})\nencounters {aId} vs {bId} (by id): {enc}  (allied {allied}, against {against})\nencounter dates: first {firstD}  last {lastD}\nname-search in A history: {nameHits}\nlast page title: {_sguru.LastDiag}\npage1 match0 roster: {sample}\nB own-history: {bNames}");
                     }
                     catch (Exception ex) { try { File.WriteAllText(sgOut, "ERR " + ex.GetType().Name + ": " + ex.Message); } catch { } }
                 }));
@@ -2285,6 +2744,65 @@ namespace SmiteGodLab
                 File.WriteAllText(Path.Combine(Theme.DataDir, "exclude_test.txt"),
                     "no-exclude:   '" + (a.name ?? "<none>") + "'  (expect ExclAlice)\nexclude-name: '" + (b.name ?? "<none>") + "'  (expect <none>)\nexclude-id:   '" + (c.name ?? "<none>") + "'  (expect <none>)\nlearned-recognized: '" + (d.name ?? "<none>") + "'  (expect Nonkas)\nheal-before:  '" + (hBefore?.Nick ?? "<none>") + "'  (expect <none>)\nheal-after:   '" + (hAfter?.Nick ?? "<none>") + "'  (expect HealMe)\nweak-lone:    '" + (f.name ?? "<none>") + "'  (expect <none>)\nlevel-band:   '" + (g.name ?? "<none>") + "'  (expect ExactHi)\nskin-boost:   '" + (h2.name ?? "<none>") + "' conf+" + (h2.conf - h2b.conf) + "  (expect SkinGuy, conf+ > 0)\nmmr-pick:     '" + (m1.name ?? "<none>") + "'  (expect MmrMatch)\nmmr-tie:      '" + (m2.name ?? "<none>") + "'  (expect <none>)\n");
             } catch (Exception ex) { try { File.WriteAllText(Path.Combine(Theme.DataDir, "exclude_test.txt"), "ERR " + ex.Message); } catch { } } }
+            // SMITE_TEST_MATCHER: characterization harness — seed a deterministic synthetic corpus, run a large battery of
+            // Resolve() queries, dump "(name|conf)" per query. Snapshot before/after a matcher change → the diff must be empty
+            // (golden master), which is the safe way to refactor/optimize the matcher without altering any reveal decision.
+            var tmh = Environment.GetEnvironmentVariable("SMITE_TEST_MATCHER");
+            if (testDir && !string.IsNullOrEmpty(tmh)) { try { File.WriteAllText(Path.Combine(Theme.DataDir, "matcher_harness.txt"), RunMatcherHarness()); } catch (Exception ex) { try { File.WriteAllText(Path.Combine(Theme.DataDir, "matcher_harness.txt"), "ERR " + ex.GetType().Name + ": " + ex.Message); } catch { } } }
+        }
+
+        // Deterministic matcher characterization harness (SMITE_TEST_MATCHER). No RNG/time-of-day dependence beyond Today (all
+        // entries share it), so two runs on the same day are byte-identical — diff a snapshot before vs after a matcher edit.
+        string RunMatcherHarness()
+        {
+            string[] G = { "Thor", "Zeus", "Loki", "Ymir", "Ra", "Anubis", "Kali", "Sol" };
+            const int N = 50;
+            int ClanOf(int i) => (i % 6 == 0) ? 0 : 1000 + (i % 5);
+            int LvlOf(int i) => 30 + (i * 7) % 121;
+            int MastOf(int i) => 1 + (i * 17) % 200;
+            string GodOf(int i) => G[i % G.Length];
+            string SkinOf(int i) => (i % 4 == 0) ? null : "SK" + (i % 6);
+            string[] CompsOf(int i) => new[] { "pop" + (i % 3), "rare" + i, "rare" + ((i * 7) % N) };   // 1 popular (low-IDF) + 2 rarer
+            string[] NbOf(int i) => new[] { "nb" + (i % 4), "nb" + ((i * 5) % 20) };
+            Dictionary<string, (int tier, int mmr)> RankOf(int i) => (i % 3 == 0) ? new Dictionary<string, (int tier, int mmr)> { ["Conquest"] = (5 + (i % 15), 1000 + (i * 53) % 2500) } : null;
+
+            NameDb.Enabled = true;
+            NameDb.Clear();
+            for (int i = 0; i < N; i++)
+            {
+                var rk = RankOf(i);
+                IEnumerable<(string queue, int tier, int mmr)> ranked = rk?.Select(kv => (kv.Key, kv.Value.tier, kv.Value.mmr));
+                NameDb.Learn("H" + i, "P" + i.ToString("00"), 0, ClanOf(i), ClanOf(i) == 0 ? "" : "C" + (i % 5), LvlOf(i), GodOf(i), MastOf(i), CompsOf(i), NbOf(i), SkinOf(i), ranked);
+            }
+            // identical-fingerprint pair → exercises the tie path (should resolve to nobody)
+            NameDb.Learn("TWA", "TwinA", 0, 0, "", 88, "Ra", 120, new[] { "tw1", "tw2", "tw3" }, null);
+            NameDb.Learn("TWB", "TwinB", 0, 0, "", 88, "Ra", 120, new[] { "tw1", "tw2", "tw3" }, null);
+
+            var lines = new List<string>();
+            void Q(string key, int clan, int lvl, int mast, string god, string[] comp, string[] nb, string[] excl, string skin, IReadOnlyDictionary<string, (int tier, int mmr)> sr)
+            {
+                var r = NameDb.Resolve(clan, lvl, mast, god, comp, nb, excl, skin, sr);
+                lines.Add(key + " => " + (r.name ?? "-") + "|" + r.conf);
+            }
+            for (int i = 0; i < N; i++)
+            {
+                int c = ClanOf(i), l = LvlOf(i), m = MastOf(i); string g = GodOf(i), sk = SkinOf(i);
+                string[] comp = CompsOf(i), nb = NbOf(i); var sr = RankOf(i); string k = "P" + i.ToString("00");
+                Q(k + ".exact", c, l, m, g, comp, nb, null, sk, sr);
+                Q(k + ".lvl+1", c, l + 1, m, g, comp, nb, null, sk, sr);
+                Q(k + ".lvl-5", c, l - 5, m, g, comp, nb, null, sk, sr);
+                Q(k + ".lvl+15", c, l + 15, m, g, comp, nb, null, sk, sr);
+                Q(k + ".noComp", c, l, m, g, null, nb, null, sk, sr);
+                Q(k + ".partComp", c, l, m, g, comp.Take(2).ToArray(), nb, null, sk, sr);
+                Q(k + ".swapComp", c, l, m, g, CompsOf((i + 7) % N), nb, null, sk, sr);
+                Q(k + ".noSkin", c, l, m, g, comp, nb, null, null, sr);
+                Q(k + ".wrongGod", c, l, m, GodOf((i + 1) % G.Length), comp, nb, null, sk, sr);
+                Q(k + ".noMmr", c, l, m, g, comp, nb, null, sk, null);
+                Q(k + ".exclSelf", c, l, m, g, comp, nb, new[] { "P" + i.ToString("00") }, sk, sr);
+            }
+            Q("ZZ.twinTie", 0, 88, 120, "Ra", new[] { "tw1", "tw2", "tw3" }, null, null, null, null);
+            lines.Sort(StringComparer.Ordinal);
+            return "MATCHER HARNESS  corpus=" + (N + 2) + " queries=" + lines.Count + "\n" + string.Join("\n", lines);
         }
 
         // --- control factories -------------------------------------------------
@@ -2467,8 +2985,8 @@ namespace SmiteGodLab
         {
             var parts = name.Split(new[] { ' ', '-', '\'' }, StringSplitOptions.RemoveEmptyEntries);
             if (parts.Length == 0) return "?";
-            string s = char.ToUpper(parts[0][0]).ToString();
-            if (parts.Length > 1) s += char.ToUpper(parts[1][0]);
+            string s = char.ToUpperInvariant(parts[0][0]).ToString();
+            if (parts.Length > 1) s += char.ToUpperInvariant(parts[1][0]);
             return s;
         }
 
@@ -2786,9 +3304,11 @@ namespace SmiteGodLab
             if (slot != null)
             {
                 if (slot == "P") return ("PSV", "PASSIVE", "P", 0, true, false);
-                int n = int.Parse(slot);
-                if (n == 4) return ("A4", "ULTIMATE", "4", 4, true, true);
-                return ("A" + n, "ABILITY " + n, n.ToString(), n, true, false);
+                if (int.TryParse(slot, out int n))   // malformed slot must not crash god loading
+                {
+                    if (n == 4) return ("A4", "ULTIMATE", "4", 4, true, true);
+                    return ("A" + n, "ABILITY " + n, n.ToString(), n, true, false);
+                }
             }
 
             string suffix = PrettifySuffix(DeviceSuffix(sec));
@@ -2892,6 +3412,10 @@ namespace SmiteGodLab
             var changed = prms.Where(p => !p.IsNew && p.Value != p.Original).ToList();
             var added = prms.Where(p => p.IsNew).ToList();
             if (changed.Count == 0 && added.Count == 0) return;
+            // ';' starts an inline comment in the config format with no escape, so a value containing it would be silently
+            // truncated on the next reload (and leave a stray comment in the file). Block the save with a clear message.
+            var badSemi = changed.Concat(added).Where(p => p.Value != null && p.Value.Contains(';')).ToList();
+            if (badSemi.Count > 0) { MessageBox.Show(this, "These values contain ';', which the game config uses to start a comment and can't be saved safely:\n\n  " + string.Join("\n  ", badSemi.Select(p => p.Key + " = " + p.Value)), "Smite 1 Inspector"); return; }
             try
             {
                 var enc = new UTF8Encoding(false);
@@ -2918,7 +3442,11 @@ namespace SmiteGodLab
                 string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
                 string bak = Path.Combine(folderPath, current.FileName + "." + stamp + ".bak");
                 File.WriteAllText(bak, current.Text, enc);
-                File.WriteAllText(current.Path, newText, enc);
+                // ATOMIC write of the user's game config: temp + File.Replace so a crash mid-write can never leave a
+                // half-written/corrupt config (the timestamped .bak above is the extra safety net).
+                string ctmp = current.Path + ".tmp";
+                File.WriteAllText(ctmp, newText, enc);
+                if (File.Exists(current.Path)) File.Replace(ctmp, current.Path, null); else File.Move(ctmp, current.Path);
 
                 int total = changed.Count + added.Count;
                 current.Text = newText;
@@ -2942,6 +3470,15 @@ namespace SmiteGodLab
             return -1;
         }
 
+        // True if it's OK to discard the current in-memory God-Inspector edits (none pending, or the user confirmed).
+        bool ConfirmDiscardEdits()
+        {
+            if (current == null || prms == null) return true;
+            int dirty = prms.Count(p => p.IsNew || p.Value != p.Original);
+            if (dirty == 0) return true;
+            return MessageBox.Show(this, dirty + " unsaved change" + (dirty > 1 ? "s" : "") + " to " + current.FileName + " will be lost.\n\nSwitch anyway?",
+                "Discard changes", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes;
+        }
         void ReloadFile()
         {
             if (current == null) return;
@@ -3693,7 +4230,7 @@ namespace SmiteGodLab
         async Task<Image> LoadAvatar(string url)
         {
             if (string.IsNullOrEmpty(url)) return null;
-            if (_avatarCache.TryGetValue(url, out var cached)) return cached;   // includes negatively-cached nulls
+            if (_avatarCache.TryGetValue(url, out var cached)) { _avatarCache.Remove(url); _avatarCache[url] = cached; return cached; }   // LRU touch (so an on-screen avatar is never the eviction victim); includes negatively-cached nulls
             Image img = null;
             try
             {
@@ -3703,9 +4240,16 @@ namespace SmiteGodLab
                 img = new Bitmap(tmp);   // copy so the stream can be disposed
             }
             catch { img = null; }
-            // Cache success AND failure (null) so a broken URL isn't re-downloaded on every preview click. Light cap so a
-            // very long session can't grow the cache without bound (entries aren't disposed, so just stop adding past it).
-            if (_avatarCache.Count < 256) _avatarCache[url] = img;
+            // Cache success AND failure (null) so a broken URL isn't re-downloaded on every preview click. Bounded LRU: at the
+            // cap, dispose+evict the oldest (least-recently-used) entry so every Bitmap is cache-owned exactly once and freed
+            // deterministically (no GDI handle leak past the cap). The LRU touch above keeps the on-screen avatar from eviction.
+            if (_avatarCache.Count >= 256)
+            {
+                var oldest = _avatarCache.Keys.First();
+                if (_avatarCache.TryGetValue(oldest, out var ev)) ev?.Dispose();
+                _avatarCache.Remove(oldest);
+            }
+            _avatarCache[url] = img;
             return img;
         }
 
@@ -3939,7 +4483,7 @@ namespace SmiteGodLab
             {
                 // Coalesce FIRST: if a pass is in flight, request a re-run rather than mutating flRows mid-flight
                 // (the running pass holds row refs; its trailing flAgain re-run picks up adds/removes/the empty state).
-                if (flBusy) { flAgain = true; return; }
+                if (flBusy || flTicking) { flAgain = true; return; }   // also yield to an in-flight poll tick (it's async; its rows are mid-resolve)
                 if (friendList.Count == 0) { flRows.Clear(); flist.SetRows(new List<PlayerRow>()); hint.ForeColor = Theme.Dim; hint.Text = "No friends yet — add players from the Player Tracker (＋ Friend List)."; return; }
                 flBusy = true;
                 try
@@ -4076,7 +4620,11 @@ namespace SmiteGodLab
                     SetFlHint();
                 }
                 catch { }   // async-void handler: never let a stray error crash the app — the next tick retries
-                finally { flTicking = false; }
+                finally
+                {
+                    flTicking = false;
+                    if (flAgain && !flBusy && curMode == 2 && !IsDisposed) { flAgain = false; _ = RefreshFriendList(); }   // run a Refresh that was deferred while this tick was mid-await
+                }
             };
             // Entering the Friend List tab: seed once (full pass), or just resume the poller on the persisted list — never rebuild.
             void FlOnShow()
@@ -4116,7 +4664,18 @@ namespace SmiteGodLab
             refresh.Click += async (s, e) => await RefreshFriendList();
             _flShow = FlOnShow;
             _flPause = () => flPoll.Stop();
-            this.FormClosed += (s, e) => { FlushNote(); flPoll.Stop(); flPoll.Dispose(); NameDb.Save(true); GameLog.Shutdown(); };   // force-flush: don't lose captures/tags still inside the save debounce window
+            // Warn before quitting with unsaved God-Inspector config edits (FormClosed can't cancel; FormClosing can).
+            this.FormClosing += (s, e) =>
+            {
+                if (current != null && prms != null)
+                {
+                    int d = prms.Count(p => p.IsNew || p.Value != p.Original);
+                    if (d > 0 && MessageBox.Show(this, d + " unsaved change" + (d > 1 ? "s" : "") + " to " + current.FileName + " will be lost.\n\nQuit anyway?",
+                            "Smite 1 Inspector", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+                        e.Cancel = true;
+                }
+            };
+            this.FormClosed += (s, e) => { FlushNote(); flPoll.Stop(); flPoll.Dispose(); NameDb.Save(true); GameLog.Shutdown(); try { _sguru?.Shutdown(); } catch { } try { SaveFavs(); SaveJson(FriendListFile, friendList); SaveJson(HiddenFile, hiddenTags); } catch { } };   // force-flush + release the WebView2 process/profile lock + final save-on-close so a transiently-dropped list save isn't lost
             return host;
         }
 
@@ -4212,7 +4771,7 @@ namespace SmiteGodLab
                         else x += S(8);
                     }
                 };
-                var statusLbl = new Label { AutoSize = false, Location = new Point(S(640), S(14)), Size = new Size(S(160), S(24)), TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.White, Font = Theme.F(9f, FontStyle.Bold), Visible = false };
+                var statusLbl = new Label { AutoSize = false, UseMnemonic = false, Location = new Point(S(640), S(14)), Size = new Size(S(160), S(24)), TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.White, Font = Theme.F(9f, FontStyle.Bold), Visible = false };
                 // Profile stats — owner-drawn tile band + ranked pills + meta row + status quote (replaces the old flat
                 // dim-gray label that had no hierarchy and clipped the status line). Paint reads outer-scope fields that
                 // ShowPlayer fills, then Invalidate()s — the same pattern achPanel uses (a build-time Paint lambda can't
@@ -4396,55 +4955,146 @@ namespace SmiteGodLab
 
                 // ===== Encounters — SMITE-GURU head-to-head ("how many times did A play with/against B, across years") =====
                 var encPanel = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg, Visible = false };
-                var encTop = new Panel { Dock = DockStyle.Top, Height = S(80), BackColor = Theme.Bg };
-                encTop.Controls.Add(new Label { AutoSize = true, UseMnemonic = false, ForeColor = Theme.Text, Font = Theme.F(13.5f, FontStyle.Bold), Location = new Point(S(22), S(10)), Text = "Encounters  (experimental)" });
-                encTop.Controls.Add(new Label { AutoSize = true, ForeColor = Theme.Dim, Font = Theme.F(9f), Location = new Point(S(24), S(47)), Text = "vs" });
-                var encBox = new TextBox { BorderStyle = BorderStyle.None, BackColor = Theme.Input, ForeColor = Theme.Text, Font = Theme.F(10.5f) };
-                try { encBox.PlaceholderText = "opponent's in-game name…"; } catch { }
-                var encBoxHost = WrapInput(encBox, S(236)); encBoxHost.Location = new Point(S(52), S(42));
-                var encBtn = MkBtn("Compare", 100, false, Theme.Blue, Color.White); encBtn.Location = new Point(S(300), S(41));
-                var encRefresh = MkBtn("↻ Refresh", 96, false); encRefresh.Location = new Point(S(408), S(41));
-                var encStatus = new Label { AutoSize = true, ForeColor = Theme.Dim, Font = Theme.F(8.5f), Location = new Point(S(514), S(49)), MaximumSize = new Size(S(640), 0), Text = "" };
-                encTop.Controls.Add(encBoxHost); encTop.Controls.Add(encBtn); encTop.Controls.Add(encRefresh); encTop.Controls.Add(encStatus);
+                var encTop = new Panel { Dock = DockStyle.Top, Height = S(156), BackColor = Theme.Bg };
+                encTop.Controls.Add(new Label { AutoSize = true, UseMnemonic = false, ForeColor = Theme.Text, Font = Theme.F(13.5f, FontStyle.Bold), Location = new Point(S(22), S(8)), Text = "Encounters  (experimental)" });
+                var encTip = new ToolTip();
+                // Two players side by side. Each: a name box + "+" to tie extra accounts/smurfs + "★" presets. Compare scans
+                // every account on each side and finds games where ANY A-account met ANY B-account (union by match id).
+                var encBtn = MkBtn("Compare", 100, false, Theme.Blue, Color.White); encBtn.Location = new Point(S(330), S(9));
+                var encRefresh = MkBtn("↻ Refresh", 96, false); encRefresh.Location = new Point(S(438), S(9));
+                var encStatus = new Label { AutoSize = true, ForeColor = Theme.Dim, Font = Theme.F(8.5f), Location = new Point(S(24), S(128)), MaximumSize = new Size(S(940), 0), Text = "" };
+                var boxA = new TextBox { BorderStyle = BorderStyle.None, BackColor = Theme.Input, ForeColor = Theme.Text, Font = Theme.F(10.5f) };
+                var boxB = new TextBox { BorderStyle = BorderStyle.None, BackColor = Theme.Input, ForeColor = Theme.Text, Font = Theme.F(10.5f) };
+                try { boxA.PlaceholderText = "player A…"; boxB.PlaceholderText = "player B…"; } catch { }
+                var boxAhost = WrapInput(boxA, S(208)); boxAhost.Location = new Point(S(24), S(50));
+                var boxBhost = WrapInput(boxB, S(208)); boxBhost.Location = new Point(S(360), S(50));
+                encTop.Controls.Add(new Label { AutoSize = true, UseMnemonic = false, ForeColor = Theme.Dim, Font = Theme.F(8f, FontStyle.Bold), Location = new Point(S(26), S(36)), Text = "PLAYER A" });
+                encTop.Controls.Add(new Label { AutoSize = true, UseMnemonic = false, ForeColor = Theme.Dim, Font = Theme.F(8f, FontStyle.Bold), Location = new Point(S(362), S(36)), Text = "PLAYER B" });
+                encTop.Controls.Add(new Label { AutoSize = true, ForeColor = Theme.Dim, Font = Theme.F(10f, FontStyle.Bold), Location = new Point(S(332), S(54)), Text = "vs" });
+                var addA = MkBtn("＋", 30, false); addA.Location = new Point(S(236), S(49)); encTip.SetToolTip(addA, "Tie another account / smurf to player A");
+                var presA = MkBtn("★", 30, false); presA.Location = new Point(S(270), S(49)); encTip.SetToolTip(presA, "Presets — save or load this person's accounts");
+                var addB = MkBtn("＋", 30, false); addB.Location = new Point(S(572), S(49)); encTip.SetToolTip(addB, "Tie another account / smurf to player B");
+                var presB = MkBtn("★", 30, false); presB.Location = new Point(S(606), S(49)); encTip.SetToolTip(presB, "Presets — save or load this person's accounts");
+                var chipsA = new FlowLayoutPanel { Location = new Point(S(24), S(86)), Size = new Size(S(290), S(36)), FlowDirection = FlowDirection.LeftToRight, WrapContents = true, AutoScroll = false, BackColor = Theme.Bg };
+                var chipsB = new FlowLayoutPanel { Location = new Point(S(360), S(86)), Size = new Size(S(290), S(36)), FlowDirection = FlowDirection.LeftToRight, WrapContents = true, AutoScroll = false, BackColor = Theme.Bg };
+                encTop.Controls.Add(boxAhost); encTop.Controls.Add(boxBhost); encTop.Controls.Add(addA); encTop.Controls.Add(presA); encTop.Controls.Add(addB); encTop.Controls.Add(presB); encTop.Controls.Add(chipsA); encTop.Controls.Add(chipsB); encTop.Controls.Add(encBtn); encTop.Controls.Add(encRefresh); encTop.Controls.Add(encStatus);
                 var encScroll = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg, AutoScroll = true, Padding = new Padding(S(22), S(4), S(16), S(16)) };
                 var encFlow = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, BackColor = Theme.Bg };
                 encScroll.Controls.Add(encFlow);
                 encPanel.Controls.Add(encScroll); encPanel.Controls.Add(encTop);
                 System.Threading.CancellationTokenSource encCts = null;
+                // alias line is rendered immediately (shared-match names) then enriched in place once B's own-history names load
+                Label encAliasLbl = null; List<string> encSharedAliases = new(); List<string> encExclude = new();   // encExclude = B's typed account names (kept out of the "also seen as" line)
+                // extra accounts (smurfs) tied to each side, beyond the name in the box; + saved presets (named account groups)
+                var accA = new List<string>(); var accB = new List<string>();
+                List<EncPreset> encPresets = new();
+                try { var pf0 = Path.Combine(Theme.DataDir, "enc_presets.json"); if (File.Exists(pf0)) encPresets = (JsonSerializer.Deserialize<EncPresetFile>(File.ReadAllText(pf0)) ?? new()).Presets ?? new(); } catch { }
+                void SaveEncPresets() { try { File.WriteAllText(Path.Combine(Theme.DataDir, "enc_presets.json"), JsonSerializer.Serialize(new EncPresetFile { Presets = encPresets })); } catch { } }
+                void RebuildChips(FlowLayoutPanel host, List<string> acc)
+                {
+                    host.SuspendLayout(); host.Controls.Clear();
+                    foreach (var nm in acc.ToList())
+                    {
+                        var chip = MkBtn(nm + "  ✕", 60, false);
+                        chip.AutoSize = true; chip.AutoSizeMode = AutoSizeMode.GrowAndShrink; chip.Margin = new Padding(0, 0, S(5), S(3)); chip.Font = Theme.F(8.5f); chip.Padding = new Padding(S(6), S(1), S(6), S(1));
+                        string cap = nm; chip.Click += (s, e) => { acc.RemoveAll(a => string.Equals(a, cap, StringComparison.OrdinalIgnoreCase)); RebuildChips(host, acc); };
+                        encTip.SetToolTip(chip, "Remove " + nm);
+                        host.Controls.Add(chip);
+                    }
+                    host.ResumeLayout(true);
+                }
+                void AddAccount(TextBox box, List<string> acc, FlowLayoutPanel host)
+                {
+                    var n = box.Text.Trim(); if (n.Length == 0) { box.Focus(); return; }
+                    if (!acc.Any(a => string.Equals(a, n, StringComparison.OrdinalIgnoreCase))) acc.Add(n);
+                    box.Clear(); RebuildChips(host, acc); box.Focus();
+                }
+                void ShowPresetMenu(Button anchor, TextBox box, List<string> acc, FlowLayoutPanel host)
+                {
+                    var menu = new ContextMenuStrip { BackColor = Theme.Panel, ForeColor = Theme.Text };
+                    var save = new ToolStripMenuItem("Save these accounts as a preset…") { ForeColor = Theme.Text };
+                    save.Click += (s, e) =>
+                    {
+                        var all = new List<string>(acc); var t = box.Text.Trim();
+                        if (t.Length > 0 && !all.Any(a => string.Equals(a, t, StringComparison.OrdinalIgnoreCase))) all.Add(t);
+                        if (all.Count == 0) { MessageBox.Show(this, "Type or add at least one account first.", "Presets"); return; }
+                        var nm = PromptText("Save preset", "Name this group of accounts (e.g. all of one person's smurfs)", all[0]);
+                        if (string.IsNullOrWhiteSpace(nm)) return;
+                        encPresets.RemoveAll(p => string.Equals(p.Name, nm.Trim(), StringComparison.OrdinalIgnoreCase));
+                        encPresets.Add(new EncPreset { Name = nm.Trim(), Accounts = all }); SaveEncPresets();
+                    };
+                    menu.Items.Add(save);
+                    if (encPresets.Count > 0)
+                    {
+                        menu.Items.Add(new ToolStripSeparator());
+                        foreach (var p in encPresets.OrderBy(p => p.Name))
+                        {
+                            var pp = p; var it = new ToolStripMenuItem(pp.Name + "   (" + pp.Accounts.Count + ")") { ForeColor = Theme.Text };
+                            it.Click += (s, e) => { acc.Clear(); acc.AddRange(pp.Accounts); box.Clear(); RebuildChips(host, acc); };
+                            menu.Items.Add(it);
+                        }
+                        menu.Items.Add(new ToolStripSeparator());
+                        var del = new ToolStripMenuItem("Delete a preset") { ForeColor = Theme.Dim };
+                        foreach (var p in encPresets.OrderBy(p => p.Name)) { var pp = p; var di = new ToolStripMenuItem(pp.Name) { ForeColor = Theme.Text }; di.Click += (s, e) => { encPresets.RemoveAll(x => x == pp); SaveEncPresets(); }; del.DropDownItems.Add(di); }
+                        menu.Items.Add(del);
+                    }
+                    menu.Closed += (s, e) => menu.BeginInvoke((Action)menu.Dispose);   // dispose the one-shot menu after it closes (else it leaks every open)
+                    menu.Show(anchor, new Point(0, anchor.Height));
+                }
+                addA.Click += (s, e) => AddAccount(boxA, accA, chipsA);
+                addB.Click += (s, e) => AddAccount(boxB, accB, chipsB);
+                presA.Click += (s, e) => ShowPresetMenu(presA, boxA, accA, chipsA);
+                presB.Click += (s, e) => ShowPresetMenu(presB, boxB, accB, chipsB);
                 string EncQueue(int q) => q switch { 426 => "Conquest", 451 => "Ranked Conquest", 459 => "Conquest", 435 => "Arena", 448 => "Joust", 450 => "Ranked Joust", 440 => "Ranked Duel", 445 => "Assault", 466 => "Clash", 10189 => "Slash", 504 => "Slash", _ => "Queue " + q };
                 string EncDate(string iso) => DateTime.TryParse(iso, null, System.Globalization.DateTimeStyles.RoundtripKind, out var d) ? d.ToString("yyyy-MM-dd") : (iso ?? "");
                 Panel MakeEncRow(SmiteGuru.Match m, bool allied, bool aWon)
                 {
                     int w = AchRowWidth();
-                    var row = new Panel { Size = new Size(Math.Min(w, S(620)), S(34)), Margin = new Padding(0, 0, 0, S(5)), BackColor = Theme.Bg };
+                    var row = new Panel { Size = new Size(Math.Min(w, S(620)), S(34)), Margin = new Padding(0, 0, 0, S(5)), BackColor = Theme.Bg, Cursor = Cursors.Hand };
                     var accent = allied ? Theme.Green : Theme.Accent;
+                    string dateStr = EncDate(m.Time), queueStr = EncQueue(m.QueueId);   // precompute once — Paint fires on every hover/scroll
+                    bool hover = false;   // click a row → open that game's scoreboard (smite.guru match_id == Hi-Rez match id)
                     row.Paint += (s, e) =>
                     {
                         var g = e.Graphics; g.SmoothingMode = SmoothingMode.AntiAlias;
-                        DrawPill(g, new Rectangle(0, 0, row.Width - 1, row.Height - 1), S(6), Theme.Panel, Color.FromArgb(46, accent.R, accent.G, accent.B));
+                        var border = Color.FromArgb(hover ? 150 : 46, accent.R, accent.G, accent.B);
+                        DrawPill(g, new Rectangle(0, 0, row.Width - 1, row.Height - 1), S(6), hover ? Theme.Input : Theme.Panel, border);
                         using (var ab = new SolidBrush(accent)) g.FillRectangle(ab, S(1), S(7), S(3), row.Height - S(14));
-                        TextRenderer.DrawText(g, EncDate(m.Time), Theme.F(9f), new Rectangle(S(14), 0, S(104), row.Height), Theme.Text, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
-                        TextRenderer.DrawText(g, EncQueue(m.QueueId), Theme.F(9f), new Rectangle(S(126), 0, S(170), row.Height), Theme.Dim, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                        TextRenderer.DrawText(g, dateStr, Theme.F(9f), new Rectangle(S(14), 0, S(104), row.Height), Theme.Text, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                        TextRenderer.DrawText(g, queueStr, Theme.F(9f), new Rectangle(S(126), 0, S(170), row.Height), Theme.Dim, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
                         TextRenderer.DrawText(g, allied ? "ALLIES" : "ENEMIES", Theme.F(8f, FontStyle.Bold), new Rectangle(S(304), 0, S(86), row.Height), accent, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
                         TextRenderer.DrawText(g, aWon ? "WIN" : "LOSS", Theme.F(8.5f, FontStyle.Bold), new Rectangle(S(396), 0, S(70), row.Height), aWon ? Theme.Green : Theme.AccentHi, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                        TextRenderer.DrawText(g, hover ? "View scoreboard ›" : "›", Theme.F(8.5f, FontStyle.Bold), new Rectangle(row.Width - S(154), 0, S(146), row.Height), hover ? accent : Theme.Dim, TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
                     };
+                    row.MouseEnter += (s, e) => { hover = true; row.Invalidate(); };
+                    row.MouseLeave += (s, e) => { hover = false; row.Invalidate(); };
+                    row.Click += async (s, e) => { if (!string.IsNullOrEmpty(m.MatchId)) await ShowSguruMatch(m.MatchId); };   // SmiteGuru scoreboard (works for old matches; Hi-Rez drops them)
                     return row;
                 }
-                void RenderEnc(string bName, List<SmiteGuru.Match> all, long aId)
+                void RenderEnc(HashSet<long> aIds, HashSet<long> bIds, List<string> aNames, List<string> bNames, List<SmiteGuru.Match> all, IReadOnlyCollection<string> bOwnNames)
                 {
-                    encFlow.SuspendLayout(); encFlow.Controls.Clear();
-                    encFlow.Controls.Add(new Label { AutoSize = true, UseMnemonic = false, ForeColor = Theme.Text, Font = Theme.F(12.5f, FontStyle.Bold), Margin = new Padding(0, 0, 0, S(10)), Text = curName + "   vs   " + bName });
-                    var hits = new List<(SmiteGuru.Match m, bool allied, bool aWon)>();
+                    encFlow.SuspendLayout(); encFlow.Controls.Clear(); encAliasLbl = null; encSharedAliases = new(); encExclude = new List<string>(bNames);
+                    string Lbl(List<string> ns) => ns.Count == 0 ? "?" : ns[0] + (ns.Count > 1 ? "  +" + (ns.Count - 1) : "");
+                    string aLabel = Lbl(aNames), bLabel = Lbl(bNames);
+                    encFlow.Controls.Add(new Label { AutoSize = true, UseMnemonic = false, ForeColor = Theme.Text, Font = Theme.F(12.5f, FontStyle.Bold), Margin = new Padding(0, 0, 0, S(10)), Text = aLabel + "   vs   " + bLabel });
+                    // Match by STABLE id (survives renames) OR any typed account name. Each side can be MULTIPLE accounts (smurfs);
+                    // also fold in any roster id ever seen under a typed name (catches renames on either side).
+                    var aNameSet = new HashSet<string>(aNames.Select(n => n.Trim()), StringComparer.OrdinalIgnoreCase);
+                    var bNameSet = new HashSet<string>(bNames.Select(n => n.Trim()), StringComparer.OrdinalIgnoreCase);
+                    foreach (var m in all) if (m.Players != null) foreach (var p in m.Players) { if (p.Id == 0 || string.IsNullOrWhiteSpace(p.Name)) continue; var nm = p.Name.Trim(); if (bNameSet.Contains(nm)) bIds.Add(p.Id); if (aNameSet.Contains(nm)) aIds.Add(p.Id); }
+                    bool IsA(SmiteGuru.Player p) => (p.Id != 0 && aIds.Contains(p.Id)) || (!string.IsNullOrWhiteSpace(p.Name) && aNameSet.Contains(p.Name.Trim()));
+                    bool IsB(SmiteGuru.Player p) => (p.Id != 0 && bIds.Contains(p.Id)) || (!string.IsNullOrWhiteSpace(p.Name) && bNameSet.Contains(p.Name.Trim()));
+                    var hits = new List<(SmiteGuru.Match m, bool allied, bool aWon, string bAt)>();
                     foreach (var m in all)
                     {
-                        var ap = m.Players?.FirstOrDefault(p => p.Id == aId); if (ap == null) continue;
-                        var bp = m.Players.FirstOrDefault(p => !string.IsNullOrWhiteSpace(p.Name) && string.Equals(p.Name.Trim(), bName, StringComparison.OrdinalIgnoreCase));
-                        if (bp == null) continue;
-                        hits.Add((m, ap.Team == bp.Team, m.WinningTeam == ap.Team));
+                        if (m.Players == null) continue;
+                        var ap = m.Players.FirstOrDefault(IsA); if (ap == null) continue;
+                        var bp = m.Players.FirstOrDefault(p => p != ap && IsB(p) && !IsA(p)); if (bp == null) continue;   // opponent must be a DIFFERENT identity (guards same-person-on-both-sides)
+                        hits.Add((m, ap.Team == bp.Team, m.WinningTeam == ap.Team, bp.Name));
                     }
                     if (hits.Count == 0)
                     {
-                        encFlow.Controls.Add(new Label { AutoSize = true, ForeColor = Theme.Dim, Font = Theme.F(9.5f), MaximumSize = new Size(S(640), 0), Text = "No shared matches with \"" + bName + "\" in " + all.Count.ToString("N0") + " of " + curName + "'s recorded games. (Only games " + curName + " played are searchable, and the name must match exactly.)" });
+                        encFlow.Controls.Add(new Label { AutoSize = true, ForeColor = Theme.Dim, Font = Theme.F(9.5f), MaximumSize = new Size(S(640), 0), Text = "No shared matches between \"" + aLabel + "\" and \"" + bLabel + "\" in " + all.Count.ToString("N0") + " scanned games." });
                         encFlow.ResumeLayout(true); return;
                     }
                     int total = hits.Count, allied = hits.Count(h => h.allied), against = total - allied;
@@ -4457,40 +5107,158 @@ namespace SmiteGodLab
                     tileRow.Controls.Add(MakeAchTile("VS THEM  W-L", agW + "-" + agL, Theme.Accent));
                     tileRow.Controls.Add(MakeAchTile("WITH THEM  W-L", alW + "-" + alL, Theme.Green));
                     encFlow.Controls.Add(tileRow);
+                    // name history (same id, different names over the years). Two sources, unioned:
+                    //   • shared-match rosters (h.bAt) — names B used in games A was also in (available now)
+                    //   • B's OWN full history (bOwnNames) — every name B ever used, incl. games A wasn't in (the complete set;
+                    //     loaded a moment later → EnrichAliases updates this label in place, no re-render / scroll jump)
+                    encSharedAliases = hits.Select(h => (h.bAt ?? "").Trim()).Where(n => n.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                    var aliasSet = new List<string>(encSharedAliases);
+                    if (bOwnNames != null) aliasSet.AddRange(bOwnNames.Select(n => (n ?? "").Trim()));
+                    var aliases = aliasSet.Where(n => n.Length > 0 && !bNameSet.Contains(n)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                    encAliasLbl = new Label { AutoSize = true, UseMnemonic = false, ForeColor = Theme.Dim, Font = Theme.F(8.5f), Margin = new Padding(S(2), 0, 0, S(8)), MaximumSize = new Size(AchRowWidth(), 0), Visible = aliases.Count > 0, Text = aliases.Count > 0 ? "Same account, also seen as: " + string.Join(", ", aliases) : "" };
+                    encFlow.Controls.Add(encAliasLbl);
                     string span = EncDate(hits[hits.Count - 1].m.Time) + "   →   " + EncDate(hits[0].m.Time);
                     encFlow.Controls.Add(new Label { AutoSize = true, ForeColor = Theme.Dim, Font = Theme.F(8.5f, FontStyle.Bold), Margin = new Padding(S(2), 0, 0, S(6)), Text = "MATCHES   ·   " + span });
-                    foreach (var h in hits) encFlow.Controls.Add(MakeEncRow(h.m, h.allied, h.aWon));
+                    // filter chips — show only "as enemies", "as allies", wins or losses (re-fills just the row list, keeps tiles)
+                    int wins = agW + alW, losses = agL + alL;
+                    var filterRow = new FlowLayoutPanel { FlowDirection = FlowDirection.LeftToRight, WrapContents = true, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, MaximumSize = new Size(AchRowWidth(), 0), Margin = new Padding(S(2), 0, 0, S(6)) };
+                    var rowsHost = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = new Padding(0) };
+                    string curFilter = "all";
+                    var chips = new List<(string key, Button btn)>();
+                    void StyleChips() { foreach (var (k, b) in chips) { bool on = k == curFilter; b.BackColor = on ? Theme.Blue : Theme.Input; b.ForeColor = on ? Color.White : Theme.Dim; b.FlatAppearance.BorderColor = on ? Theme.Blue : Theme.Line; } }
+                    void Repop()
+                    {
+                        rowsHost.SuspendLayout(); rowsHost.Controls.Clear();
+                        IEnumerable<(SmiteGuru.Match m, bool allied, bool aWon, string bAt)> sel = curFilter switch
+                        {
+                            "enemies" => hits.Where(h => !h.allied),
+                            "allies" => hits.Where(h => h.allied),
+                            "wins" => hits.Where(h => h.aWon),
+                            "losses" => hits.Where(h => !h.aWon),
+                            _ => hits
+                        };
+                        foreach (var h in sel) rowsHost.Controls.Add(MakeEncRow(h.m, h.allied, h.aWon));
+                        rowsHost.ResumeLayout(true);
+                    }
+                    void AddChip(string key, string label)
+                    {
+                        var b = MkBtn(label, Math.Max(60, 18 + label.Length * 7), false); b.Margin = new Padding(0, 0, S(6), S(4));
+                        b.Click += (s, e) => { curFilter = key; StyleChips(); Repop(); };
+                        chips.Add((key, b)); filterRow.Controls.Add(b);
+                    }
+                    AddChip("all", "All " + total); AddChip("enemies", "As enemies " + against); AddChip("allies", "As allies " + allied);
+                    AddChip("wins", "Wins " + wins); AddChip("losses", "Losses " + losses);
+                    encFlow.Controls.Add(filterRow);
+                    encFlow.Controls.Add(rowsHost);
+                    StyleChips(); Repop();
                     encFlow.ResumeLayout(true);
+                }
+                // Update the "also seen as" line in place once B's own-history names finish loading (no full re-render).
+                void EnrichAliases(IReadOnlyCollection<string> bOwnNames)
+                {
+                    if (encAliasLbl == null || encAliasLbl.IsDisposed || bOwnNames == null) return;
+                    var ex = new HashSet<string>(encExclude, StringComparer.OrdinalIgnoreCase);
+                    var set = new List<string>(encSharedAliases);
+                    set.AddRange(bOwnNames.Select(n => (n ?? "").Trim()));
+                    var aliases = set.Where(n => n.Length > 0 && !ex.Contains(n)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                    if (aliases.Count == 0) return;
+                    encAliasLbl.Text = "Same account, also seen as: " + string.Join(", ", aliases);
+                    encAliasLbl.Visible = true;
+                }
+                // Gather one side's accounts: the chips PLUS whatever is currently typed in its box.
+                List<string> GatherSide(List<string> chipAcc, TextBox box)
+                {
+                    var l = new List<string>(chipAcc); var t = box.Text.Trim();
+                    if (t.Length > 0 && !l.Any(a => string.Equals(a, t, StringComparison.OrdinalIgnoreCase))) l.Add(t);
+                    return l;
                 }
                 async Task RunCompare(bool forceRefresh)
                 {
-                    if (string.IsNullOrEmpty(curPid) || curPid == "0" || !long.TryParse(curPid, out var aId)) { encStatus.ForeColor = Theme.Yellow; encStatus.Text = "Load a player on the Track tab first."; return; }
-                    string bName = encBox.Text.Trim();
-                    if (bName.Length == 0) { encStatus.ForeColor = Theme.Yellow; encStatus.Text = "Type an opponent's name."; encBox.Focus(); return; }
-                    encCts?.Cancel(); encCts = new System.Threading.CancellationTokenSource(); var ct = encCts.Token;
+                    var aAccts = GatherSide(accA, boxA); var bAccts = GatherSide(accB, boxB);
+                    if (aAccts.Count == 0) { encStatus.ForeColor = Theme.Yellow; encStatus.Text = "Enter player A."; boxA.Focus(); return; }
+                    if (bAccts.Count == 0) { encStatus.ForeColor = Theme.Yellow; encStatus.Text = "Enter player B."; boxB.Focus(); return; }
+                    encCts?.Cancel();   // signal any in-flight compare to stop; only the newest run owns the UI (guarded below)
+                    var myCts = new System.Threading.CancellationTokenSource(); encCts = myCts; var ct = myCts.Token;
                     _sguru ??= new SmiteGuru(this);
                     encBtn.Enabled = false; encRefresh.Enabled = false;
-                    encStatus.ForeColor = Theme.Dim; encStatus.Text = (SmiteGuru.HasCache(aId) && !forceRefresh) ? "Loading " + curName + "'s history…" : "Fetching " + curName + "'s history from SmiteGuru (first time is slow; cached after)…";
+                    encStatus.ForeColor = Theme.Dim; encStatus.Text = "Resolving accounts…";
                     try
                     {
-                        if (forceRefresh) _sguru.Wipe(aId);
-                        var all = await _sguru.GetHistory(aId, 80, (p, m) => { try { encStatus.Text = "Fetching page " + p + " / " + m + " …  (cancel by leaving the tab)"; } catch { } }, ct);
-                        encStatus.ForeColor = Theme.Dim; encStatus.Text = all.Count.ToString("N0") + " of " + curName + "'s games scanned.";
-                        RenderEnc(bName, all, aId);
+                        // resolve every account on each side to a STABLE Hi-Rez id (keeps the typed names for fallback / renames)
+                        async Task<(HashSet<long> ids, List<string> names)> ResolveSide(List<string> accts)
+                        {
+                            var ids = new HashSet<long>(); var names = new List<string>();
+                            foreach (var n in accts)
+                            {
+                                names.Add(n);
+                                try { using var pd = JsonDocument.Parse(await SmiteApi.Call("getplayer", n)); if (pd.RootElement.ValueKind == JsonValueKind.Array && pd.RootElement.GetArrayLength() > 0) { var r0 = pd.RootElement[0]; string idv = GS(r0, "Id"); if (string.IsNullOrEmpty(idv) || idv == "0") idv = GS(r0, "ActivePlayerId"); if (long.TryParse(idv, out var id) && id > 0) ids.Add(id); } } catch { }
+                            }
+                            return (ids, names);
+                        }
+                        var (aIds, aNames) = await ResolveSide(aAccts);
+                        var (bIds, bNames) = await ResolveSide(bAccts);
+                        if (aIds.Count == 0 && bIds.Count == 0) { encStatus.ForeColor = Theme.Yellow; encStatus.Text = "Couldn't find those names on the SMITE API."; return; }
+                        if (forceRefresh) foreach (var id in aIds.Concat(bIds)) await _sguru.WipeAsync(id, ct);   // gated wipe so it can't race an in-flight SaveCache
+                        // scan EVERY account on both sides (season-by-season, back to 2020), union all matches by match_id.
+                        var pool = new Dictionary<string, SmiteGuru.Match>();
+                        var bOwn = new List<string>();
+                        bool allComplete = true; int done = 0, totalAccts = aIds.Count + bIds.Count;
+                        int NonZero(SmiteGuru.Match m) => m.Players == null ? 0 : m.Players.Count(p => p.Id != 0);
+                        async Task Scan(long id, bool isB)
+                        {
+                            done++; int who = done;
+                            var h = await _sguru.GetHistory(id, 400, (p, m) => { try { encStatus.Text = p < 0 ? "Filling in any missed pages…" : "Scanning account " + who + " of " + totalAccts + " — " + p + " of ~" + m + " pages…"; } catch { } }, ct);
+                            allComplete &= h.Complete;
+                            // union by match_id; prefer the roster with MORE resolved (non-zero) ids so B's de-anonymized copy of a
+                            // shared game upgrades A's anonymized one (the "one side was hidden" recovery).
+                            foreach (var mm in h.Matches) { if (mm.MatchId == null) continue; if (!pool.TryGetValue(mm.MatchId, out var ex) || NonZero(mm) > NonZero(ex)) pool[mm.MatchId] = mm; }
+                            if (isB) bOwn.AddRange(h.Matches.Where(mm => mm.Players != null).SelectMany(mm => mm.Players).Where(p => p.Id == id && !string.IsNullOrWhiteSpace(p.Name)).Select(p => p.Name.Trim()));
+                        }
+                        // encounter count mirrors RenderEnc's matching (id OR typed name) so the re-render gate can't miss name-only / hidden games
+                        var aNameSetE = new HashSet<string>(aNames.Select(n => n.Trim()), StringComparer.OrdinalIgnoreCase);
+                        var bNameSetE = new HashSet<string>(bNames.Select(n => n.Trim()), StringComparer.OrdinalIgnoreCase);
+                        bool IsAE(SmiteGuru.Player p) => (p.Id != 0 && aIds.Contains(p.Id)) || (!string.IsNullOrWhiteSpace(p.Name) && aNameSetE.Contains(p.Name.Trim()));
+                        bool IsBE(SmiteGuru.Player p) => (p.Id != 0 && bIds.Contains(p.Id)) || (!string.IsNullOrWhiteSpace(p.Name) && bNameSetE.Contains(p.Name.Trim()));
+                        int EncCount(List<SmiteGuru.Match> ms) => ms.Count(m => m.Players != null && m.Players.Any(IsAE) && m.Players.Any(p => IsBE(p) && !IsAE(p)));
+                        // A side first → show results as soon as A is scanned
+                        foreach (var id in aIds) await Scan(id, false);
+                        var listA = pool.Values.OrderByDescending(m => m.Time ?? "", StringComparer.Ordinal).ToList();
+                        RenderEnc(new HashSet<long>(aIds), new HashSet<long>(bIds), aNames, bNames, listA, null);
+                        int aOnly = EncCount(listA);
+                        string Yr(string t) => !string.IsNullOrEmpty(t) && t.Length >= 4 ? t.Substring(0, 4) : "?";
+                        void Finalize(List<SmiteGuru.Match> shown)
+                        {
+                            string span = shown.Count > 0 ? " (" + Yr(shown[shown.Count - 1].Time) + "–" + Yr(shown[0].Time) + ")" : "";
+                            if (allComplete) { encStatus.ForeColor = Theme.Green; encStatus.Text = shown.Count.ToString("N0") + " games scanned" + span + "  ·  full history ✓"; }
+                            else { encStatus.ForeColor = Theme.Yellow; encStatus.Text = shown.Count.ToString("N0") + " games scanned" + span + "  ·  ⚠ a very active account exceeds smite.guru's page limit — a slice of recent games may be missing (older seasons fully scanned)."; }
+                        }
+                        if (ct.IsCancellationRequested) return;
+                        // then B side → fills any shared games missing from A's record (gaps / one side hidden) + B's rename history
+                        foreach (var id in bIds) { if (ct.IsCancellationRequested) break; await Scan(id, true); }
+                        if (!ct.IsCancellationRequested)
+                        {
+                            var bOwnNames = bOwn.Where(n => n.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                            var listAll = pool.Values.OrderByDescending(m => m.Time ?? "", StringComparer.Ordinal).ToList();
+                            if (EncCount(listAll) > aOnly) RenderEnc(new HashSet<long>(aIds), new HashSet<long>(bIds), aNames, bNames, listAll, bOwnNames);   // B added shared games → re-render
+                            else EnrichAliases(bOwnNames);                                                                                                  // same encounters → just enrich names in place
+                            Finalize(listAll);
+                        }
                     }
-                    catch (OperationCanceledException) { encStatus.Text = "Cancelled."; }
-                    catch (Exception ex) { encStatus.ForeColor = Theme.Yellow; encStatus.Text = "Lookup failed: " + ex.Message; }
-                    finally { encBtn.Enabled = true; encRefresh.Enabled = true; }
+                    catch (OperationCanceledException) { if (encCts == myCts) { encStatus.ForeColor = Theme.Dim; encStatus.Text = "Paused (progress saved — Compare again to resume)."; } }
+                    catch (Exception ex) { if (encCts == myCts) { encStatus.ForeColor = Theme.Yellow; encStatus.Text = "Lookup failed: " + ex.Message; } }
+                    finally { if (encCts == myCts) { encBtn.Enabled = true; encRefresh.Enabled = true; } }   // only the newest run owns the buttons/status (superseded runs stay quiet)
                 }
                 encBtn.Click += async (s, e) => await RunCompare(false);
-                encRefresh.Click += async (s, e) => await RunCompare(true);
-                encBox.KeyDown += async (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; await RunCompare(false); } };
+                encRefresh.Click += async (s, e) => await RunCompare(true);   // ↻ = wipe caches + full rescan (new games / retry gaps)
+                boxA.KeyDown += async (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; await RunCompare(false); } };
+                boxB.KeyDown += async (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; await RunCompare(false); } };
                 void ShowEncounters()
                 {
                     addAllFriendsBtn.Visible = false; ShowStage(6);
                     bool loaded = !string.IsNullOrEmpty(curPid) && curPid != "0";
-                    hint.ForeColor = Theme.Dim; hint.Text = loaded ? "Head-to-head vs another player across " + curName + "'s full match history (via SmiteGuru)." : "Load a player on the Track tab first.";
-                    if (loaded) encBox.Focus();
+                    if (loaded && boxA.Text.Trim().Length == 0 && accA.Count == 0) boxA.Text = curName;   // default player A to the loaded player (editable)
+                    hint.ForeColor = Theme.Dim; hint.Text = "Head-to-head between two players (with smurfs) across their full match history — via SmiteGuru.";
+                    if (boxB.Text.Trim().Length == 0) boxB.Focus(); else encBtn.Focus();
                 }
 
                 // Owner-drawn list (search results / favorites / recents / friends). It lives in a FIXED-WIDTH column —
@@ -5100,6 +5868,9 @@ namespace SmiteGodLab
                 void SelectSecondary(int j)
                 {
                     if (j == 4 && trackBusy) return;   // can't open Friends mid-load
+                    // "Change my profile" lives in the top strip and belongs ONLY to My profile's Overview — hide it (and its now-
+                    // empty strip) on every other My-profile sub-tab so it doesn't float over their content.
+                    if (curPrimary == 0) { myProfBtn.Visible = (j == 0); top.Visible = (j == 0); }
                     curSecondary = j; StyleSecondary(j);
                     switch (j) { case 0: ShowSearchView(); break; case 1: ShowExpanded(1); break; case 2: ShowExpanded(2); break; case 3: ShowAchievements(); break; case 4: _ = Guarded(ShowFriends); break; case 5: ShowEncounters(); break; }
                 }
@@ -5237,7 +6008,7 @@ namespace SmiteGodLab
                 _trkResetSecondary = () => { curSecondary = 0; StyleSecondary(0); };   // so SelectNav restores Overview (non-blocking), not a stale Guarded Friends view
                 _trkSubTab = SelectPrimary;
                 _trkSubTab2 = SelectSecondary;
-                _trkEncCompare = nm => { try { encBox.Text = nm; _ = RunCompare(false); } catch { } };   // test/screenshot hook
+                _trkEncCompare = nm => { try { if (boxA.Text.Trim().Length == 0 && accA.Count == 0) boxA.Text = curName; boxB.Text = nm; _ = RunCompare(false); } catch { } };   // test/screenshot hook
                 StylePrimary(1); StyleSecondary(0);
                 godLv.DoubleClick += async (s, e) =>
                 {
@@ -5404,19 +6175,23 @@ namespace SmiteGodLab
                     using var s = asm.GetManifestResourceStream(res);
                     using var src = Image.FromStream(s);
                     var bmp = new Bitmap(px, px);
-                    using (var g = Graphics.FromImage(bmp))
+                    try
                     {
-                        g.SmoothingMode = SmoothingMode.AntiAlias;
-                        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                        using (var clip = new System.Drawing.Drawing2D.GraphicsPath())
+                        using (var g = Graphics.FromImage(bmp))
                         {
-                            clip.AddEllipse(0, 0, px - 1, px - 1);
-                            g.SetClip(clip);
-                            g.DrawImage(src, 0, 0, px, px);   // logos are square; fill the circle
+                            g.SmoothingMode = SmoothingMode.AntiAlias;
+                            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                            using (var clip = new System.Drawing.Drawing2D.GraphicsPath())
+                            {
+                                clip.AddEllipse(0, 0, px - 1, px - 1);
+                                g.SetClip(clip);
+                                g.DrawImage(src, 0, 0, px, px);   // logos are square; fill the circle
+                            }
                         }
+                        result = bmp;
                     }
-                    result = bmp;
+                    catch { bmp.Dispose(); throw; }   // don't leak the partial bitmap if drawing fails
                 }
             }
             catch { result = null; }
@@ -5458,14 +6233,18 @@ namespace SmiteGodLab
                     using var src = Image.FromStream(s);
                     int w = Math.Max(1, (int)Math.Round(h * src.Width / (double)src.Height));
                     var bmp = new Bitmap(w, h);
-                    using (var g = Graphics.FromImage(bmp))
+                    try
                     {
-                        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                        g.DrawImage(src, 0, 0, w, h);
-                        using (var pen = new Pen(Color.FromArgb(90, 255, 255, 255))) g.DrawRectangle(pen, 0, 0, w - 1, h - 1);
+                        using (var g = Graphics.FromImage(bmp))
+                        {
+                            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                            g.DrawImage(src, 0, 0, w, h);
+                            using (var pen = new Pen(Color.FromArgb(90, 255, 255, 255))) g.DrawRectangle(pen, 0, 0, w - 1, h - 1);
+                        }
+                        result = bmp;
                     }
-                    result = bmp;
+                    catch { bmp.Dispose(); throw; }   // don't leak the partial bitmap if drawing fails
                 }
             }
             catch { result = null; }
@@ -5503,14 +6282,18 @@ namespace SmiteGodLab
                     using var s = asm.GetManifestResourceStream(res);
                     using var src = Image.FromStream(s);
                     var bmp = new Bitmap(px, px);
-                    using (var g = Graphics.FromImage(bmp))
+                    try
                     {
-                        g.SmoothingMode = SmoothingMode.AntiAlias;
-                        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                        g.DrawImage(src, 0, 0, px, px);
+                        using (var g = Graphics.FromImage(bmp))
+                        {
+                            g.SmoothingMode = SmoothingMode.AntiAlias;
+                            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                            g.DrawImage(src, 0, 0, px, px);
+                        }
+                        result = bmp;
                     }
-                    result = bmp;
+                    catch { bmp.Dispose(); throw; }   // don't leak the partial bitmap if drawing fails
                 }
             }
             catch { result = null; }
@@ -5553,20 +6336,20 @@ namespace SmiteGodLab
         // wipe is recoverable. Loaders fall back to .bak when the main file is missing/unparseable.
         static void SaveJson(string path, object data)
         {
+            string tmp = path + "." + Environment.CurrentManagedThreadId + ".tmp";   // unique per thread so concurrent saves don't collide on one .tmp
             try
             {
                 string json = JsonSerializer.Serialize(data, new JsonSerializerOptions { WriteIndented = true });
                 // ATOMIC: temp + File.Replace. Keep .bak ONLY when the current on-disk content is non-trivial AND differs —
                 // so clearing a list (writing "[]") then re-adding can't push the EMPTY file into .bak and lose the prior good
                 // copy. Otherwise replace atomically WITHOUT touching .bak (null backup arg). Protects the user's tags etc.
-                string tmp = path + ".tmp";
                 File.WriteAllText(tmp, json);
                 if (!File.Exists(path)) { File.Move(tmp, path); return; }
                 string cur = null; try { cur = File.ReadAllText(path); } catch { }
                 bool keepBak = cur != null && cur.Trim().Length > 2 && cur.Trim() != json.Trim();
                 File.Replace(tmp, path, keepBak ? path + ".bak" : null);
             }
-            catch { }
+            catch { try { if (File.Exists(tmp)) File.Delete(tmp); } catch { } }   // don't leave an orphan .tmp behind on a failed write
         }
         // Read a JSON list. The main file wins even when it's a valid EMPTY array (so an intentional Clear sticks);
         // only when the main file is missing or unparseable do we recover from the .bak backup.
@@ -5727,13 +6510,16 @@ namespace SmiteGodLab
                 dlg.Shown += async (s, e) => { try { ok = await DownloadFile(url, newExe, prog); } catch { ok = false; } dlg.Close(); };
                 dlg.ShowDialog(this);
             }
-            if (!ok) { try { File.Delete(newExe); } catch { } MessageBox.Show(this, "Download failed. You can update manually from the Releases page.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+            // reject a truncated/incomplete download before swapping it in — a partial exe would brick the install
+            if (ok && size > 0) { try { ok = new FileInfo(newExe).Length == size; } catch { ok = false; } }
+            if (!ok) { try { File.Delete(newExe); } catch { } MessageBox.Show(this, "Download failed or was incomplete. You can update manually from the Releases page.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
             try
             {
                 string bak = Path.Combine(dir, "SmiteInspector.old.exe");
                 try { if (File.Exists(bak)) File.Delete(bak); } catch { }
                 File.Move(exe, bak);     // a running exe can be renamed on Windows, just not overwritten
-                File.Move(newExe, exe);
+                try { File.Move(newExe, exe); }
+                catch { try { if (!File.Exists(exe) && File.Exists(bak)) File.Move(bak, exe); } catch { } throw; }   // new-exe move failed → restore the original exe so the install is never left with NO exe
             }
             catch (Exception ex)
             {
@@ -6036,6 +6822,87 @@ namespace SmiteGodLab
                 catch { }
                 try { await Task.Delay(TimeSpan.FromSeconds(45), ct); } catch { break; }
             }
+        }
+
+        // --- match scoreboard from SmiteGuru -----------------------------------
+        // Hi-Rez's getmatchdetails only keeps matches for a few weeks; SmiteGuru keeps them for years. So Encounters rows
+        // (which are historical) open THIS scoreboard, built from api.smite.guru/v3/matches/pc/<id> (full per-player stats).
+        static string SgKfmt(int n) => n >= 1000 ? (n / 1000.0).ToString("0.0") + "k" : n.ToString();
+        async Task ShowSguruMatch(string matchId)
+        {
+            if (string.IsNullOrEmpty(matchId)) return;
+            _sguru ??= new SmiteGuru(this);
+            SmiteGuru.MDetail md = null; Dictionary<int, string> gods = null, items = null;
+            var prev = Cursor.Current;
+            try { Cursor.Current = Cursors.WaitCursor; (md, gods, items) = await _sguru.GetMatchFull(matchId, System.Threading.CancellationToken.None); }
+            catch (Exception ex) { Cursor.Current = prev; MessageBox.Show(this, "Couldn't load this match from SmiteGuru: " + ex.Message, "SMITE", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+            finally { Cursor.Current = prev; }
+            if (md == null || md.Players == null || md.Players.Count == 0) { MessageBox.Show(this, "Couldn't load this match from SmiteGuru (it may not be available).", "SMITE"); return; }
+
+            string Qn(int q) => q switch { 426 => "Conquest", 451 => "Ranked Conquest", 459 => "Conquest", 435 => "Arena", 448 => "Joust", 450 => "Ranked Joust", 440 => "Ranked Duel", 445 => "Assault", 466 => "Clash", 10189 => "Slash", 504 => "Slash", _ => "Queue " + q };
+            string God(int id) => gods != null && gods.TryGetValue(id, out var n) && !string.IsNullOrEmpty(n) ? n : ("God " + id);
+            string dateS = DateTime.TryParse(md.Time, null, System.Globalization.DateTimeStyles.RoundtripKind, out var dt) ? dt.ToString("yyyy-MM-dd") : (md.Time ?? "");
+
+            using (var dlg = new Form())
+            using (var tip = new ToolTip())
+            {
+                dlg.Text = "Match " + matchId + "  —  " + Qn(md.QueueId) + "  ·  " + md.Duration + " min  ·  " + dateS;
+                dlg.BackColor = Theme.Bg; dlg.ForeColor = Theme.Text; dlg.Font = Theme.F(9.5f);
+                dlg.StartPosition = FormStartPosition.CenterParent; dlg.FormBorderStyle = FormBorderStyle.Sizable; dlg.MinimizeBox = false;
+                dlg.ClientSize = new Size(S(748), S(560));
+                var root = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true, BackColor = Theme.Bg, Padding = new Padding(S(14), S(10), S(14), S(14)) };
+                dlg.Controls.Add(root);
+                // party highlight: players sharing a non-zero party id were premade together
+                var partyColors = new Dictionary<int, Color>();
+                var palette = new[] { Color.FromArgb(86, 156, 214), Color.FromArgb(224, 162, 80), Color.FromArgb(150, 122, 224), Color.FromArgb(86, 196, 142), Color.FromArgb(224, 120, 168), Color.FromArgb(120, 200, 210) };
+                foreach (var grp in md.Players.GroupBy(p => p.Party).Where(g => g.Key != 0 && g.Count() > 1)) partyColors[grp.Key] = palette[partyColors.Count % palette.Length];
+                // column-header strip
+                var head = new Panel { Size = new Size(S(716), S(18)), Margin = new Padding(0, 0, 0, S(2)), BackColor = Theme.Bg };
+                head.Paint += (s, e) =>
+                {
+                    var g = e.Graphics;
+                    void Cap(string t, int x, int w2) => TextRenderer.DrawText(g, t, Theme.F(7.5f, FontStyle.Bold), new Rectangle(S(x), 0, S(w2), S(18)), Theme.Dim, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                    Cap("PLAYER", 44, 180); Cap("K / D / A", 232, 96); Cap("DMG", 336, 70); Cap("MIT", 414, 64); Cap("GOLD", 486, 70);
+                };
+                root.Controls.Add(head);
+                foreach (var team in new[] { 1, 2 })
+                {
+                    var tp = md.Players.Where(p => p.Team == team).OrderByDescending(p => p.Kills).ToList();
+                    if (tp.Count == 0) continue;
+                    bool won = md.WinningTeam == team;
+                    root.Controls.Add(new Label { AutoSize = true, UseMnemonic = false, Font = Theme.F(11f, FontStyle.Bold), ForeColor = won ? Theme.Green : Theme.Accent, Margin = new Padding(S(2), S(10), 0, S(4)), Text = (team == 1 ? "Order" : "Chaos") + "   ·   " + (won ? "VICTORY" : "DEFEAT") + "   ·   " + tp.Sum(p => p.Kills) + "/" + tp.Sum(p => p.Deaths) + "/" + tp.Sum(p => p.Assists) });
+                    foreach (var p in tp) root.Controls.Add(MakeSguruScoreRow(p, God, items, partyColors, tip));
+                }
+                dlg.ShowDialog(this);
+            }
+        }
+
+        Panel MakeSguruScoreRow(SmiteGuru.MPlayer p, Func<int, string> God, Dictionary<int, string> items, Dictionary<int, Color> partyColors, ToolTip tip)
+        {
+            var row = new Panel { Size = new Size(S(716), S(36)), Margin = new Padding(0, 0, 0, S(4)), BackColor = Theme.Panel };
+            string godName = God(p.Champion);
+            bool hidden = p.Id <= 0 || string.IsNullOrWhiteSpace(p.Name);
+            var gi = GodListIcon(godName);
+            var pc = partyColors.TryGetValue(p.Party, out var c) ? c : (Color?)null;
+            // items tooltip (resolved names, by slot)
+            if (items != null && p.Build != null && p.Build.Count > 0)
+            {
+                var names = p.Build.OrderBy(kv => kv.Key).Select(kv => items.TryGetValue(kv.Value, out var nm) ? nm : null).Where(n => !string.IsNullOrEmpty(n)).ToList();
+                if (names.Count > 0) tip.SetToolTip(row, "Build: " + string.Join(", ", names));
+            }
+            row.Paint += (s, e) =>
+            {
+                var g = e.Graphics; g.SmoothingMode = SmoothingMode.AntiAlias; g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                if (pc.HasValue) using (var b = new SolidBrush(pc.Value)) g.FillRectangle(b, 0, 0, S(3), row.Height);
+                if (gi != null) g.DrawImage(gi, new Rectangle(S(8), S(5), S(26), S(26)));
+                TextRenderer.DrawText(g, hidden ? "Hidden" : p.Name, Theme.F(9.5f, hidden ? FontStyle.Italic : FontStyle.Bold), new Rectangle(S(44), S(3), S(184), S(17)), hidden ? Theme.Dim : Theme.Text, TextFormatFlags.Left | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+                TextRenderer.DrawText(g, godName + "   ·   Lv " + p.Level, Theme.F(8f), new Rectangle(S(44), S(19), S(184), S(14)), Theme.Dim, TextFormatFlags.Left | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+                TextRenderer.DrawText(g, p.Kills + " / " + p.Deaths + " / " + p.Assists, Theme.F(10f, FontStyle.Bold), new Rectangle(S(232), 0, S(96), row.Height), Theme.Text, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                TextRenderer.DrawText(g, SgKfmt(p.Damage), Theme.F(9.5f), new Rectangle(S(336), 0, S(70), row.Height), Theme.Blue, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                TextRenderer.DrawText(g, SgKfmt(p.Mitigated), Theme.F(9.5f), new Rectangle(S(414), 0, S(64), row.Height), Theme.Dim, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                TextRenderer.DrawText(g, SgKfmt(p.Gold), Theme.F(9.5f), new Rectangle(S(486), 0, S(70), row.Height), Theme.Yellow, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+            };
+            return row;
         }
 
         // --- match scoreboard (getmatchdetails) --------------------------------
