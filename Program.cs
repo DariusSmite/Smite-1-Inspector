@@ -6446,7 +6446,14 @@ namespace SmiteGodLab
         }
 
         // --- auto-update (checks the GitHub releases of this repo) ---
-        public const string AppVersion = "1.0.0";   // bump to match each release v-tag; drives the update check
+        // Derived from the assembly version (set by csproj <Version>) so it can NEVER desync from the release tag again —
+        // a hardcoded const here previously stayed at "1.0.0" and made the updater re-prompt forever after updating.
+        public static readonly string AppVersion = AppVersionFromAssembly();
+        static string AppVersionFromAssembly()
+        {
+            try { var v = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version; if (v != null && (v.Major + v.Minor + v.Build) > 0) return v.Major + "." + v.Minor + "." + v.Build; } catch { }
+            return "1.1.1";
+        }
         const string ReleasesApi = "https://api.github.com/repos/DariusSmite/Smite-1-Inspector/releases/latest";
         const string ReleasesPage = "https://github.com/DariusSmite/Smite-1-Inspector/releases/latest";
         bool _updateChecked;   // startup check runs once per launch
