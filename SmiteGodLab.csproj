@@ -8,12 +8,18 @@
     <Nullable>disable</Nullable>
     <AssemblyName>SmiteInspector</AssemblyName>
     <RootNamespace>SmiteGodLab</RootNamespace>
-    <Version>0.4.0</Version>
+    <Version>1.0.0</Version>
     <Product>Smite 1 Inspector</Product>
     <!-- Publish hints; the build.bat passes these on the command line too. -->
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
   </PropertyGroup>
+
+  <!-- WebView2 (real Edge engine) — used ONLY by the optional SMITE-GURU encounters lookup, which loads the player's
+       public smite.guru match page (Cloudflare-gated, so a plain HttpClient can't) and reads its embedded match data. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4022.49" />
+  </ItemGroup>
 
   <!-- God->ability mapping + SDK-derived section/slot/type data travel inside the exe. -->
   <ItemGroup>
@@ -44,6 +50,14 @@
     </EmbeddedResource>
     <EmbeddedResource Include="assets\logos\*.png">
       <LogicalName>logo.%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+    <!-- Region flags for the profile meta row: assets\flags\<iso>.png -> flag.<iso>.png (baked in; no runtime network). -->
+    <EmbeddedResource Include="assets\flags\*.png">
+      <LogicalName>flag.%(Filename)%(Extension)</LogicalName>
+    </EmbeddedResource>
+    <!-- Ranked tier emblems for the ranked pills: assets\ranks\<tier>.png -> rank.<tier>.png (baked in; no runtime network). -->
+    <EmbeddedResource Include="assets\ranks\*.png">
+      <LogicalName>rank.%(Filename)%(Extension)</LogicalName>
     </EmbeddedResource>
   </ItemGroup>
 
