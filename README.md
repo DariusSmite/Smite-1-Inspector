@@ -1,10 +1,14 @@
 # SMITE 1 Inspector
 
-A native Windows desktop app (C# / WinForms, .NET 8) for **SMITE 1**. It pairs a live player/friend tracker built on the official Hi-Rez API with an offline editor for the game's god ability-tuning files, in a single portable, self-contained exe.
+A native Windows desktop app (C# / WinForms, .NET 8) for **SMITE 1**. It combines a live player/friend tracker built on the official Hi-Rez API, an offline editor for the game's god ability-tuning files, and **Whispers** — a standalone messenger that messages live players with the game completely closed. Ships as a single portable exe or a one-click installer.
 
 > SMITE 1 is in maintenance mode, but its servers and stats API are still up. This is an unofficial fan tool, see **Disclaimer** below.
 
 ## Screenshots
+
+Whispers — message live players with the game closed; messages send as in-game whispers and replies arrive in real time:
+
+![Whispers](screenshots/whispers.png)
 
 Player Tracker, showing a player's friends, sent requests, and blocked and hidden entries:
 
@@ -46,6 +50,19 @@ Your own curated buddy list with continuous, live status.
 - **Preview panel** per friend: in-game avatar (or a colored initial when none is set), platform, status, last seen, an Open-profile button, a View-current-game button when they're in a match, and a **private Notes** box.
 - Self-throttles to stay well under the API's daily request limit.
 
+### Whispers
+
+Message live SMITE players while the game is completely **closed**. Whispers connects to SMITE's own chat service — the same backend the in-game whisper window uses — so your messages arrive as ordinary in-game whispers and replies appear here in real time.
+
+- **No SMITE install required** — the networking components it needs are bundled with the app.
+- **Steam or Hi-Rez login** — sign in with your running Steam session, or with your Hi-Rez account name and password directly (which avoids showing "playing SMITE" on Steam). Saved passwords are encrypted with Windows' own per-user encryption (DPAPI) and are never stored in plain text.
+- **Instant offline feedback** (like in-game), **queued messages** you can cancel before they send, and a searchable **friend picker**.
+- **Pin** and **soft-delete** conversations — deleting keeps the history and restores it the moment that person messages you again.
+- **Presence** — see who's online without launching the game.
+- **Export Logs** — a one-click diagnostics zip for troubleshooting, which never includes your password or saved conversation history.
+
+> The SMITE game must be **closed** while you whisper (one account can't be signed in to chat twice). See **Whispers requirements** under [Install](#install).
+
 ### Hidden players
 
 The privacy flag hides a player's name and ids, but a match row still leaks their clan, level, total mastery, gods played, and premade party-mates.
@@ -67,7 +84,21 @@ An in-depth, in-app guide to every feature and how it works, with an expandable 
 
 ### Settings
 
-Choose the startup tab and time format, and clear saved data (recents, favorites, hidden tags, friend list).
+Choose the startup tab and time format, opt in to **beta** (pre-release) updates, clear saved data (recents, favorites, hidden tags, friend list), or **uninstall** the app (optionally erasing your saved data).
+
+## Install
+
+**Easiest (recommended for most people):** download **`SmiteInspector-Setup-x.y.z.exe`** from the latest [Release](../../releases), run it, and follow the prompts. It installs the app, creates shortcuts, sets up seamless in-place updates, and installs the WebView2 runtime if it's missing. (Windows SmartScreen may warn on first run since the app is unsigned — click *More info → Run anyway*.)
+
+**Portable:** download **`SmiteInspector.exe`** from the same release and run it directly — it's self-contained, no install needed.
+
+### Whispers requirements
+
+The stats tools (Player Tracker, Friend List, God Inspector, Codex) need only an internet connection. **Whispers** additionally needs:
+
+- The SMITE game **closed** while you whisper (one account can't be signed in to chat twice).
+- **Steam** running and signed in to your SMITE account — *or* the in-app **Hi-Rez login** (Whispers → Options).
+- **No separate SMITE installation** — the networking components Whispers uses are bundled with the app.
 
 ## Build
 
@@ -84,7 +115,7 @@ dotnet publish -c Release -r win-x64 --self-contained true ^
   -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
 ```
 
-The result is `bin\Release\net8.0-windows\win-x64\publish\SmiteInspector.exe`. `build.bat` runs the same publish. Prebuilt exes are attached to each [Release](../../releases).
+The result is `bin\Release\net8.0-windows\win-x64\publish\SmiteInspector.exe`. `build.bat` runs the same publish. Prebuilt exes and the installer are attached to each [Release](../../releases). (Whispers also needs its chat engine in a `whisper\` folder next to the exe; the prebuilt Releases bundle it.)
 
 ## API key (Player Tracker)
 
@@ -100,7 +131,7 @@ Put it next to the exe, or in `Documents\Smite Inspector\`. The app prefers `api
 
 ## Where data lives
 
-All your data (favorites, friend list and per-friend notes, recents, settings, hidden-player nicknames, and god default snapshots) is stored as plain JSON in `Documents\Smite Inspector\`, so a shared copy of the app in a read-only folder still works. Nothing is uploaded anywhere; the only network traffic is to the Hi-Rez API, and only for the stats you request.
+All your data (favorites, friend list and per-friend notes, recents, settings, hidden-player nicknames, your Whispers conversations, and god default snapshots) is stored as plain JSON in `Documents\Smite Inspector\`, so a shared copy of the app in a read-only folder still works. Nothing is uploaded anywhere; the only network traffic is to the Hi-Rez API and SMITE's chat service, and only when you ask.
 
 ## Disclaimer
 
