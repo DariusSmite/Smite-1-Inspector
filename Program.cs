@@ -590,6 +590,7 @@ namespace SmiteGodLab
             public Dictionary<string, int> NeighborCounts { get; set; } = new();   // named SAME-TEAM co-players -> times co-occurred (weak; trusted only after repeats)
             public Dictionary<string, int> RankTier { get; set; } = new();   // queue (Conquest/Joust/Duel) -> ranked tier 1-27 (latest seen). SURVIVES the privacy flag in completed matches.
             public Dictionary<string, int> RankMmr { get; set; } = new();    // queue -> MMR (Rank_Stat, rounded). A near-unique per-account number → the most DISCRIMINATING fingerprint signal available.
+            public string PortalUserId { get; set; } = "";               // platform-specific user ID (Steam64 ID for Portal=5, Epic account for 9, etc.) — UNIQUE per player, never changes, survives privacy in MCTS responses
             public string LastSeen { get; set; } = "";
             public int Seen { get; set; }
         }
@@ -611,6 +612,7 @@ namespace SmiteGodLab
         static Dictionary<string, HashSet<string>> _byGod = new();
         static Dictionary<int, HashSet<string>> _byClan = new();
         static Dictionary<string, HashSet<string>> _byNeighbor = new();   // trusted same-team co-player -> entries (only edges that cleared NeighborTrust)
+        static Dictionary<string, string> _byPortal = new();               // PORTAL_USERID → entry.Id (1:1 — MCTS leaks this for hidden players; unique per account, never changes)
         static bool _dirty;
         static DateTime _lastSave = DateTime.MinValue;
 
@@ -624,6 +626,21 @@ namespace SmiteGodLab
         public static int LiveCount { get { lock (_lock) return _live.Count; } }
         // Resolve a learned player_id → its known name (for showing a hidden tag's party-mate ids as names). Null if unknown.
         public static string NameById(string id) { if (string.IsNullOrEmpty(id)) return null; lock (_lock) return _byId.TryGetValue(id, out var e) ? e.Name : null; }
+
+        // Record a platform id ↔ account id link WITHOUT a name. Used when getplayeridbyportaluserid recovers a hidden
+        // player's real player_id but the account is private + un-indexed (no name anywhere). Persisting the link means
+        // that if the id ever gets a name (harvester, a later match, manual tag), the PORTAL_USERID resolves instantly.
+        public static void LinkPortal(string id, string portalUserId)
+        {
+            if (string.IsNullOrEmpty(id) || id == "0" || string.IsNullOrEmpty(portalUserId)) return;
+            lock (_lock)
+            {
+                if (!_byId.TryGetValue(id, out var e)) { e = new Entry { Id = id, Seen = 0, Name = "" }; _byId[id] = e; }
+                if (string.IsNullOrEmpty(e.PortalUserId)) e.PortalUserId = portalUserId;
+                _byPortal[portalUserId] = id;
+                _dirty = true;
+            }
+        }
 
         [System.Runtime.InteropServices.DllImport("kernel32.dll")] static extern bool GetPhysicallyInstalledSystemMemory(out long totalMemoryInKilobytes);
         static int MaxEntriesForRam()
@@ -640,8 +657,9 @@ namespace SmiteGodLab
             if (e.ClanId != 0) { if (!_byClan.TryGetValue(e.ClanId, out var sc)) _byClan[e.ClanId] = sc = new(); sc.Add(e.Id); }
             foreach (var c in e.Companions) Idx(_byCompanion, c, e.Id);
             foreach (var kv in e.NeighborCounts) if (kv.Value >= NeighborTrust) Idx(_byNeighbor, kv.Key, e.Id);   // only trusted edges
+            if (!string.IsNullOrEmpty(e.PortalUserId)) _byPortal[e.PortalUserId] = e.Id;
         }
-        static void RebuildIndexes() { _byCompanion = new(); _byGod = new(); _byClan = new(); _byNeighbor = new(); foreach (var e in _byId.Values) IndexEntry(e); }
+        static void RebuildIndexes() { _byCompanion = new(); _byGod = new(); _byClan = new(); _byNeighbor = new(); _byPortal = new(); foreach (var e in _byId.Values) IndexEntry(e); }
         // Inverse document frequency of a party-mate: a teammate that partners with MANY distinct players (a popular pub
         // or a streamer) carries little identity; a rare 2-3 stack partner pins hard. df = how many entries list them.
         static double Idf(string companionId) { int n = Math.Max(2, _byId.Count); int df = (_byCompanion.TryGetValue(companionId, out var s) ? s.Count : 0) + 1; return Math.Log((double)(n + 1) / df); }
@@ -660,7 +678,7 @@ namespace SmiteGodLab
                 var p = TryRead(DbFile) ?? TryRead(BakFile);   // fall back to the backup if the main file is missing/corrupt
                 if (p != null)
                 {
-                    if (p.Players != null) foreach (var e in p.Players) if (e != null && !string.IsNullOrEmpty(e.Id)) { e.GodMastery ??= new(); e.GodSkin ??= new(); e.Companions ??= new(); e.NeighborCounts ??= new(); e.RankTier ??= new(); e.RankMmr ??= new(); _byId[e.Id] = e; }
+                    if (p.Players != null) foreach (var e in p.Players) if (e != null && !string.IsNullOrEmpty(e.Id)) { e.GodMastery ??= new(); e.GodSkin ??= new(); e.Companions ??= new(); e.NeighborCounts ??= new(); e.RankTier ??= new(); e.RankMmr ??= new(); e.PortalUserId ??= ""; _byId[e.Id] = e; }
                     if (p.Live != null) _live = p.Live;
                 }
                 RebuildIndexes();
@@ -683,7 +701,7 @@ namespace SmiteGodLab
                 // Save no longer freezes the UI thread's Resolve()/Learn() while a large DB serializes + hits disk.
                 p = new Persist
                 {
-                    Players = _byId.Values.Select(e => new Entry { Id = e.Id, Name = e.Name, Portal = e.Portal, ClanId = e.ClanId, Clan = e.Clan, Level = e.Level, GodMastery = new Dictionary<string, int>(e.GodMastery), GodSkin = new Dictionary<string, string>(e.GodSkin), Companions = new List<string>(e.Companions), NeighborCounts = new Dictionary<string, int>(e.NeighborCounts), RankTier = new Dictionary<string, int>(e.RankTier), RankMmr = new Dictionary<string, int>(e.RankMmr), LastSeen = e.LastSeen, Seen = e.Seen }).ToList(),
+                    Players = _byId.Values.Select(e => new Entry { Id = e.Id, Name = e.Name, Portal = e.Portal, ClanId = e.ClanId, Clan = e.Clan, Level = e.Level, GodMastery = new Dictionary<string, int>(e.GodMastery), GodSkin = new Dictionary<string, string>(e.GodSkin), Companions = new List<string>(e.Companions), NeighborCounts = new Dictionary<string, int>(e.NeighborCounts), RankTier = new Dictionary<string, int>(e.RankTier), RankMmr = new Dictionary<string, int>(e.RankMmr), PortalUserId = e.PortalUserId, LastSeen = e.LastSeen, Seen = e.Seen }).ToList(),
                     Live = _live.ToDictionary(kv => kv.Key, kv => new LiveCap { At = kv.Value.At, ByGod = new Dictionary<string, string>(kv.Value.ByGod) }),
                 };
                 _dirty = false; _lastSave = DateTime.UtcNow;
@@ -708,6 +726,7 @@ namespace SmiteGodLab
                     if (_byClan.TryGetValue(e.ClanId, out var sc)) sc.Remove(id);
                     foreach (var c in e.Companions) if (_byCompanion.TryGetValue(c, out var s2)) s2.Remove(id);
                     foreach (var kv in e.NeighborCounts) if (_byNeighbor.TryGetValue(kv.Key, out var s3)) s3.Remove(id);
+                    if (!string.IsNullOrEmpty(e.PortalUserId)) _byPortal.Remove(e.PortalUserId);
                 }
                 _byId.Remove(id);
             }
@@ -722,12 +741,12 @@ namespace SmiteGodLab
 
         public static void Clear()
         {
-            lock (_lock) { _byId = new(); _live = new(); _byCompanion = new(); _byGod = new(); _byClan = new(); _byNeighbor = new(); _dirty = true; }
+            lock (_lock) { _byId = new(); _live = new(); _byCompanion = new(); _byGod = new(); _byClan = new(); _byNeighbor = new(); _byPortal = new(); _dirty = true; }
             Save(true);
         }
 
         // Record a VISIBLE player. god/mastery are optional (0/"" when learning from a profile/friend rather than a match row).
-        public static void Learn(string id, string name, int portal, int clanId, string clan, int level, string god, int godMastery, IEnumerable<string> companions = null, IEnumerable<string> neighbors = null, string skinId = null, IEnumerable<(string queue, int tier, int mmr)> ranked = null)
+        public static void Learn(string id, string name, int portal, int clanId, string clan, int level, string god, int godMastery, IEnumerable<string> companions = null, IEnumerable<string> neighbors = null, string skinId = null, IEnumerable<(string queue, int tier, int mmr)> ranked = null, string portalUserId = null)
         {
             if (string.IsNullOrEmpty(id) || id == "0" || string.IsNullOrEmpty(name)) return;
             lock (_lock)
@@ -735,6 +754,7 @@ namespace SmiteGodLab
                 if (!_byId.TryGetValue(id, out var e)) { e = new Entry { Id = id, Seen = 0 }; _byId[id] = e; }
                 e.Name = name;
                 if (portal != 0) e.Portal = portal;
+                if (!string.IsNullOrEmpty(portalUserId)) { e.PortalUserId = portalUserId; _byPortal[portalUserId] = e.Id; }
                 if (clanId != 0) { if (e.ClanId != 0 && e.ClanId != clanId && _byClan.TryGetValue(e.ClanId, out var oldClanSet)) oldClanSet.Remove(e.Id); e.ClanId = clanId; if (!string.IsNullOrEmpty(clan)) e.Clan = clan; }   // purge stale _byClan posting on a clan change
                 if (level > e.Level) e.Level = level;
                 if (!string.IsNullOrEmpty(god) && godMastery > 0)
@@ -813,6 +833,17 @@ namespace SmiteGodLab
                 }
                 return null;
             }
+        }
+
+        public static (string name, string id) ResolveByPortal(string portalUserId)
+        {
+            if (string.IsNullOrEmpty(portalUserId)) return (null, null);
+            lock (_lock)
+            {
+                if (_byPortal.TryGetValue(portalUserId, out var eid) && _byId.TryGetValue(eid, out var e))
+                    return (e.Name, e.Id);
+            }
+            return (null, null);
         }
 
         // Honest, CORROBORATION-GATED reveal. A privacy-hidden record carries no identifier, so a name can only ever be
@@ -924,6 +955,224 @@ namespace SmiteGodLab
                 int conf = (int)Math.Min(95, 30 + ranked[0].Value / 3);
                 return (ranked[0].Key, nameId[ranked[0].Key], conf);
             }
+        }
+    }
+
+    static class MctsPortal
+    {
+        public class MatchPlayer
+        {
+            public int TaskForce { get; set; }
+            public int Kills { get; set; }
+            public int Deaths { get; set; }
+            public int Assists { get; set; }
+            public int Mastery { get; set; }
+            public int Level { get; set; }
+            public int PortalId { get; set; }
+            public string PortalUserId { get; set; } = "";
+            public string PlayerName { get; set; } = "";
+            public string PlayerId { get; set; } = "";
+            public int ClanId { get; set; }
+            public string ClanName { get; set; } = "";
+            public int Gold { get; set; }
+            public bool Privacy { get; set; }
+        }
+        class Persist { public Dictionary<string, List<MatchPlayer>> Matches { get; set; } = new(); }
+        static Dictionary<string, List<MatchPlayer>> _matches = new();
+        static readonly object _lock = new();
+        static string CacheFile => Path.Combine(Theme.DataDir, "mcts_portal.json");
+
+        public static void Load()
+        {
+            lock (_lock)
+            {
+                try { if (File.Exists(CacheFile)) { var p = JsonSerializer.Deserialize<Persist>(File.ReadAllText(CacheFile)); _matches = p?.Matches ?? new(); } }
+                catch { _matches = new(); }
+            }
+        }
+        public static void Save()
+        {
+            Persist p; lock (_lock) { p = new Persist { Matches = new(_matches) }; }
+            try { File.WriteAllText(CacheFile, JsonSerializer.Serialize(p)); } catch { }
+        }
+        public static int MatchCount { get { lock (_lock) return _matches.Count; } }
+
+        public static int AutoImport()
+        {
+            int total = 0;
+            try
+            {
+                var dir = Theme.DataDir;
+                if (!Directory.Exists(dir)) return 0;
+                foreach (var f in Directory.GetFiles(dir, "mcts_import*.txt"))
+                {
+                    int n = ImportProbeFile(f);
+                    if (n > 0) { total += n; try { File.Move(f, f + ".imported", true); } catch { } }
+                }
+            }
+            catch { }
+            if (total > 0) Save();
+            return total;
+        }
+
+        public static int ImportProbeFile(string path)
+        {
+            if (!File.Exists(path)) return 0;
+            var lines = File.ReadAllLines(path);
+            int imported = 0;
+            int i = 0;
+            while (i < lines.Length)
+            {
+                if (!lines[i].Contains("REQUEST_MATCH_DETAILS")) { i++; continue; }
+                i++;
+                string matchId = null;
+                var players = new List<MatchPlayer>();
+                while (i < lines.Length && !lines[i].StartsWith("===") && !lines[i].StartsWith("}"))
+                {
+                    string line = lines[i].Trim().TrimEnd('|');
+                    if (line.StartsWith("MAP_INSTANCE_ID"))
+                    {
+                        var val = ExtractVal(line);
+                        matchId = ParseMctsVal(val);
+                    }
+                    if (line.StartsWith("Row Dump") && matchId != null)
+                    {
+                        var pl = ParsePlayerBlock(lines, ref i);
+                        if (pl != null) players.Add(pl);
+                        continue;
+                    }
+                    i++;
+                }
+                if (matchId != null && players.Count > 0)
+                {
+                    lock (_lock) { _matches[matchId] = players; }
+                    imported++;
+                    if (NameDb.Enabled) foreach (var pl in players.Where(p => !p.Privacy && !string.IsNullOrEmpty(p.PlayerName) && !string.IsNullOrEmpty(p.PlayerId) && p.PlayerId != "0" && !string.IsNullOrEmpty(p.PortalUserId)))
+                        NameDb.Learn(pl.PlayerId, pl.PlayerName, pl.PortalId, pl.ClanId, pl.ClanName, pl.Level, "", pl.Mastery, portalUserId: pl.PortalUserId);
+                }
+                i++;
+            }
+            return imported;
+        }
+
+        static MatchPlayer ParsePlayerBlock(string[] lines, ref int i)
+        {
+            i++;
+            var pl = new MatchPlayer();
+            bool hasData = false;
+            while (i < lines.Length)
+            {
+                string line = lines[i].Trim().TrimEnd('|');
+                if (line.StartsWith("---") || line.StartsWith("Row Dump") || line.StartsWith("===") || line.StartsWith("}")) break;
+                if (line.Contains(" = "))
+                {
+                    int eq = line.IndexOf(" = ");
+                    string key = line.Substring(0, eq).Trim();
+                    string val = line.Substring(eq + 3).Trim();
+                    switch (key)
+                    {
+                        case "PLAYER_NAME": pl.PlayerName = val; break;
+                        case "PLAYER_ID": pl.PlayerId = ParseMctsVal(val); break;
+                        case "PORTAL_ID": if (int.TryParse(val, out var pid)) pl.PortalId = pid; break;
+                        case "PORTAL_USERID": pl.PortalUserId = val; break;
+                        case "TASK_FORCE": if (int.TryParse(val, out var tf)) pl.TaskForce = tf; break;
+                        case "KILLS_PLAYER": if (int.TryParse(val, out var k)) pl.Kills = k; break;
+                        case "DEATHS": if (int.TryParse(val, out var d)) pl.Deaths = d; break;
+                        case "ASSISTS": if (int.TryParse(val, out var a)) pl.Assists = a; break;
+                        case "MASTERY_LEVEL": if (int.TryParse(val, out var m)) pl.Mastery = m; break;
+                        case "GOLD_EARNED": if (int.TryParse(val, out var g)) pl.Gold = g; break;
+                        case "PRIVACY_FLAG": pl.Privacy = val == "1"; break;
+                        case "CLAN_ID": var cv = ParseMctsVal(val); if (int.TryParse(cv, out var ci)) pl.ClanId = ci; break;
+                        case "CLAN_NAME": pl.ClanName = val; break;
+                        case "DATA_SET": break;
+                        case "SUCCESS": break;
+                        default: break;
+                    }
+                    hasData = true;
+                }
+                i++;
+            }
+            return hasData && pl.TaskForce > 0 ? pl : null;
+        }
+
+        static string ParseMctsVal(string v)
+        {
+            if (string.IsNullOrEmpty(v)) return "";
+            int colon = v.LastIndexOf(':');
+            return colon >= 0 ? v.Substring(colon + 1) : v;
+        }
+        static string ExtractVal(string line)
+        {
+            int eq = line.IndexOf(" = ");
+            return eq >= 0 ? line.Substring(eq + 3).Trim() : "";
+        }
+
+        public static MatchPlayer FindPlayer(string matchId, int taskForce, int kills, int deaths, int assists)
+        {
+            lock (_lock)
+            {
+                if (!_matches.TryGetValue(matchId, out var players)) return null;
+                return players.FirstOrDefault(p => p.TaskForce == taskForce && p.Kills == kills && p.Deaths == deaths && p.Assists == assists);
+            }
+        }
+
+        public static bool HasMatch(string matchId) { lock (_lock) return _matches.ContainsKey(matchId); }
+
+        public static async Task<bool> QueryLive(string matchId, string relayDir, int timeoutMs = 5000)
+        {
+            if (HasMatch(matchId)) return true;
+            string cmdFile = Path.Combine(relayDir, "probe_cmd.txt");
+            string respFile = Path.Combine(relayDir, "probe_responses.txt");
+            long baseline = 0;
+            try { if (File.Exists(respFile)) baseline = new FileInfo(respFile).Length; } catch { }
+            try { File.WriteAllText(cmdFile, $"FC5F3FE1 685:u={matchId}\n"); } catch { return false; }
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < timeoutMs)
+            {
+                await Task.Delay(200);
+                try
+                {
+                    if (!File.Exists(respFile)) continue;
+                    var fi = new FileInfo(respFile);
+                    if (fi.Length <= baseline) continue;
+                    using var fs = new FileStream(respFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    fs.Seek(baseline, SeekOrigin.Begin);
+                    using var sr = new StreamReader(fs, Encoding.UTF8);
+                    string tail = sr.ReadToEnd();
+                    if (!tail.Contains("REQUEST_MATCH_DETAILS")) continue;
+                    var lines = tail.Split(new[] { '\r', '\n' }, StringSplitOptions.None);
+                    int i = 0;
+                    while (i < lines.Length)
+                    {
+                        if (!lines[i].Contains("REQUEST_MATCH_DETAILS")) { i++; continue; }
+                        i++;
+                        string mid = null;
+                        var players = new List<MatchPlayer>();
+                        while (i < lines.Length && !lines[i].StartsWith("===") && !lines[i].StartsWith("}"))
+                        {
+                            string line = lines[i].Trim().TrimEnd('|');
+                            if (line.StartsWith("MAP_INSTANCE_ID")) { mid = ParseMctsVal(ExtractVal(line)); }
+                            if (line.StartsWith("Row Dump") && mid != null)
+                            {
+                                var pl = ParsePlayerBlock(lines, ref i);
+                                if (pl != null) players.Add(pl);
+                                continue;
+                            }
+                            i++;
+                        }
+                        if (mid != null && players.Count > 0)
+                        {
+                            lock (_lock) { _matches[mid] = players; }
+                            if (NameDb.Enabled) foreach (var pl in players.Where(p => !p.Privacy && !string.IsNullOrEmpty(p.PlayerName) && !string.IsNullOrEmpty(p.PlayerId) && p.PlayerId != "0" && !string.IsNullOrEmpty(p.PortalUserId)))
+                                NameDb.Learn(pl.PlayerId, pl.PlayerName, pl.PortalId, pl.ClanId, pl.ClanName, pl.Level, "", pl.Mastery, portalUserId: pl.PortalUserId);
+                            if (mid == matchId) { Save(); return true; }
+                        }
+                        i++;
+                    }
+                }
+                catch { }
+            }
+            return HasMatch(matchId);
         }
     }
 
@@ -2773,8 +3022,14 @@ namespace SmiteGodLab
             try { File.Delete(Path.Combine(_relay, "whisper_out.txt")); } catch { }
             try { File.Delete(Path.Combine(_relay, "whisper_in.txt")); } catch { }
             try { File.Delete(Path.Combine(_relay, "presence.tsv")); } catch { }
+            try { File.Delete(Path.Combine(_relay, "probe_cmd.txt")); } catch { }
+            try { File.Delete(Path.Combine(_relay, "probe_responses.txt")); } catch { }
             _presPos = 0;
             _inPos = 0;
+            // Fresh run, fresh grace period: a brand-new child's own normal pre-login "connected=False" chatter must
+            // NOT be mistaken for a lost-and-regained session (that gate is keyed on _everConnected, see OnLine()).
+            _everConnected = false;
+            _lastLineAt = DateTime.Now; _lastTrafficAt = DateTime.Now; _lastQueryAt = DateTime.MinValue;
             var psi = new System.Diagnostics.ProcessStartInfo
             {
                 FileName = _exe,
@@ -2787,7 +3042,7 @@ namespace SmiteGodLab
             e["ACFLAG"] = "1"; e["SENDID"] = "0"; e["CLIENTTYPE"] = "1";
             e["GAMETICKET"] = "0"; e["NORECON"] = "0"; e["PUMPPATCH"] = "0"; e["POLLFL"] = "1";
             e["MESSENGER"] = "1"; e["CHATCAP"] = "1"; e["FULLCONFIGS"] = "1"; e["DIAGFIELDS"] = "0"; e["STORELOG"] = "0";
-            e["CHATDIAG"] = "0";
+            e["CHATDIAG"] = "0"; e["PROBE"] = "1";
             e["KEEPSECS"] = "86400"; e["WHISPER_DIR"] = _relay; e["WHISPER_TO"] = "";
             if (_loginMode == "hirez")
             {
@@ -2821,14 +3076,31 @@ namespace SmiteGodLab
         readonly object _logLock = new object();
         public string RelayDir { get { return _relay; } }
         public string[] RecentLog() { lock (_logLock) { return _log.ToArray(); } }
+        volatile bool _everConnected;          // true once we've reached "connected" at least once this run
+        DateTime _lastLineAt = DateTime.Now;       // last time Probe5 produced ANY log output — catches a fully hung process
+        DateTime _lastTrafficAt = DateTime.Now;    // last time a REAL over-the-wire reply landed (whisper_in.txt / presence.tsv growth)
+        DateTime _lastQueryAt = DateTime.MinValue; // last time the UI asked us to poll presence — pairs with _lastTrafficAt below
         void OnLine(string line)
         {
             if (line == null) return;
+            _lastLineAt = DateTime.Now;
             lock (_logLock) { _log.Add(DateTime.Now.ToString("HH:mm:ss") + " " + line); if (_log.Count > 5000) _log.RemoveRange(0, _log.Count - 5000); }
             if (line.Contains("LOGGED IN & READY") || line.Contains("loggedOn=True")) SetState("connected");
+            // Probe5 logs its own "state: connected=False loggedOn=False ..." line whenever the chat session's
+            // IsConnected()/IsLoggedOn() flip false — e.g. the socket silently died after a long idle, a sleep/resume,
+            // or a network blip. We previously ignored this negative signal entirely, so a dead session stayed
+            // reported as "connected" forever. Only react to it AFTER we've connected once (the same text is normal
+            // and expected during the initial login handshake, before there's anything real to lose).
+            else if (_everConnected && line.Contains("connected=False")) SetState("disconnected");
             else if (line.Contains("FATAL") || line.Contains("EXCEPTION:")) SetState("stopped");
         }
-        void SetState(string s) { if (State == s) return; State = s; try { Status?.Invoke(s); } catch { } }
+        void SetState(string s)
+        {
+            if (State == s) return;
+            State = s;
+            if (s == "connected") _everConnected = true;
+            try { Status?.Invoke(s); } catch { }
+        }
 
         void Worker()
         {
@@ -2837,6 +3109,19 @@ namespace SmiteGodLab
             string presFile = Path.Combine(_relay, "presence.tsv");
             while (_run)
             {
+                // Watchdog #1: Probe5 logs something (at minimum a "[hb]" heartbeat) roughly every 3s while its tick
+                // loop is alive — connected or not, since the heartbeat isn't gated on real connectivity. Total
+                // silence for 45s while we still believe we're connected means the PROCESS itself wedged (e.g. a
+                // native call stuck across a sleep/resume).
+                if (State == "connected" && (DateTime.Now - _lastLineAt).TotalSeconds > 45) SetState("disconnected");
+                // Watchdog #2: Probe5's own IsConnected()/IsLoggedOn() flags can stay stuck reporting true even when
+                // the socket is dead at a layer the library never notices (e.g. a half-open connection the OS hasn't
+                // torn down) — so "[hb]" keeps logging and watchdog #1 above never trips either. The presence poll the
+                // UI already sends every 5 seconds is a genuine over-the-wire round trip: if we've been actively
+                // asking and getting NOTHING back for 90s, the link is dead regardless of what the library claims.
+                if (State == "connected" && _lastQueryAt != DateTime.MinValue
+                    && (DateTime.Now - _lastQueryAt).TotalSeconds < 30 && (DateTime.Now - _lastTrafficAt).TotalSeconds > 90)
+                    SetState("disconnected");
                 try
                 {
                     // Hold _outLock across the whole exists-check + write + dequeue so Cancel() can't interleave
@@ -2859,6 +3144,7 @@ namespace SmiteGodLab
                             if (fs.Length < _inPos) _inPos = 0;
                             if (fs.Length > _inPos)
                             {
+                                _lastTrafficAt = DateTime.Now;
                                 SetState("connected");   // any inbound traffic (whisper or send-confirmation) proves we're logged in
                                 fs.Seek(_inPos, SeekOrigin.Begin);
                                 using (var sr = new StreamReader(fs, Encoding.UTF8))
@@ -2886,6 +3172,7 @@ namespace SmiteGodLab
                             if (fs.Length < _presPos) _presPos = 0;
                             if (fs.Length > _presPos)
                             {
+                                _lastTrafficAt = DateTime.Now;
                                 SetState("connected");   // a presence reply also proves the backend is talking to us
                                 fs.Seek(_presPos, SeekOrigin.Begin);
                                 using (var sr = new StreamReader(fs, Encoding.UTF8))
@@ -2913,6 +3200,7 @@ namespace SmiteGodLab
                 var lines = new System.Collections.Generic.List<string>();
                 foreach (var n in names) if (!string.IsNullOrWhiteSpace(n) && !lines.Contains(n.Trim())) lines.Add(n.Trim());
                 if (lines.Count == 0) return;
+                _lastQueryAt = DateTime.Now;   // we ARE actively asking for a round trip now — feeds the dead-link watchdog above
                 File.WriteAllText(Path.Combine(_relay, "query_out.txt"), string.Join("\n", lines), new UTF8Encoding(false));
             }
             catch { }
@@ -2957,6 +3245,10 @@ namespace SmiteGodLab
         {
             _run = false;
             try { if (_proc != null && !_proc.HasExited) _proc.Kill(); } catch { }
+            // Wait for the Worker loop to actually exit before returning. Without this, an immediate Start() (the
+            // normal auto-reconnect path) can reset _inPos/_presPos/relay files and spin up a NEW Worker thread while
+            // the OLD one is still mid-iteration on this same instance's shared fields — a real, if narrow, race.
+            try { _worker?.Join(2000); } catch { }
             SetState("stopped");
         }
     }
@@ -3011,6 +3303,10 @@ namespace SmiteGodLab
         Action _wsOnShow;                            // entering the Whispers tab: ensure the engine is started
         Action _wsAutoStart;                          // app startup: connect the engine in the background IF that option is on
         Action<string, string> _openWhisper;         // open/create a conversation with (player name, player id) — id may be "" for typed names
+        Func<bool> _mctsConnected;                   // returns true if the MCTS engine is logged in and running
+        string _mctsRelayDir;                         // relay directory for probe commands/responses
+        Func<int, Task<bool>> _mctsEnsureConnected;  // start engine if needed, wait up to N ms for connection
+        Action _mctsPreconnect;                       // start MCTS engine at app startup for hidden player reveal
         Action _codexJumpReveal;   // set by BuildCodexPanel; scrolls the Codex to the hidden-player-reveal section (Settings link)
         SmiteGuru _sguru;          // lazily-created SmiteGuru fetcher (Encounters tab); holds the hidden WebView2
         System.Threading.CancellationTokenSource _archiveCts;   // SMITE_ARCHIVE bulk crawl → canceled on FormClosed
@@ -3371,6 +3667,7 @@ namespace SmiteGodLab
             try { SetWindowTheme(trackSuggest.Handle, "DarkMode_Explorer", null); } catch { }
             CleanupOldExe();   // clear the renamed-aside exe a previous update left behind
             BeginInvoke(new Action(() => { try { _wsAutoStart?.Invoke(); } catch { } }));   // optional: pre-connect the Whispers engine
+            BeginInvoke(new Action(() => { try { _mctsPreconnect?.Invoke(); } catch { } }));   // pre-connect MCTS for hidden player reveal
             if (settings.CheckUpdates && !_updateChecked) { _updateChecked = true; BeginInvoke(new Action(async () => await CheckForUpdate(false))); }
             // Test hook (no-op in production): open a scoreboard directly so verification can screenshot the reveal.
             var tmid = Environment.GetEnvironmentVariable("SMITE_TEST_MATCHID");
@@ -5034,8 +5331,11 @@ namespace SmiteGodLab
                + "- It depends on Hi-Rez's chat servers staying online; if\n"
                + "  Hi-Rez retires them, Whispers stops working.");
 
+            H3("Staying connected — and recovering automatically");
+            P("A chat connection left open for a long time (a sleeping laptop, a network blip, an idle stretch of hours) can silently die without either side sending a clean close — the app would otherwise keep showing \"connected\" with no real link underneath, which used to surface as messages wrongly blamed on SMITE's spam filter and everyone in the list looking offline. Whispers actively watches for this: it notices when the chat session reports itself dead, or when the engine goes quiet for too long, and shows \"connection lost — reconnecting…\" while it automatically restarts the link — no need to reopen the tab or relaunch the app. A message caught mid-drop is queued and resent the moment it's back, and presence stops claiming anyone is online or offline until a fresh read actually comes in.");
+
             H3("Known issues (beta)");
-            P("Whispers is the newest and most experimental feature and ships as a beta. Known rough edges: the first connection after launch can be slow or, rarely, fail and need a reconnect (reopen the tab); on a flaky network the engine may drop and re-establish the chat link, briefly showing \"connecting\"; presence can lag a few seconds behind reality; and because delivery is inferred rather than confirmed by the server, a message shown as sent may in rare cases not have been routed. If something misbehaves, use Export Logs on the Whispers tab and share the zip. It never includes your password or your saved conversation history, but the diagnostic logs can contain recent whisper text and your Hi-Rez username — so only share it with someone you trust to help.");
+            P("Whispers is the newest and most experimental feature and ships as a beta. Known rough edges: the first connection after launch can be slow or, rarely, fail and need a reconnect (reopen the tab); a long-dropped connection takes a few seconds to detect and a moment to auto-reconnect, during which sends are held rather than lost; presence can lag a few seconds behind reality; and because delivery is inferred rather than confirmed by the server, a message shown as sent may in rare cases not have been routed. If something misbehaves, use Export Logs on the Whispers tab and share the zip. It never includes your password or your saved conversation history, but the diagnostic logs can contain recent whisper text and your Hi-Rez username — so only share it with someone you trust to help.");
 
             H2("The Hi-Rez API");
             H3("Request signing");
@@ -5230,7 +5530,7 @@ namespace SmiteGodLab
             {
                 var st = GameLog.Status();
                 if (lblLog != null) { lblLog.Text = st.detail; lblLog.ForeColor = st.found ? Theme.Green : Theme.Yellow; }
-                if (lblCounts != null) lblCounts.Text = "Learned names: " + NameDb.PlayerCount.ToString("N0") + "   ·   live rosters cached: " + NameDb.LiveCount.ToString("N0");
+                if (lblCounts != null) lblCounts.Text = "Learned names: " + NameDb.PlayerCount.ToString("N0") + "   ·   live rosters cached: " + NameDb.LiveCount.ToString("N0") + (MctsPortal.MatchCount > 0 ? "   ·   MCTS matches: " + MctsPortal.MatchCount : "");
                 if (lblHarv != null) { bool run = _harvestCts != null; lblHarv.Text = run ? "✓ Harvester running — growing the name DB from live rosters" : (settings.Harvest && settings.RevealHidden ? "Harvester is enabled but not running — toggle it off and on" : "Harvester off"); lblHarv.ForeColor = run ? Theme.Green : Theme.Dim; }
             }
 
@@ -5265,6 +5565,17 @@ namespace SmiteGodLab
                 NameDb.Clear(); GameLog.Clear(); btnNuke.Text = "Wiped — fresh start"; btnClrDb.Text = "Clear learned names"; RefreshReveal();
             };
             Add(btnClrDb); Add(btnNuke); y += S(40);
+
+            var btnMcts = MkBtn("Import MCTS probe data…", 200, false); btnMcts.Location = new Point(S(2), y);
+            btnMcts.Click += (s, e) =>
+            {
+                using var ofd = new OpenFileDialog { Title = "Select MCTS probe response file", Filter = "Text files|*.txt|All files|*.*", InitialDirectory = Theme.DataDir };
+                if (ofd.ShowDialog(this) != DialogResult.OK) return;
+                int n = MctsPortal.ImportProbeFile(ofd.FileName);
+                if (n > 0) { MctsPortal.Save(); btnMcts.Text = $"Imported {n} match(es)"; RefreshReveal(); }
+                else btnMcts.Text = "No matches found in file";
+            };
+            Add(btnMcts); y += S(40);
 
             // link to the in-app Codex explanation of these three switches
             var lnkCodex = new Label { Text = "▸  How these three switches work — open the Codex", AutoSize = true, ForeColor = Theme.Blue, Font = Theme.F(9f, FontStyle.Underline | FontStyle.Bold), Location = new Point(S(2), y), Cursor = Cursors.Hand, BackColor = Theme.Bg };
@@ -5446,6 +5757,10 @@ namespace SmiteGodLab
                 if (st == "connected") { blink.Stop(); dot.BackColor = Theme.Green; statusLbl.Text = "connected"; statusLbl.ForeColor = Theme.Green; return; }
                 int n = QueuedCount();
                 if (st == "connecting") { statusLbl.ForeColor = Theme.Accent; if (!blink.Enabled) blink.Start(); statusLbl.Text = n > 0 ? "connecting… (" + n + " queued)" : "connecting…"; }
+                // "disconnected" = we WERE connected and silently lost it (dead socket, sleep/resume, hung process) —
+                // distinct from "stopped" (never started / explicitly stopped). Read as urgent + actively recovering,
+                // since the engine auto-reconnects on this signal (see engine.Status wiring below).
+                else if (st == "disconnected") { statusLbl.ForeColor = Theme.AccentHi; if (!blink.Enabled) blink.Start(); statusLbl.Text = n > 0 ? "connection lost — reconnecting… (" + n + " queued)" : "connection lost — reconnecting…"; }
                 else { blink.Stop(); dot.BackColor = Color.FromArgb(120, 50, 50); statusLbl.ForeColor = Theme.Dim; statusLbl.Text = n > 0 ? "disconnected (" + n + " queued)" : "disconnected"; }
             }
 
@@ -5509,9 +5824,13 @@ namespace SmiteGodLab
             // token 780) which works for ANY player cross-platform; else "active X ago" / unknown.
             (int code, string txt, Color col) PresenceDisplay(string key)
             {
+                // Presence polls can only be arriving while we're actually connected. If the link silently died, any
+                // "fresh" qstatus entry is leftover from right before the drop, not a live read — trusting it would
+                // misreport someone as confidently Online/Offline when really we just stopped hearing from the server.
+                bool live = engine != null && engine.State == "connected";
                 bool hasQ = qstatus.TryGetValue(key, out var q);
                 bool hasS = lastSeen.TryGetValue(key, out var seen);
-                bool qFresh = hasQ && (DateTime.Now - q.when).TotalSeconds < 60;   // live backend status (polled every 5s)
+                bool qFresh = live && hasQ && (DateTime.Now - q.when).TotalSeconds < 60;   // live backend status (polled every 5s)
                 bool sFresh = hasS && (DateTime.Now - seen).TotalSeconds < 60;     // they messaged us very recently
                 if (qFresh)
                 {
@@ -5818,23 +6137,82 @@ namespace SmiteGodLab
                 if (any) { SaveConvs(); if (activeKey != null) RenderThread(activeKey); RenderConvList(true); }
             }
 
+            // Auto-recovery from a silently dropped connection ("disconnected" — see WhisperEngine's connected=False /
+            // hang-watchdog detection). The chat session can't heal itself reliably (the lib's own reconnect path is
+            // the very thing Probe5 has to fight off during login — see its pump-patch comments), so we cycle the
+            // whole engine: a fresh Probe5 process re-logs in cleanly. Backs off on repeated failures so a genuinely
+            // offline network doesn't spin in a tight restart loop; resets the moment we're connected again.
+            int reconnectAttempts = 0;
+            System.Windows.Forms.Timer reconnectTimer = null;
+            // Drop any pending auto-reconnect and reset its backoff. Called whenever we reach a genuinely healthy
+            // "connected" state, or whenever something ELSE already restarted the engine (a manual login-settings
+            // change) — otherwise a stale scheduled restart fires later and disrupts an already-fine connection.
+            void CancelPendingReconnect() { reconnectTimer?.Stop(); reconnectTimer?.Dispose(); reconnectTimer = null; reconnectAttempts = 0; }
+            void ScheduleReconnect()
+            {
+                if (engine == null) return;
+                if (reconnectTimer != null) return;   // already scheduled — a duplicate "disconnected" raise for the same outage must not double the backoff
+                // SMITE open on the same Steam account is the one disconnect cause a restart can NEVER fix (the
+                // server will just close the fresh login again); don't churn the engine while that's true. Reopening
+                // the tab / app already re-attempts the connection once the conflict clears.
+                if (_gameOpen) return;
+                int attempt = reconnectAttempts++;
+                int delayMs = Math.Min(2000 * (int)Math.Pow(2, Math.Min(attempt, 4)), 30000);   // 2s,4s,8s,16s,30s cap
+                reconnectTimer = new System.Windows.Forms.Timer { Interval = delayMs };
+                reconnectTimer.Tick += (s, e) =>
+                {
+                    reconnectTimer.Stop(); reconnectTimer.Dispose(); reconnectTimer = null;
+                    if (engine == null || !LoginReady()) return;
+                    try { engine.Stop(); } catch { }
+                    ApplyLogin(); engine.Start();
+                };
+                reconnectTimer.Start();
+            }
+
             // ---- engine wiring (events arrive off-thread -> marshal to UI) ----
             void Ui(Action a) { try { if (IsHandleCreated) BeginInvoke(a); } catch { } }
             if (engine != null)
             {
-                engine.Status += st => Ui(() => { SetStatus(st); if (st == "connected") FlushQueued(); else RefreshConnLabel(); });
+                engine.Status += st => Ui(() =>
+                {
+                    SetStatus(st);
+                    if (st == "connected")
+                    {
+                        CancelPendingReconnect();
+                        FlushQueued();
+                        // Presence reads taken while disconnected are deliberately suppressed (see PresenceDisplay's
+                        // "live" gate) — force a fresh round so the conv list / open thread don't sit on a stale
+                        // "status unknown" display until the next 5s poll happens to land (FlushQueued only re-renders
+                        // when something was actually queued, which isn't true for the common "friend just idle" case).
+                        RenderConvList(true);
+                        if (activeKey != null) { var pd = PresenceDisplay(activeKey); ShowPresence(pd.code, pd.txt, pd.col); }
+                        QueryAllPresence();
+                    }
+                    else if (st == "disconnected") ScheduleReconnect();
+                    else RefreshConnLabel();
+                });
                 engine.Inbound += (sender, text) => Ui(() =>
                 {
                     if (!string.IsNullOrEmpty(sender) && sender[0] == (char)1)   // delivery confirmation, not a message
                     {
                         // NOTE: the server echoes ACCEPTED messages even for OFFLINE recipients (it queues them),
                         // so this confirms acceptance — NOT that the recipient is online. Do not infer presence.
-                        for (int i = pending.Count - 1; i >= 0; i--) if (pending[i].text == text) { pending.RemoveAt(i); break; }
+                        // The wire format carries no recipient/message id on this echo (just a timestamp + the literal
+                        // text), so matching is inherently text-based — but BOTH the pending-list entry and the WMsg we
+                        // clear must agree on which conversation, or a duplicate-text send to two people (or two rapid
+                        // identical sends to the same person) can clear the wrong one. Resolve the conversation ONCE
+                        // from the OLDEST matching pending entry (sends confirm in the order they left), then scope the
+                        // WMsg clear to that same conversation instead of searching every open conversation.
+                        int pi = -1;
+                        for (int i = 0; i < pending.Count; i++) if (pending[i].text == text) { pi = i; break; }   // oldest first
+                        string matchKey = pi >= 0 ? pending[pi].key : null;
+                        if (pi >= 0) pending.RemoveAt(pi);
                         // The server accepted it, so it definitely LEFT — clear any lingering "queued" marker on it
                         // (e.g. a reconnect meant the "connected" state event never fired to flush it).
                         bool cleared = false;
-                        foreach (var kv in convs) { foreach (var m in kv.Value.Msgs) if (m.Dir == "out" && m.St == "queued" && m.Text == text) { m.St = ""; cleared = true; break; } if (cleared) break; }
-                        if (cleared) { SaveConvs(); if (activeKey != null) RenderThread(activeKey); RenderConvList(true); RefreshConnLabel(); }
+                        if (matchKey != null && convs.TryGetValue(matchKey, out var mc))
+                            foreach (var m in mc.Msgs) if (m.Dir == "out" && m.St == "queued" && m.Text == text) { m.St = ""; cleared = true; break; }
+                        if (cleared) { SaveConvs(); if (activeKey == matchKey) RenderThread(matchKey); RenderConvList(true); RefreshConnLabel(); }
                         return;
                     }
                     string disp = string.IsNullOrWhiteSpace(sender) ? (activeKey != null ? convs[activeKey].Display : "?") : sender;
@@ -5904,9 +6282,21 @@ namespace SmiteGodLab
                     // message that just echoes late must NOT be mislabelled "rejected".
                     if ((now - pending[i].at).TotalSeconds < 6) continue;
                     var p = pending[i]; pending.RemoveAt(i);
+                    if (!convs.ContainsKey(p.key)) continue;
                     string snip = p.text.Length > 40 ? p.text.Substring(0, 39) + "…" : p.text;
-                    // No echo within the window ⇒ not accepted. Blame offline if we know they're offline, else spam.
-                    if (convs.ContainsKey(p.key))
+                    // The missing echo proves nothing about spam/offline if the LINK itself dropped mid-send — that's
+                    // not a rejection, just an unconfirmed send. Re-queue it (the engine auto-reconnects and
+                    // FlushQueued() resends once it's back) instead of misreporting "spam filter rejected it".
+                    if (engine == null || engine.State != "connected")
+                    {
+                        foreach (var m in convs[p.key].Msgs)
+                            if (m.Dir == "out" && m.St == "" && m.Text == p.text) { m.St = "queued"; break; }
+                        SaveConvs(); if (activeKey == p.key) RenderThread(p.key); RenderConvList(true); RefreshConnLabel();
+                        AddMsg(p.key, "sys", "\"" + snip + "\" connection dropped before this was confirmed — it'll resend automatically once reconnected.");
+                        continue;
+                    }
+                    // No echo within the window while still connected ⇒ genuinely not accepted. Blame offline if we
+                    // know they're offline, else spam.
                     {
                         bool offline = qstatus.TryGetValue(p.key, out var q) && (DateTime.Now - q.when).TotalSeconds < 90 && q.code == 0;
                         string reason = _gameOpen
@@ -6063,7 +6453,7 @@ namespace SmiteGodLab
                     SaveLogin(); ApplyLogin();
                     dlg.Close();
                     // Reconnect only if the login method/credentials actually changed.
-                    if (modeChanged) { try { if (engine != null && engine.Running) engine.Stop(); } catch { } SetStatus("stopped"); }
+                    if (modeChanged) { CancelPendingReconnect(); try { if (engine != null && engine.Running) engine.Stop(); } catch { } SetStatus("stopped"); }
                     if (root.Visible && engine != null && !engine.Running && LoginReady()) TryStartEngine();
                 };
                 dlg.Controls.Add(hdr); dlg.Controls.Add(rSteam); dlg.Controls.Add(rHirez);
@@ -6154,7 +6544,24 @@ namespace SmiteGodLab
             _wsOnShow = () => { _gameOpen = CheckGameOpen(); SetStatus(engine == null ? "stopped" : engine.State); if (engine != null && !engine.Running && LoginReady()) TryStartEngine(); RenderConvList(); QueryAllPresence(); };
             _wsAutoStart = () => { _gameOpen = CheckGameOpen(); if (loginAuto && engine != null && !engine.Running && LoginReady()) TryStartEngine(); SetStatus(engine == null ? "stopped" : engine.State); };
             _openWhisper = (name, id) => StartConvFromName(name, id);
-            this.FormClosing += (s, e) => { try { engine?.Stop(); } catch { } };
+            _mctsRelayDir = relayDir;
+            _mctsConnected = () => engine != null && engine.State == "connected";
+            _mctsEnsureConnected = async (timeoutMs) =>
+            {
+                if (engine != null && engine.State == "connected") return true;
+                if (engine != null && !engine.Running && LoginReady()) { ApplyLogin(); engine.Start(); }
+                if (engine == null || !engine.Running) return false;
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                while (sw.ElapsedMilliseconds < timeoutMs)
+                {
+                    if (engine.State == "connected") return true;
+                    if (engine.State == "stopped") return false;
+                    await Task.Delay(300);
+                }
+                return engine.State == "connected";
+            };
+            _mctsPreconnect = () => { if (engine != null && !engine.Running && LoginReady()) { ApplyLogin(); engine.Start(); } };
+            this.FormClosing += (s, e) => { try { reconnectTimer?.Stop(); reconnectTimer?.Dispose(); } catch { } try { engine?.Stop(); } catch { } };
 
             RenderConvList();
             return root;
@@ -6594,6 +7001,8 @@ namespace SmiteGodLab
             LoadFavs(); LoadHiddenTags(); LoadRecents();
             NameDb.Load(); NameDb.Enabled = settings.RevealHidden;   // experiment/reveal-hidden-names
             GodBoard.Load();   // god-leaderboard id-leak → smite.guru name cache (experiment 2026-06-25)
+            MctsPortal.Load();
+            { int n = MctsPortal.AutoImport(); if (n > 0) System.Diagnostics.Debug.WriteLine($"[MctsPortal] Auto-imported {n} match(es)"); }
             GameLog.Init(); GameLog.Enabled = settings.LogReveal;   // EXACT reveal from local game logs (combat log)
             if (settings.RevealHidden && settings.Harvest) StartHarvester();
             TagSync.Init(); TagSync.Enabled = settings.CommunityTags;   // crowdsourced shared tags
@@ -8477,7 +8886,7 @@ namespace SmiteGodLab
         static string AppVersionFromAssembly()
         {
             try { var v = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version; if (v != null && (v.Major + v.Minor + v.Build) > 0) return v.Major + "." + v.Minor + "." + v.Build; } catch { }
-            return "1.2.1";
+            return "1.2.2";
         }
         const string ReleasesApi = "https://api.github.com/repos/DariusSmite/Smite-1-Inspector/releases/latest";
         const string ReleasesListApi = "https://api.github.com/repos/DariusSmite/Smite-1-Inspector/releases?per_page=10";   // beta channel: includes pre-releases (newest first)
@@ -9076,6 +9485,31 @@ namespace SmiteGodLab
             return row;
         }
 
+        // getplayeridbyportaluserid: the Hi-Rez API maps a platform user id (Steam64 / Epic / Xbox XUID) → the real Hi-Rez
+        // player_id EVEN for a privacy-hidden account — it returns player_id with privacy_flag=y but does NOT zero the id
+        // (only getplayer/getmatchhistory/etc. blank it). MCTS leaks the PORTAL_USERID for hidden players; this turns that
+        // platform id into the real account anchor, so a hidden player we've never seen visible still de-anonymizes.
+        // Returns the player_id string (never "0"/empty) or null. Costs one API request per call.
+        static async Task<string> RecoverIdByPortal(int portalId, string portalUserId)
+        {
+            if (portalId <= 0 || string.IsNullOrEmpty(portalUserId)) return null;
+            try
+            {
+                var raw = await SmiteApi.Call("getplayeridbyportaluserid", portalId.ToString(), portalUserId);
+                if (string.IsNullOrEmpty(raw)) return null;
+                using var doc = JsonDocument.Parse(raw);
+                var root = doc.RootElement;
+                var el = root.ValueKind == JsonValueKind.Array ? (root.GetArrayLength() > 0 ? root[0] : default) : root;
+                if (el.ValueKind == JsonValueKind.Object && el.TryGetProperty("player_id", out var pid))
+                {
+                    string id = pid.ValueKind == JsonValueKind.Number ? pid.GetInt64().ToString() : pid.GetString();
+                    if (!string.IsNullOrEmpty(id) && id != "0") return id;
+                }
+            }
+            catch { }
+            return null;
+        }
+
         // --- match scoreboard (getmatchdetails) --------------------------------
         async Task ShowMatchDetails(string matchId)
         {
@@ -9197,6 +9631,99 @@ namespace SmiteGodLab
                     }
                 }
 
+                // MCTS PORTAL reveal: the MCTS server's REQUEST_MATCH_DETAILS leaks PORTAL_USERID (Steam/Epic/Xbox
+                // account ID) for PRIVACY_FLAG=1 players — the privacy filter blanks PLAYER_NAME and zeros PLAYER_ID
+                // but forgets to strip the platform user ID. If we've seen that PORTAL_USERID before (from a match
+                // where the same player was visible), NameDb instantly resolves it → exact reveal, 100% confidence.
+                // Live query: auto-start the MCTS engine if needed, query the match for hidden player portal IDs.
+                bool hasHidden = players.Any(p => { string n = GS(p, "playerName"); if (string.IsNullOrEmpty(n)) n = GS(p, "hz_player_name"); return string.IsNullOrEmpty(n); });
+                if (hasHidden && NameDb.Enabled) UseWaitCursor = true;   // de-anonymizing hidden players can hit the network (MCTS query + getplayeridbyportaluserid + smite.guru)
+                if (hasHidden && !MctsPortal.HasMatch(matchId) && !string.IsNullOrEmpty(_mctsRelayDir))
+                {
+                    bool connected = _mctsConnected != null && _mctsConnected();
+                    if (!connected && _mctsEnsureConnected != null)
+                        connected = await _mctsEnsureConnected(20000);
+                    if (connected)
+                        await MctsPortal.QueryLive(matchId, _mctsRelayDir, 8000);
+                }
+                Dictionary<string, (string name, string id)> mctsMap = null;
+                if (NameDb.Enabled && MctsPortal.HasMatch(matchId))
+                {
+                    mctsMap = new();
+                    // hidden slots with an MCTS portal id, not already revealed by the local game log
+                    var unresolved = new List<(string key, MctsPortal.MatchPlayer mp, string id)>();
+                    foreach (var pl in players)
+                    {
+                        string nmh = GS(pl, "playerName"); if (string.IsNullOrEmpty(nmh)) nmh = GS(pl, "hz_player_name");
+                        if (!string.IsNullOrEmpty(nmh)) continue;
+                        if (logMap != null && logMap.ContainsKey(GS(pl, "GodId") + "|" + GI(pl, "TaskForce"))) continue;
+                        var mp = MctsPortal.FindPlayer(matchId, GI(pl, "TaskForce"), GI(pl, "Kills_Player"), GI(pl, "Deaths"), GI(pl, "Assists"));
+                        if (mp == null || string.IsNullOrEmpty(mp.PortalUserId)) continue;
+                        string key = GS(pl, "GodId") + "|" + GI(pl, "TaskForce");
+                        // (a) seen this PORTAL_USERID visible before → instant exact reveal (rId may be set with no name yet)
+                        var (rName, rId) = NameDb.ResolveByPortal(mp.PortalUserId);
+                        if (!string.IsNullOrEmpty(rName) && !present.Contains(rName)) { mctsMap[key] = (rName, rId); present.Add(rName); }
+                        else unresolved.Add((key, mp, rId));
+                    }
+                    // (b) never seen visible → recover the REAL player_id from the platform id (getplayeridbyportaluserid
+                    //     leaks it through the privacy flag), then resolve the name from our cache, finally from smite.guru's
+                    //     permanent index (which still has the name for currently-private accounts it ever indexed).
+                    if (unresolved.Count > 0)
+                    {
+                        var needName = new List<(string key, MctsPortal.MatchPlayer mp, string id)>();
+                        foreach (var (key, mp, cachedId) in unresolved)
+                        {
+                            string recId = !string.IsNullOrEmpty(cachedId) ? cachedId : await RecoverIdByPortal(mp.PortalId, mp.PortalUserId);
+                            if (string.IsNullOrEmpty(recId))
+                            {
+                                string portalLabel = mp.PortalId == 5 ? "Steam " + mp.PortalUserId : mp.PortalId == 9 ? "Epic " + mp.PortalUserId : mp.PortalId == 10 ? "Xbox " + mp.PortalUserId : "Portal" + mp.PortalId + " " + mp.PortalUserId;
+                                mctsMap[key] = (portalLabel, null);
+                                continue;
+                            }
+                            string cachedName = NameDb.NameById(recId);
+                            if (!string.IsNullOrEmpty(cachedName))
+                            {
+                                NameDb.LinkPortal(recId, mp.PortalUserId);
+                                if (!present.Contains(cachedName)) { mctsMap[key] = (cachedName, recId); present.Add(cachedName); }
+                                else mctsMap[key] = ("Player #" + recId, null);   // name already shown for another slot → id-only anchor (id=null so the placeholder isn't re-learned as a name)
+                            }
+                            else needName.Add((key, mp, recId));
+                        }
+                        // (c) recovered ids with no cached name → one smite.guru batch (resolves private-but-indexed accounts)
+                        if (needName.Count > 0)
+                        {
+                            Dictionary<string, (string name, int level, string clan)> sg = null;
+                            try
+                            {
+                                _sguru ??= new SmiteGuru(this);
+                                using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(30));
+                                sg = await _sguru.ResolveProfilesBatch(needName.Select(n => n.id).Distinct().ToList(), cts.Token);
+                            }
+                            catch { }
+                            foreach (var (key, mp, id) in needName)
+                            {
+                                string nm = (sg != null && sg.TryGetValue(id, out var pr) && !string.IsNullOrWhiteSpace(pr.name)) ? pr.name : null;
+                                if (!string.IsNullOrEmpty(nm))
+                                {
+                                    NameDb.Learn(id, nm, mp.PortalId, mp.ClanId, mp.ClanName, sg[id].level, "", mp.Mastery, portalUserId: mp.PortalUserId);
+                                    if (!present.Contains(nm)) { mctsMap[key] = (nm, id); present.Add(nm); }
+                                    else mctsMap[key] = ("Player #" + id, null);
+                                }
+                                else
+                                {
+                                    // private + never indexed anywhere: no name exists to recover, but the real account id is
+                                    // still a far better anchor than the raw platform id (clickable, future-resolvable).
+                                    NameDb.LinkPortal(id, mp.PortalUserId);
+                                    mctsMap[key] = ("Player #" + id, null);
+                                }
+                            }
+                        }
+                    }
+                    NameDb.Save();
+                    if (mctsMap.Count == 0) mctsMap = null;
+                }
+                if (hasHidden && NameDb.Enabled) UseWaitCursor = false;
+
                 try
                 {
                 using (var dlg = new Form())
@@ -9224,7 +9751,7 @@ namespace SmiteGodLab
                             Text = "TEAM " + tf + "    " + (won ? "VICTORY" : "DEFEAT") + "    ·    " + kills + " kills"
                         });
                         y += S(34);
-                        foreach (var pl in team) { body.Controls.Add(MakeScoreRow(pl, y, rowW, dtip, partyColors.TryGetValue(GI(pl, "PartyId"), out var pc) ? pc : Color.Empty, partyNamed.TryGetValue(GI(pl, "PartyId"), out var comp) ? comp : null, matchId, teamNamed.TryGetValue(GI(pl, "TaskForce"), out var nbr) ? nbr : null, logMap, present, gbMap)); y += S(46); }
+                        foreach (var pl in team) { body.Controls.Add(MakeScoreRow(pl, y, rowW, dtip, partyColors.TryGetValue(GI(pl, "PartyId"), out var pc) ? pc : Color.Empty, partyNamed.TryGetValue(GI(pl, "PartyId"), out var comp) ? comp : null, matchId, teamNamed.TryGetValue(GI(pl, "TaskForce"), out var nbr) ? nbr : null, logMap, present, gbMap, mctsMap)); y += S(46); }
                         y += S(10);
                     }
                     try { int on = 1; if (DwmSetWindowAttribute(dlg.Handle, 20, ref on, 4) != 0) DwmSetWindowAttribute(dlg.Handle, 19, ref on, 4); } catch { }
@@ -9236,7 +9763,7 @@ namespace SmiteGodLab
             }
         }
 
-        Control MakeScoreRow(JsonElement pl, int y, int rowW, ToolTip dtip, Color partyCol = default, List<string> companions = null, string matchId = null, List<string> neighbors = null, Dictionary<string, (string name, string id)> logMap = null, HashSet<string> present = null, Dictionary<string, (string name, int conf)> gbMap = null)
+        Control MakeScoreRow(JsonElement pl, int y, int rowW, ToolTip dtip, Color partyCol = default, List<string> companions = null, string matchId = null, List<string> neighbors = null, Dictionary<string, (string name, string id)> logMap = null, HashSet<string> present = null, Dictionary<string, (string name, int conf)> gbMap = null, Dictionary<string, (string name, string id)> mctsMap = null)
         {
             var row = new Panel { Location = new Point(S(4), y), Size = new Size(rowW, S(42)), BackColor = Theme.Panel };
             if (partyCol != Color.Empty)   // premade-party accent bar on the left
@@ -9281,6 +9808,11 @@ namespace SmiteGodLab
             string gbName = null; int gbConf = 0;
             if (NameDb.Enabled && priv && gbMap != null && gbMap.TryGetValue(GS(pl, "GodId") + "|" + tf, out var gbv)) { gbName = gbv.name; gbConf = gbv.conf; }
             Color gbCol = Color.FromArgb(120, 205, 170);   // teal-green = a leaderboard-sourced reveal
+            string mctsName = null; string mctsId = null;
+            if (NameDb.Enabled && priv && mctsMap != null && mctsMap.TryGetValue(GS(pl, "GodId") + "|" + tf, out var mv)) { mctsName = mv.name; mctsId = mv.id; }
+            Color mctsCol = Color.FromArgb(100, 200, 255);   // sky-blue = MCTS portal reveal (PORTAL_USERID → NameDb)
+            if (NameDb.Enabled && priv && !string.IsNullOrEmpty(mctsName) && !string.IsNullOrEmpty(mctsId) && mctsId != "0")
+                NameDb.Learn(mctsId, mctsName, 0, clanId, clan, acct, god, mast, companions, nbrSelf, rareSkin, RankedFromRow(pl));
             string cName = null; int cVotes = 0; bool cConf = false;
             if (TagSync.Enabled && priv)
             {
@@ -9327,16 +9859,18 @@ namespace SmiteGodLab
                 // someone else — so an exact reveal outranks ★, and we must NOT fold this slot into a fuzzy tag when an exact
                 // source is present (that would poison the tag with a different player's fingerprint). The by-nick heal above
                 // already folds completed data into the tag whose Nick == the exact name (the agreement case).
-                bool hasExact = !string.IsNullOrEmpty(logName) || revExact;
+                bool hasExact = !string.IsNullOrEmpty(logName) || revExact || !string.IsNullOrEmpty(mctsName);
                 if (tag != null && !hasExact) UpdateSighting(tag, clan, acct, mast, companions, god);   // fold only when no exact source supersedes this slot
                 string tail = clan.Length > 0 ? "  ·  [" + clan + "]" : "";
-                // Priority: EXACT ✔ (ground truth) > your ★ tag > community-confirmed ⚑ > local fingerprint ≈ > community-unconfirmed ⚑ > Hidden
+                // Priority: EXACT ✔ (ground truth) > your ★ tag > MCTS ⊕ (portal reveal) > ✦ god-board > ⚑ community > ≈ fingerprint > Hidden
                 if (!string.IsNullOrEmpty(logName))
                 { nameLbl.ForeColor = logCol; nameLbl.Text = "✔ " + logName + tail; }
                 else if (revExact)
                 { nameLbl.ForeColor = revCol; nameLbl.Text = "✔ " + revName + tail; }
                 else if (tag != null)
                 { nameLbl.ForeColor = Theme.Blue; nameLbl.Text = "★ " + tag.Nick + tail; }
+                else if (!string.IsNullOrEmpty(mctsName))
+                { nameLbl.ForeColor = mctsCol; nameLbl.Text = "⊕ " + mctsName + tail; }
                 else if (!string.IsNullOrEmpty(gbName))
                 { nameLbl.ForeColor = gbCol; nameLbl.Text = "✦ " + gbName + tail; }
                 else if (cConf)
@@ -9350,7 +9884,8 @@ namespace SmiteGodLab
                 string note; Color noteCol = Theme.Dim;
                 if (!string.IsNullOrEmpty(logName)) { note = "   ·   from your match log"; noteCol = logCol; }
                 else if (revExact) { note = "   ·   matched live capture"; noteCol = revCol; }
-                else if (tag != null) note = !string.IsNullOrEmpty(revName) ? "   ·   maybe " + revName : (!string.IsNullOrEmpty(gbName) ? "   ·   maybe " + gbName : (!string.IsNullOrEmpty(cName) ? "   ·   community: " + cName : ""));
+                else if (tag != null) note = !string.IsNullOrEmpty(mctsName) ? "   ·   portal: " + mctsName : (!string.IsNullOrEmpty(revName) ? "   ·   maybe " + revName : (!string.IsNullOrEmpty(gbName) ? "   ·   maybe " + gbName : (!string.IsNullOrEmpty(cName) ? "   ·   community: " + cName : "")));
+                else if (!string.IsNullOrEmpty(mctsName)) { note = mctsId != null ? "   ·   MCTS portal reveal" : "   ·   platform account ID (click to tag)"; noteCol = mctsCol; }
                 else if (!string.IsNullOrEmpty(gbName)) { note = "   ·   ranked leaderboard · " + gbConf + "%"; noteCol = gbCol; }
                 else if (cConf) { note = "   ·   community · " + cVotes + " taggers"; noteCol = comCol; }
                 else if (!string.IsNullOrEmpty(revName)) { note = "   ·   possible · " + revConf + "% (guess)"; noteCol = revCol; }
@@ -9370,14 +9905,15 @@ namespace SmiteGodLab
                     var cur = MatchHidden(clanId, acct, mast, companions, god);
                     // ACTIVE LEARNING: if the algorithm guessed a name (✔ exact / ≈ / ⚑), pre-fill it so one Save CONFIRMS it
                     // into a ground-truth user tag (★, which outranks every guess afterwards). Otherwise the box is blank to name fresh.
-                    string suggested = cur?.Nick ?? (!string.IsNullOrEmpty(logName) ? logName : (!string.IsNullOrEmpty(gbName) ? gbName : (string.IsNullOrEmpty(revName) ? "" : revName)));
+                    string suggested = cur?.Nick ?? (!string.IsNullOrEmpty(logName) ? logName : (!string.IsNullOrEmpty(mctsName) && mctsId != null ? mctsName : (!string.IsNullOrEmpty(gbName) ? gbName : (string.IsNullOrEmpty(revName) ? "" : revName))));
                     bool isGuess = cur == null && (!string.IsNullOrEmpty(revName) || !string.IsNullOrEmpty(gbName));
                     string head = priv ? (isGuess ? "Confirm or correct this player" : "Name this hidden player") : "Edit the tag for " + nm;
                     int compCount = companions?.Count ?? 0;
+                    string portalHint = !string.IsNullOrEmpty(mctsName) && mctsId == null ? "\r\nPlatform account: " + mctsName : "";
                     string matchNote = isGuess ? "suggested name pre-filled — Save to confirm, edit to correct, or clear to dismiss"
                         : (compCount > 0 ? "matched by clan + level + mastery + " + compCount + " party-mate" + (compCount == 1 ? "" : "s") : "matched by clan + level + mastery");
                     string nick = PromptText(head,
-                        god + (clan.Length > 0 ? "  ·  [" + clan + "]" : "") + "   ·   Acct Lv " + acct + "   ·   Mastery " + mast + "\r\n(" + matchNote + ")",
+                        god + (clan.Length > 0 ? "  ·  [" + clan + "]" : "") + "   ·   Acct Lv " + acct + "   ·   Mastery " + mast + portalHint + "\r\n(" + matchNote + ")",
                         suggested);
                     if (nick == null) return;
                     SetHiddenTag(clanId, clan, acct, mast, nick, companions, god);
@@ -9391,7 +9927,8 @@ namespace SmiteGodLab
                 };
                 row.Cursor = nameLbl.Cursor = subLbl.Cursor = Cursors.Hand;
                 row.Click += tagIt; nameLbl.Click += tagIt; subLbl.Click += tagIt;
-                dtip.SetToolTip(nameLbl, priv ? "Click to set a custom nickname for this hidden player" : "You tagged this player while hidden — click to edit/clear the tag");
+                string mctsToolTip = !string.IsNullOrEmpty(mctsName) && mctsId == null && mctsName.StartsWith("Steam ") ? "\nSteam profile: https://steamcommunity.com/profiles/" + mctsName.Substring(6) : "";
+                dtip.SetToolTip(nameLbl, priv ? "Click to set a custom nickname for this hidden player" + mctsToolTip : "You tagged this player while hidden — click to edit/clear the tag");
             }
             int ix = S(336);
             for (int i = 1; i <= 6; i++)

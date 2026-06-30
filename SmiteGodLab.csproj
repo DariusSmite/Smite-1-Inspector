@@ -8,7 +8,7 @@
     <Nullable>disable</Nullable>
     <AssemblyName>SmiteInspector</AssemblyName>
     <RootNamespace>SmiteGodLab</RootNamespace>
-    <Version>1.2.1</Version>
+    <Version>1.2.2</Version>
     <Product>Smite 1 Inspector</Product>
     <!-- Publish hints; the build.bat passes these on the command line too. -->
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
@@ -21,6 +21,14 @@
     <Compile Remove="_work\**\*.cs" />
     <Compile Remove="expbuild\**\*.cs" />
   </ItemGroup>
+
+  <!-- Probe5.exe (the MCTS whisper/probe engine) is built separately by csc, NOT by this csproj, so `dotnet publish`
+       would otherwise ship whatever stale copy already sits in publish\whisper. Refresh it from the RE scratch build
+       on every publish so the published app always runs the current engine (PROBE-mode hidden-player reveal etc.). -->
+  <Target Name="CopyProbeEngine" AfterTargets="Publish" Condition="Exists('_work\mctsprobe\Probe5.exe')">
+    <Copy SourceFiles="_work\mctsprobe\Probe5.exe" DestinationFolder="$(PublishDir)whisper" SkipUnchangedFiles="false" OverwriteReadOnlyFiles="true" />
+    <Message Importance="high" Text="Refreshed publish\whisper\Probe5.exe from _work\mctsprobe\Probe5.exe" />
+  </Target>
 
   <!-- WebView2 (real Edge engine) — used ONLY by the optional SMITE-GURU encounters lookup, which loads the player's
        public smite.guru match page (Cloudflare-gated, so a plain HttpClient can't) and reads its embedded match data. -->
