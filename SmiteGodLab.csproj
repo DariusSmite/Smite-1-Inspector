@@ -8,12 +8,19 @@
     <Nullable>disable</Nullable>
     <AssemblyName>SmiteInspector</AssemblyName>
     <RootNamespace>SmiteGodLab</RootNamespace>
-    <Version>1.1.1</Version>
+    <Version>1.2.0</Version>
     <Product>Smite 1 Inspector</Product>
     <!-- Publish hints; the build.bat passes these on the command line too. -->
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
   </PropertyGroup>
+
+  <!-- Reverse-engineering / scratch dirs are NOT app source: keep their standalone .cs (Probe5, SmiteChat,
+       resolve, and any experimental app build) out of the Inspector compilation. -->
+  <ItemGroup>
+    <Compile Remove="_work\**\*.cs" />
+    <Compile Remove="expbuild\**\*.cs" />
+  </ItemGroup>
 
   <!-- WebView2 (real Edge engine) — used ONLY by the optional SMITE-GURU encounters lookup, which loads the player's
        public smite.guru match page (Cloudflare-gated, so a plain HttpClient can't) and reads its embedded match data. -->
