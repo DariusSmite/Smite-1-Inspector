@@ -3049,6 +3049,13 @@ namespace SmiteGodLab
         [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
         struct RECT { public int Left, Top, Right, Bottom; }
 
+        // Freeze a control's painting while we rebuild its content (e.g. refilling a RichTextBox), so the user never sees
+        // it repaint line-by-line or scroll through the whole history. Pair Suspend/Resume; Resume repaints once.
+        [DllImport("user32.dll")] static extern int SendMessage(IntPtr hWnd, int msg, int wParam, int lParam);
+        const int WM_SETREDRAW = 0x000B;
+        static void SuspendDrawing(Control c) { if (c != null && c.IsHandleCreated) SendMessage(c.Handle, WM_SETREDRAW, 0, 0); }
+        static void ResumeDrawing(Control c) { if (c != null && c.IsHandleCreated) { SendMessage(c.Handle, WM_SETREDRAW, 1, 0); c.Invalidate(); } }
+
         // ---- DPAPI (Windows per-user encryption) — used to remember the Hi-Rez password without storing it in plaintext.
         [StructLayout(LayoutKind.Sequential)] struct DATA_BLOB { public int cbData; public IntPtr pbData; }
         [DllImport("crypt32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool CryptProtectData(ref DATA_BLOB pDataIn, string szDataDescr, IntPtr pOptionalEntropy, IntPtr pvReserved, IntPtr pPromptStruct, int dwFlags, ref DATA_BLOB pDataOut);
@@ -5446,8 +5453,13 @@ namespace SmiteGodLab
             var left = new Panel { Dock = DockStyle.Left, Width = S(280), BackColor = Theme.Panel };
             var leftLine = new Panel { Dock = DockStyle.Right, Width = S(1), BackColor = Theme.Line };
             var newRow = new Panel { Dock = DockStyle.Top, Height = S(46), BackColor = Theme.Panel, Padding = new Padding(S(10), S(8), S(10), S(6)) };
-            var pickBtn = new Button { Dock = DockStyle.Right, Width = S(34), Text = "…", FlatStyle = FlatStyle.Flat, BackColor = Theme.Input, ForeColor = Theme.Text, Font = Theme.F(12f, FontStyle.Bold), Cursor = Cursors.Hand };
+            var pickBtn = new Button { Dock = DockStyle.Right, Width = S(34), Text = "▾", FlatStyle = FlatStyle.Flat, BackColor = Theme.Input, ForeColor = Theme.Dim, Font = Theme.F(10.5f, FontStyle.Bold), Cursor = Cursors.Hand, TextAlign = ContentAlignment.MiddleCenter, Margin = new Padding(S(4), 0, 0, 0) };
+            pickBtn.FlatAppearance.BorderSize = 1;
             pickBtn.FlatAppearance.BorderColor = Theme.Line;
+            pickBtn.FlatAppearance.MouseOverBackColor = Theme.Lighten(Theme.Input);
+            pickBtn.MouseEnter += (s, e) => { pickBtn.FlatAppearance.BorderColor = Theme.Accent; pickBtn.ForeColor = Theme.Text; };
+            pickBtn.MouseLeave += (s, e) => { pickBtn.FlatAppearance.BorderColor = Theme.Line; pickBtn.ForeColor = Theme.Dim; };
+            new ToolTip().SetToolTip(pickBtn, "Pick from your Friend List");
             var newName = new TextBox { Dock = DockStyle.Fill, BackColor = Theme.Input, ForeColor = Theme.Text, BorderStyle = BorderStyle.FixedSingle, Font = Theme.F(10f), Text = "" };
             var newHint = new Label { Text = "New whisper — type a name + Enter", Dock = DockStyle.Bottom, Height = S(0), ForeColor = Theme.Dim, Font = Theme.F(8f) };
             newRow.Controls.Add(newName); newRow.Controls.Add(pickBtn);
@@ -5532,7 +5544,7 @@ namespace SmiteGodLab
                 {
                     thread.SelectionColor = Color.FromArgb(210, 150, 60); thread.SelectionFont = Theme.F(9f, FontStyle.Italic);
                     thread.AppendText("⚠  " + m.Text + "\n");
-                    thread.SelectionStart = thread.TextLength; thread.ScrollToCaret(); return;
+                    return;
                 }
                 bool outg = m.Dir == "out";
                 bool queued = outg && m.St == "queued";
@@ -5560,13 +5572,34 @@ namespace SmiteGodLab
                     thread.AppendText("   cancelled");
                 }
                 thread.SelectionColor = Theme.Text; thread.SelectionFont = Theme.F(10.5f); thread.AppendText("\n");
-                thread.SelectionStart = thread.TextLength; thread.ScrollToCaret();
             }
+            // Jump the thread straight to the newest message (no visible scroll-through).
+            void ScrollThreadToBottom() { thread.SelectionStart = thread.TextLength; thread.SelectionLength = 0; thread.ScrollToCaret(); }
             void RenderThread(string key)
             {
                 cancelRanges.Clear();
-                thread.Clear();
-                if (key != null && convs.TryGetValue(key, out var c)) foreach (var m in c.Msgs) AppendThread(m);
+                // Freeze painting while we refill, so a long history renders instantly at the bottom instead of
+                // visibly scrolling top-to-bottom as each line is appended.
+                SuspendDrawing(thread);
+                try
+                {
+                    thread.Clear();
+                    if (key != null && convs.TryGetValue(key, out var c))
+                    {
+                        // Render only the most recent messages — a thread with thousands of lines (heavy testing/spam)
+                        // is otherwise slow to rebuild segment-by-segment. The newest are what you want; older stay saved.
+                        const int CAP = 300;
+                        int total = c.Msgs.Count, start = total > CAP ? total - CAP : 0;
+                        if (start > 0)
+                        {
+                            thread.SelectionStart = thread.TextLength; thread.SelectionColor = Theme.Dim; thread.SelectionFont = Theme.F(8.5f, FontStyle.Italic);
+                            thread.AppendText("— showing the last " + CAP + " of " + total + " messages —\n\n");
+                        }
+                        for (int i = start; i < total; i++) AppendThread(c.Msgs[i]);
+                    }
+                }
+                finally { ResumeDrawing(thread); }
+                ScrollThreadToBottom();   // after redraw resumes, so it positions on the last line
             }
             // Click the red "✕ cancel" on a queued message to retract it (works until the engine actually sends it).
             void CancelQueued(WMsg m)
@@ -5762,7 +5795,7 @@ namespace SmiteGodLab
                 if (c.Hidden && dir != "sys") c.Hidden = false;   // a real message (in or out) restores a soft-deleted thread
                 var m = new WMsg { T = DateTimeOffset.UtcNow.ToUnixTimeSeconds(), Dir = dir, Text = text, St = st };
                 c.Msgs.Add(m); c.Last = m.T; SaveConvs();
-                if (key == activeKey) AppendThread(m);
+                if (key == activeKey) { AppendThread(m); ScrollThreadToBottom(); }
                 RenderConvList();
                 return m;
             }
@@ -6050,20 +6083,62 @@ namespace SmiteGodLab
             }
             newName.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; var n = newName.Text.Trim(); newName.Clear(); StartConvFromName(n); } };
 
-            // "…" -> pick a friend (online first) from the saved Friend List
+            // ▾ -> a compact, SEARCHABLE popup of your saved friends (replaces the old full-screen native menu).
             pickBtn.Click += (s, e) =>
             {
-                var menu = new ContextMenuStrip { BackColor = Theme.Panel, ForeColor = Theme.Text };
-                var ordered = friendList.OrderBy(f => f.Name, StringComparer.OrdinalIgnoreCase).ToList();
-                if (ordered.Count == 0) menu.Items.Add(new ToolStripMenuItem("No saved friends — add some in Friend List") { Enabled = false });
-                foreach (var f in ordered)
+                var all = friendList.OrderBy(f => f.Name, StringComparer.OrdinalIgnoreCase).ToList();
+                var pop = new Form { FormBorderStyle = FormBorderStyle.None, StartPosition = FormStartPosition.Manual, ShowInTaskbar = false, BackColor = Theme.Line, Padding = new Padding(1), Size = new Size(S(236), S(312)) };
+                var inner = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Panel };
+                var search = new TextBox { Dock = DockStyle.Top, BackColor = Theme.Input, ForeColor = Theme.Text, BorderStyle = BorderStyle.FixedSingle, Font = Theme.F(10f) };
+                try { search.PlaceholderText = all.Count > 0 ? "Search friends…" : "Type a name…"; } catch { }
+                var list = new ListBox { Dock = DockStyle.Fill, BackColor = Theme.Panel, ForeColor = Theme.Text, BorderStyle = BorderStyle.None, Font = Theme.F(10f), IntegralHeight = false, DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = S(24) };
+                var hint = new Label { Dock = DockStyle.Fill, ForeColor = Theme.Dim, Font = Theme.F(9f), TextAlign = ContentAlignment.MiddleCenter, Text = "No saved friends.\nType a name above, then Enter." };
+                list.DrawItem += (s2, e2) =>
                 {
-                    var it = new ToolStripMenuItem(f.Name) { ForeColor = Theme.Text };
-                    string nm = f.Name, fid = f.Id;
-                    it.Click += (s2, e2) => StartConvFromName(nm, fid);
-                    menu.Items.Add(it);
+                    if (e2.Index < 0) return;
+                    bool sel = (e2.State & DrawItemState.Selected) != 0;
+                    using (var b = new SolidBrush(sel ? Color.FromArgb(46, 24, 26) : Theme.Panel)) e2.Graphics.FillRectangle(b, e2.Bounds);
+                    if (sel) using (var b = new SolidBrush(Theme.Accent)) e2.Graphics.FillRectangle(b, e2.Bounds.X, e2.Bounds.Y, S(3), e2.Bounds.Height);
+                    TextRenderer.DrawText(e2.Graphics, (string)list.Items[e2.Index], Theme.F(10f), new Rectangle(e2.Bounds.X + S(10), e2.Bounds.Y, e2.Bounds.Width - S(12), e2.Bounds.Height), sel ? Theme.Text : Color.FromArgb(200, 200, 206), TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+                };
+                // highlighted header ("From Friend List"), then the search box, then the list
+                var head = new Panel { Dock = DockStyle.Top, Height = S(30), BackColor = Color.FromArgb(46, 24, 26) };
+                var headBar = new Panel { Dock = DockStyle.Left, Width = S(3), BackColor = Theme.Accent };
+                var headLbl = new Label { Dock = DockStyle.Fill, Text = "From Friend List", ForeColor = Theme.Text, Font = Theme.F(10f, FontStyle.Bold), TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(S(9), 0, 0, 0), BackColor = Color.FromArgb(46, 24, 26) };
+                head.Controls.Add(headLbl); head.Controls.Add(headBar);
+                // add order matters for Dock stacking (last added docks first): list/hint fill, search above them, head on top
+                inner.Controls.Add(list); inner.Controls.Add(hint); inner.Controls.Add(search); inner.Controls.Add(head);
+                pop.Controls.Add(inner);
+                void Fill(string q)
+                {
+                    list.BeginUpdate(); list.Items.Clear();
+                    foreach (var f in all) if (q.Length == 0 || f.Name.IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0) list.Items.Add(f.Name);
+                    list.EndUpdate();
+                    list.Visible = list.Items.Count > 0; hint.Visible = !list.Visible;
+                    if (list.Items.Count > 0) list.SelectedIndex = 0;
                 }
-                menu.Show(pickBtn, new Point(0, pickBtn.Height));
+                Fill("");
+                void Commit(string chosen)
+                {
+                    if (string.IsNullOrWhiteSpace(chosen)) return;
+                    var f = all.FirstOrDefault(x => string.Equals(x.Name, chosen, StringComparison.OrdinalIgnoreCase));
+                    pop.Close();
+                    StartConvFromName(chosen.Trim(), f?.Id);
+                }
+                list.DoubleClick += (s2, e2) => { if (list.SelectedItem != null) Commit((string)list.SelectedItem); };
+                list.KeyDown += (s2, e2) => { if (e2.KeyCode == Keys.Enter && list.SelectedItem != null) { e2.Handled = true; Commit((string)list.SelectedItem); } else if (e2.KeyCode == Keys.Escape) { e2.Handled = true; pop.Close(); } };
+                search.KeyDown += (s2, e2) =>
+                {
+                    if (e2.KeyCode == Keys.Enter) { e2.SuppressKeyPress = true; Commit(list.SelectedItem as string ?? search.Text); }
+                    else if (e2.KeyCode == Keys.Down && list.Visible && list.Items.Count > 0) { e2.SuppressKeyPress = true; list.Focus(); }
+                    else if (e2.KeyCode == Keys.Escape) { e2.SuppressKeyPress = true; pop.Close(); }
+                };
+                search.TextChanged += (s2, e2) => Fill(search.Text.Trim());
+                pop.Deactivate += (s2, e2) => pop.Close();
+                pop.FormClosed += (s2, e2) => pop.Dispose();
+                pop.Location = pickBtn.PointToScreen(new Point(pickBtn.Width - pop.Width, pickBtn.Height + S(2)));
+                pop.Show(this);
+                search.Focus();
             };
 
             // refresh the active conversation's presence rapidly while the tab is open, + instantly on window focus
@@ -6542,6 +6617,7 @@ namespace SmiteGodLab
                 var secondaryTabs = new[] { MkSubTab("Overview"), MkSubTab("Masteries"), MkSubTab("Matches"), MkSubTab("Achievements"), MkSubTab("Friend List") };   // Encounters moved up to a primary tab
                 foreach (var t in secondaryTabs) { t.Height = S(36); subFlow2.Controls.Add(t); }
                 int curPrimary = 1;   // 0 My profile · 1 Track · 2 Favorites · 3 Recent Profiles · 4 Hidden Tags · 5 Encounters (declared early: used by Lookup/_trkLoadPlayer closures)
+                bool curFromMyProfile = false;   // the loaded player was loaded BY the My-profile tab → don't bleed it into Track
                 subBar2.Controls.Add(subFlow2); subBar2.Controls.Add(subBar2Line);
 
                 // --- search bar ---
@@ -6554,7 +6630,12 @@ namespace SmiteGodLab
                 favSaveBtn = MkBtn("☆ Save", 104, false, Theme.Input, Theme.Dim); favSaveBtn.Location = new Point(S(464), S(12)); favSaveBtn.Enabled = false;
                 friendAddBtn = MkBtn("＋ Friend List", 136, false, Theme.Input, Theme.Dim); friendAddBtn.Location = new Point(S(574), S(12)); friendAddBtn.Enabled = false;
                 var addAllFriendsBtn = MkBtn("＋ Add all to Friend List", 184, false, Theme.Input, Theme.Green); addAllFriendsBtn.Location = new Point(S(720), S(12)); addAllFriendsBtn.Visible = false;
-                var myProfBtn = MkBtn("＋ Set my profile", 184, false, Theme.Input, Theme.Blue); myProfBtn.Location = new Point(S(720), S(12)); myProfBtn.Visible = false;   // shown only on the "My profile" tab
+                // The Set/Change-my-profile button lives on the SECONDARY (sub-menu) bar, right-aligned, only on the My-profile
+                // tab. (The primary "My profile" tab already names the view, so no separate title is needed.)
+                var myProfBtn = MkBtn("＋ Set my profile", 184, false, Theme.Input, Theme.Blue); myProfBtn.Visible = false;
+                subBar2.Controls.Add(myProfBtn); myProfBtn.BringToFront();   // sits over the (left-aligned) secondary tab flow
+                void LayoutMyProfBar() { myProfBtn.Top = S(4); myProfBtn.Left = Math.Max(S(240), subBar2.ClientSize.Width - myProfBtn.Width - S(16)); }
+                subBar2.SizeChanged += (s, e) => LayoutMyProfBar();   // keep it right-aligned even if a resize happened while hidden
                 var lastFriends = new List<PlayerRow>();   // the FRIENDS section of the currently-shown friends list (for "add all")
                 var friendCats = new List<(string key, string cap, List<PlayerRow> list)>();   // collapsible friend sections
                 var collapsedFriendSecs = new HashSet<string>();
@@ -6562,7 +6643,7 @@ namespace SmiteGodLab
                 // Status line: its own full-width strip docked just under the search bar. A fixed Location on the search
                 // row would land off-screen at high DPI (the row is already full to the window edge), so it lives here.
                 var hint = new Label { Dock = DockStyle.Top, Height = S(22), TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(S(14), 0, S(14), 0), ForeColor = Theme.Dim, Font = Theme.F(8.5f), BackColor = Theme.Panel, Text = "Live data from the official Hi-Rez SMITE API." };
-                top.Controls.Add(lbl); top.Controls.Add(bhost); top.Controls.Add(track); top.Controls.Add(favSaveBtn); top.Controls.Add(friendAddBtn); top.Controls.Add(addAllFriendsBtn); top.Controls.Add(myProfBtn);
+                top.Controls.Add(lbl); top.Controls.Add(bhost); top.Controls.Add(track); top.Controls.Add(favSaveBtn); top.Controls.Add(friendAddBtn); top.Controls.Add(addAllFriendsBtn);
 
                 // --- overview card ---
                 var card = new Panel { Dock = DockStyle.Top, Height = S(214), BackColor = Theme.Bg };
@@ -7328,18 +7409,26 @@ namespace SmiteGodLab
                     if (string.IsNullOrEmpty(curPid) || curPid == "0") { hint.ForeColor = Theme.Dim; hint.Text = "Search for a SMITE player above."; box.Focus(); }
                 }
                 // "My profile" tab: always loads the user's own pinned account (set only here). Not set → prompt to set it.
+                // Shows the My-profile button on the sub-menu bar, then loads the pinned account. curFromMyProfile flags the
+                // load so it never bleeds into Track (handled in SelectPrimary(1) and the load-complete callback).
                 void ShowMyProfile()
                 {
-                    addAllFriendsBtn.Visible = false; subBar2.Visible = false;
+                    addAllFriendsBtn.Visible = false;
+                    curFromMyProfile = true;   // set up-front (the load is async) so a quick switch to Track won't show this player
                     if (string.IsNullOrEmpty(settings.MyProfileId))
                     {
-                        myProfBtn.Visible = true; myProfBtn.Text = "＋ Set my profile"; myProfBtn.BringToFront();
-                        ResetCard(); ShowStage(0);
+                        ResetCard(); ShowStage(0);   // ResetCard hides subBar2 — re-show it (no tabs) just for the action button
+                        subBar2.Visible = true; subFlow2.Visible = false;
+                        myProfBtn.Visible = true; myProfBtn.Text = "＋ Set my profile"; myProfBtn.BringToFront(); LayoutMyProfBar();
                         hint.ForeColor = Theme.Dim; hint.Text = "Set your own SMITE profile here — it'll always be one click away on this tab.";
                         return;
                     }
-                    myProfBtn.Visible = true; myProfBtn.Text = "↻ Change my profile"; myProfBtn.BringToFront();
-                    _ = Guarded(() => LoadKey(settings.MyProfileId, settings.MyProfileName));
+                    myProfBtn.Text = "↻ Change my profile";
+                    _ = Guarded(() => LoadKey(settings.MyProfileId, settings.MyProfileName, fromMyProfile: true));
+                    // LoadKey's ResetCard (run synchronously up to its first await) hid subBar2; restore the bar + button now
+                    // so they stay put during the load. The load-complete callback re-asserts this too.
+                    subBar2.Visible = true; subFlow2.Visible = true;
+                    myProfBtn.Visible = true; myProfBtn.BringToFront(); LayoutMyProfBar();
                 }
                 void ShowAchievements()
                 {
@@ -7524,9 +7613,11 @@ namespace SmiteGodLab
                     hint.ForeColor = Theme.Dim; hint.Text = "Updated " + FmtNow() + ".";
                 }
 
-                // Loads a player by a known key (numeric id from a search pick, or an exact name).
-                async Task LoadKey(string key, string display)
+                // Loads a player by a known key (numeric id from a search pick, or an exact name). fromMyProfile marks the
+                // load as belonging to the My-profile tab so it isn't shown again under Track (they share one player slot).
+                async Task LoadKey(string key, string display, bool fromMyProfile = false)
                 {
+                    curFromMyProfile = fromMyProfile;
                     track.Enabled = false; hint.ForeColor = Theme.Dim; hint.Text = "Loading " + display + "…";
                     listCol.Visible = false; ResetCard();
                     try
@@ -7546,7 +7637,7 @@ namespace SmiteGodLab
                 {
                     string name = box.Text.Trim();
                     if (name.Length == 0) return;
-                    StylePrimary(1); curPrimary = 1;   // searching belongs to the Track tab
+                    StylePrimary(1); curPrimary = 1; curFromMyProfile = false;   // searching belongs to the Track tab (and is its own player)
                     track.Enabled = false; hint.ForeColor = Theme.Dim; hint.Text = "Looking up " + name + "…";
                     listCol.Visible = false; ResetCard();
                     try
@@ -7780,9 +7871,9 @@ namespace SmiteGodLab
                 void SelectSecondary(int j)
                 {
                     if (j == 4 && trackBusy) return;   // can't open Friends mid-load
-                    // "Change my profile" lives in the top strip and belongs ONLY to My profile's Overview — hide it (and its now-
-                    // empty strip) on every other My-profile sub-tab so it doesn't float over their content.
-                    if (curPrimary == 0) { myProfBtn.Visible = (j == 0); top.Visible = (j == 0); }
+                    // The Change-my-profile button is on the sub-menu bar itself, so it stays right-aligned across every
+                    // My-profile sub-tab (no need to hide it per sub-tab the way the old top-strip placement did).
+                    if (curPrimary == 0) { myProfBtn.Visible = true; myProfBtn.BringToFront(); LayoutMyProfBar(); }
                     curSecondary = j; StyleSecondary(j);
                     switch (j) { case 0: ShowSearchView(); break; case 1: ShowExpanded(1); break; case 2: ShowExpanded(2); break; case 3: ShowAchievements(); break; case 4: _ = Guarded(ShowFriends); break; }
                 }
@@ -7902,29 +7993,42 @@ namespace SmiteGodLab
                     // Tags hide it entirely (they each have their own list + controls). Track-only search controls:
                     bool onTrack = i == 1;
                     lbl.Visible = bhost.Visible = track.Visible = favSaveBtn.Visible = friendAddBtn.Visible = onTrack;
-                    top.Visible = onTrack || i == 0;
+                    top.Visible = onTrack;                 // search strip is Track-only now (My-profile button moved to the sub-menu bar)
                     if (i != 0) myProfBtn.Visible = false;
                     if (i == 0) ShowMyProfile();           // My profile: the user's own pinned account (set only here)
                     else if (i == 1)                        // Track: player-context strip + current player view (or idle search)
                     {
-                        subBar2.Visible = PlayerLoaded();
-                        if (PlayerLoaded()) SelectSecondary(curSecondary); else ShowSearchView();
+                        // Don't bleed the My-profile account into Track: if the loaded player came from the My-profile tab,
+                        // clear it so Track starts BLANK (we track a different person here). ResetCard wipes curPid + the card.
+                        if (curFromMyProfile) ResetCard();
+                        subFlow2.Visible = true;
+                        bool showHere = PlayerLoaded();
+                        subBar2.Visible = showHere;
+                        if (showHere) SelectSecondary(curSecondary); else ShowSearchView();
                     }
                     else if (i == 5) { subBar2.Visible = false; ShowEncounters(); }   // Encounters: top-level, self-contained (own A/B inputs, no sub-tabs, no lookup bar)
                     else { subBar2.Visible = false; if (i == 2) ShowFavorites(); else if (i == 3) ShowRecents(); else ShowHidden(); }
                 }
-                for (int i = 0; i < primaryTabs.Length; i++) { int k = i; primaryTabs[i].Click += (s, e) => SelectPrimary(k); }
+                // Ignore primary-tab switches while a load is in flight (same trackBusy guard the search/friends/double-click
+                // paths use). This closes the mid-load races where a completing load would render under the wrong tab.
+                for (int i = 0; i < primaryTabs.Length; i++) { int k = i; primaryTabs[i].Click += (s, e) => { if (trackBusy) return; SelectPrimary(k); }; }
                 for (int j = 0; j < secondaryTabs.Length; j++) { int k = j; secondaryTabs[j].Click += (s, e) => SelectSecondary(k); }
                 // when a player finishes loading, reveal the secondary strip and default it to Overview; highlight My profile
                 // if the load was initiated from that tab (curPrimary==0), otherwise Track (1). A player can be opened from
                 // Favorites/Recents/Encounters (where SelectPrimary hid the Track lookup bar), so ACTUALLY land on the styled
                 // tab (set curPrimary) and restore the ☆ Save / ＋ Friend List bar — otherwise those buttons stay hidden.
                 _trkPlayerLoaded = () => {
+                    // RACE GUARD (defence-in-depth; the trackBusy tab-click guard prevents most of these): if a My-profile
+                    // load finishes while we're NOT on My profile, never paint it here. Track → blank idle prompt; the
+                    // list/encounters tabs (2-5) just drop the result and keep their own view (don't call ShowSearchView).
+                    if (curFromMyProfile && curPrimary != 0) { ResetCard(); if (curPrimary == 1) ShowSearchView(); return; }
                     int hp = curPrimary == 0 ? 0 : 1; curPrimary = hp; StylePrimary(hp);
                     bool onTrack = hp == 1;
                     lbl.Visible = bhost.Visible = track.Visible = favSaveBtn.Visible = friendAddBtn.Visible = onTrack;
-                    top.Visible = onTrack || hp == 0; myProfBtn.Visible = hp == 0;
-                    subBar2.Visible = true; curSecondary = 0; StyleSecondary(0); ShowStage(0);
+                    top.Visible = onTrack;                                  // search strip is Track-only; My-profile button is on the sub-menu bar
+                    subBar2.Visible = true; subFlow2.Visible = true;
+                    myProfBtn.Visible = hp == 0; if (hp == 0) { myProfBtn.BringToFront(); LayoutMyProfBar(); }
+                    curSecondary = 0; StyleSecondary(0); ShowStage(0);
                 };
                 _trkResetSecondary = () => { curSecondary = 0; StyleSecondary(0); };   // so SelectNav restores Overview (non-blocking), not a stale Guarded Friends view
                 _trkSubTab = SelectPrimary;
@@ -8373,7 +8477,7 @@ namespace SmiteGodLab
         static string AppVersionFromAssembly()
         {
             try { var v = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version; if (v != null && (v.Major + v.Minor + v.Build) > 0) return v.Major + "." + v.Minor + "." + v.Build; } catch { }
-            return "1.2.0";
+            return "1.2.1";
         }
         const string ReleasesApi = "https://api.github.com/repos/DariusSmite/Smite-1-Inspector/releases/latest";
         const string ReleasesListApi = "https://api.github.com/repos/DariusSmite/Smite-1-Inspector/releases?per_page=10";   // beta channel: includes pre-releases (newest first)
