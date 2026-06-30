@@ -5,9 +5,10 @@ name: Release
 #  - or run this workflow manually (Actions tab -> Release -> Run workflow) and type the version.
 # It builds the portable exe, generates patch notes from the commits since the previous tag,
 # and attaches SmiteInspector.exe to the release.
+# The distributed build is the one-click INSTALLER, attached to each Release manually (it bundles the
+# Whispers chat engine, which CI can't build). This workflow only builds a bare dev exe on manual dispatch;
+# it no longer runs on tag push, so it can't attach a portable exe to a published Release.
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
     inputs:
       version:

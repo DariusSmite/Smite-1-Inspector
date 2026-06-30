@@ -1,6 +1,6 @@
 # SMITE 1 Inspector
 
-A native Windows desktop app (C# / WinForms, .NET 8) for **SMITE 1**. It combines a live player/friend tracker built on the official Hi-Rez API, an offline editor for the game's god ability-tuning files, and **Whispers** — a standalone messenger that messages live players with the game completely closed. Ships as a single portable exe or a one-click installer.
+A native Windows desktop app (C# / WinForms, .NET 8) for **SMITE 1**. It combines a live player/friend tracker built on the official Hi-Rez API, an offline editor for the game's god ability-tuning files, and **Whispers** — a standalone messenger that messages live players with the game completely closed. Installs in one click — no admin prompt — and keeps itself up to date.
 
 > SMITE 1 is in maintenance mode, but its servers and stats API are still up. This is an unofficial fan tool, see **Disclaimer** below.
 
@@ -88,9 +88,9 @@ Choose the startup tab and time format, opt in to **beta** (pre-release) updates
 
 ## Install
 
-**Easiest (recommended for most people):** download **`SmiteInspector-Setup-x.y.z.exe`** from the latest [Release](../../releases), run it, and follow the prompts. It installs the app, creates shortcuts, sets up seamless in-place updates, and installs the WebView2 runtime if it's missing. (Windows SmartScreen may warn on first run since the app is unsigned — click *More info → Run anyway*.)
+Download **`SmiteInspector-Setup-x.y.z.exe`** from the latest [Release](../../releases) and run it. It installs **in one click — no admin prompt** (it installs just for your Windows user), creates a desktop shortcut, launches itself, and keeps itself up to date automatically. The WebView2 runtime is installed if it's missing. (Windows SmartScreen may warn on first run since the app is unsigned — click *More info → Run anyway*.)
 
-**Portable:** download **`SmiteInspector.exe`** from the same release and run it directly — it's self-contained, no install needed.
+The installer is the only build, because Whispers needs the bundled chat engine that ships inside it.
 
 ### Whispers requirements
 
@@ -115,7 +115,7 @@ dotnet publish -c Release -r win-x64 --self-contained true ^
   -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
 ```
 
-The result is `bin\Release\net8.0-windows\win-x64\publish\SmiteInspector.exe`. `build.bat` runs the same publish. Prebuilt exes and the installer are attached to each [Release](../../releases). (Whispers also needs its chat engine in a `whisper\` folder next to the exe; the prebuilt Releases bundle it.)
+The result is `bin\Release\net8.0-windows\win-x64\publish\SmiteInspector.exe`. `build.bat` runs the same publish. The packaged installer is attached to each [Release](../../releases). (Whispers also needs its chat engine in a `whisper\` folder next to the exe; the installer bundles it — a bare `dotnet publish` does not.)
 
 ## API key (Player Tracker)
 
