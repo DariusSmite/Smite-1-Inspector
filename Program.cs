@@ -103,6 +103,23 @@ namespace SmiteGodLab
             }
         }
 
+        // Crash-safe text write: serialize to a sibling temp file, flush it all the way to physical disk, then atomically
+        // swap it over the target. A kill/crash/power-loss mid-write can only ever leave the PREVIOUS good file intact (plus a
+        // stray .tmp that the next write overwrites) — never a truncated/corrupt file. Used for caches whose loss is permanent
+        // now that smite.guru is shutting down (per-player history, scoreboards, name maps, shared tags). No external deps.
+        public static void AtomicWriteText(string path, string content)
+        {
+            string tmp = path + ".tmp";
+            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                var bytes = System.Text.Encoding.UTF8.GetBytes(content);   // UTF-8, no BOM — matches File.WriteAllText/ReadAllText defaults
+                fs.Write(bytes, 0, bytes.Length);
+                fs.Flush(true);   // flush OS buffers to the physical disk BEFORE the rename → the swapped-in file is always complete
+            }
+            if (File.Exists(path)) File.Replace(tmp, path, null);   // atomic in-place replace on NTFS
+            else File.Move(tmp, path);                              // first write: no target to replace
+        }
+
         public static void LoadFont()
         {
             // 1) installed system-wide?
@@ -910,6 +927,149 @@ namespace SmiteGodLab
         }
     }
 
+    // EXPERIMENT (reveal-hidden-names, 2026-06-25): reveal a privacy-hidden RANKED player via the god-leaderboard id-leak.
+    // getgodleaderboard(godId, rankedQueue 451/450/440) is the ONE Hi-Rez endpoint that leaks a hidden player's real
+    // player_id — it blanks player_name but NOT player_id (every other endpoint zeroes BOTH). Chained with smite.guru's
+    // permanent id→name cache (/v3/profiles/{id}/matches returns the real name/level/clan for any account it EVER indexed,
+    // even one that is CURRENTLY Hi-Rez-private), this de-anonymizes a hidden ranked player with no prior sighting. The
+    // join from a hidden completed-match SLOT to a leaked board id can't use MMR (the board's player_ranking is a per-god
+    // score, NOT the account Rank_Stat — verified: Kokushíbo Rank_Stat_Duel 3438 vs board 92) nor per-god mastery
+    // (getgodranks is privacy-blocked for the id), so we match on the only attributes visible on BOTH sides: god (narrows
+    // to that god's ~100-deep board), account level, and CLAN (both survive the privacy flag in a completed match; the
+    // candidate's clan/level come from smite.guru). A clan-exact + close-level match inside one god's hidden pool is
+    // near-unique → safe to assert (the experiment's 99.9%-precision bar). COVERAGE: hidden players who are top-100 on a
+    // god in a ranked queue. Casual-only / never-indexed accounts (e.g. match 1393561801's two hidden players) are on no
+    // board and in no cache → NOT reachable here; only the local game-log/MCTS path reveals those. Network-heavy → opt-in.
+    static class GodBoard
+    {
+        // ranked-queue NAME (as it appears in a completed getmatchdetails: <Queue>_Tier / Rank_Stat_<Queue>) → god-leaderboard queue id
+        public static readonly Dictionary<string, int> RankedQueueId = new(StringComparer.OrdinalIgnoreCase)
+        { ["Conquest"] = 451, ["Joust"] = 450, ["Duel"] = 440 };
+
+        public sealed class Slot { public string GodId = ""; public string GodName = ""; public int Tf; public int Level; public string Clan = ""; public int ClanId; public int Mastery; public List<int> Queues = new(); }
+        public sealed class Cand { public string Id = ""; public string Name = ""; public string Clan = ""; public int Level; }
+
+        sealed class Prof { public string Name { get; set; } = ""; public string Clan { get; set; } = ""; public int Level { get; set; } public string At { get; set; } = ""; }
+        static readonly object _lock = new();
+        static Dictionary<string, Prof> _prof = new();   // smite.guru id→profile cache (name/level/clan), persisted across runs
+        static string ProfFile => Path.Combine(Theme.DataDir, "godboard.json");
+        static bool _loaded;
+        public static void Load() { lock (_lock) { if (_loaded) return; _loaded = true; try { if (File.Exists(ProfFile)) _prof = JsonSerializer.Deserialize<Dictionary<string, Prof>>(File.ReadAllText(ProfFile)) ?? new(); } catch { _prof = new(); } } }
+        static void SaveProf() { try { Theme.AtomicWriteText(ProfFile, JsonSerializer.Serialize(_prof)); } catch { } }
+
+        sealed class Board { public List<string> HiddenIds = new(); public DateTime At; }
+        static readonly Dictionary<string, Board> _boards = new();   // (godId|queue) → leaked hidden ids, short-TTL (the board moves slowly)
+        static readonly TimeSpan BoardTtl = TimeSpan.FromMinutes(30);
+
+        // PURE, TESTABLE: pick the slot's identity from the god-board candidates. v1 asserts a name ONLY on a clan-exact,
+        // near-unique match (safest; clanless disambiguation on stale smite.guru levels is deferred). Returns (null,null,0) for Hidden.
+        public static (string id, string name, int conf) BestMatch(string slotClan, int slotLevel, IReadOnlyList<Cand> cands)
+        {
+            if (cands == null || cands.Count == 0 || string.IsNullOrWhiteSpace(slotClan)) return (null, null, 0);
+            var m = new List<(Cand c, double s)>();
+            foreach (var c in cands)
+            {
+                if (string.IsNullOrWhiteSpace(c.Clan) || !string.Equals(slotClan, c.Clan, StringComparison.OrdinalIgnoreCase)) continue;
+                double s = 50;   // clan-exact base
+                if (slotLevel > 0 && c.Level > 0)
+                {
+                    int d = slotLevel - c.Level;   // smite.guru level is last-seen (≤ current) → d≥0 expected; level only rises
+                    if (d == 0) s += 30; else if (d >= 1 && d <= 8) s += 18; else if (d >= 9 && d <= 20) s += 6;
+                    else if (d < 0 && d >= -3) s -= 4; else s -= 25;   // big gap either way → likely a different account
+                }
+                m.Add((c, s));
+            }
+            if (m.Count == 0) return (null, null, 0);
+            m.Sort((a, b) => b.s.CompareTo(a.s));
+            if (m[0].s < 55) return (null, null, 0);                                   // need clan + a non-terrible level
+            if (m.Count > 1 && (m[0].s - m[1].s) < 20) return (null, null, 0);          // two same-clan/same-god candidates at close level → ambiguous → Hidden
+            return (m[0].c.Id, m[0].c.Name, (int)Math.Min(93, 72 + m[0].s / 6));
+        }
+
+        static async Task<List<string>> PullBoardHidden(string godId, int queueId, CancellationToken ct)
+        {
+            if (string.IsNullOrEmpty(godId) || godId == "0") return new();
+            string key = godId + "|" + queueId;
+            lock (_lock) { if (_boards.TryGetValue(key, out var b) && (DateTime.UtcNow - b.At) < BoardTtl) return b.HiddenIds; }
+            var ids = new List<string>();
+            try
+            {
+                using var doc = JsonDocument.Parse(await SmiteApi.Call("getgodleaderboard", godId, queueId.ToString()));
+                if (doc.RootElement.ValueKind == JsonValueKind.Array)
+                    foreach (var e in doc.RootElement.EnumerateArray())
+                    {
+                        string nm = e.TryGetProperty("player_name", out var n) ? (n.GetString() ?? "") : "";
+                        string id = e.TryGetProperty("player_id", out var i) ? (i.ValueKind == JsonValueKind.Number ? i.GetInt64().ToString() : (i.GetString() ?? "")) : "";
+                        if (string.IsNullOrEmpty(nm) && !string.IsNullOrEmpty(id) && id != "0") ids.Add(id);   // a HIDDEN board entry whose real id leaked
+                    }
+            }
+            catch { }
+            lock (_lock) { _boards[key] = new Board { HiddenIds = ids, At = DateTime.UtcNow }; }
+            return ids;
+        }
+
+        // Resolve hidden RANKED slots → names. resolveProfiles = the smite.guru id→(name,level,clan) batch (cached here).
+        // Returns "godId|tf" → (name,conf), consumed by MakeScoreRow. Also NameDb.Learn's every RESOLVED candidate, because
+        // a leaked-id→name mapping is GROUND TRUTH regardless of which slot it is (it enriches the fingerprint DB).
+        public static async Task<Dictionary<string, (string name, int conf)>> ResolveSlots(
+            IReadOnlyList<Slot> slots,
+            Func<IReadOnlyList<string>, CancellationToken, Task<Dictionary<string, (string name, int level, string clan)>>> resolveProfiles,
+            CancellationToken ct)
+        {
+            Load();
+            var result = new Dictionary<string, (string name, int conf)>();
+            if (slots == null || slots.Count == 0) return result;
+
+            // 1) gather candidate ids across each slot's god boards (only the queues the slot is actually ranked in)
+            var slotIds = new Dictionary<Slot, List<string>>();
+            var need = new HashSet<string>();
+            foreach (var s in slots)
+            {
+                var ids = new List<string>();
+                foreach (var q in s.Queues)
+                    foreach (var id in await PullBoardHidden(s.GodId, q, ct))
+                        if (!ids.Contains(id)) ids.Add(id);
+                slotIds[s] = ids;
+                lock (_lock) { foreach (var id in ids) if (!_prof.ContainsKey(id)) need.Add(id); }
+            }
+
+            // 2) resolve unknown candidate profiles via smite.guru (batched), cache to disk
+            if (need.Count > 0 && resolveProfiles != null)
+            {
+                Dictionary<string, (string name, int level, string clan)> got = null;
+                try { got = await resolveProfiles(need.ToList(), ct); } catch { }
+                if (got != null)
+                    lock (_lock)
+                    {
+                        foreach (var kv in got)
+                            if (!string.IsNullOrEmpty(kv.Value.name))
+                                _prof[kv.Key] = new Prof { Name = kv.Value.name, Level = kv.Value.level, Clan = kv.Value.clan ?? "", At = DateTime.Now.ToString("yyyy-MM-dd") };
+                        SaveProf();
+                    }
+            }
+
+            // 3) match each slot, and learn every resolved id→name (ground truth)
+            foreach (var s in slots)
+            {
+                var cands = new List<Cand>();
+                foreach (var id in slotIds[s])
+                {
+                    Prof p; lock (_lock) { _prof.TryGetValue(id, out p); }
+                    if (p == null || string.IsNullOrEmpty(p.Name)) continue;
+                    cands.Add(new Cand { Id = id, Name = p.Name, Clan = p.Clan, Level = p.Level });
+                    if (NameDb.Enabled) NameDb.Learn(id, p.Name, 0, 0, p.Clan, p.Level, s.GodName, 0);   // id→name is true regardless of the slot
+                }
+                var (mid, mname, conf) = BestMatch(s.Clan, s.Level, cands);
+                if (!string.IsNullOrEmpty(mname))
+                {
+                    result[s.GodId + "|" + s.Tf] = (mname, conf);
+                    if (NameDb.Enabled) NameDb.Learn(mid, mname, 0, s.ClanId, s.Clan, s.Level, s.GodName, s.Mastery);   // fold THIS slot's full fingerprint (clan id + mastery) onto the matched real id
+                }
+            }
+            return result;
+        }
+    }
+
     // EXPERIMENT (reveal-hidden-names): EXACT reveal from the LOCAL game logs. SMITE 1 (UE3) writes a per-match combat
     // log to Documents\My Games\Smite\BattleGame\Logs\CombatLog_0.log listing EVERY player's real id + name + god + team
     // at spawn — including players the stats API anonymizes ("hidden"), because the client must render them in-match.
@@ -1272,7 +1432,7 @@ namespace SmiteGodLab
                 if (!resp.IsSuccessStatusCode) return;
                 string json = await resp.Content.ReadAsStringAsync();
                 Parse(json);
-                try { File.WriteAllText(CacheFile, json); } catch { }
+                try { Theme.AtomicWriteText(CacheFile, json); } catch { }   // atomic shared-tags cache write
             }
             catch { }
         }
@@ -1396,6 +1556,7 @@ namespace SmiteGodLab
         public string SkippedVersion { get; set; } = "";  // a version the user said "no" to → don't re-prompt for it
         public bool RevealHidden { get; set; }   // EXPERIMENT: auto-reveal privacy-hidden players from the learned name DB
         public bool Harvest { get; set; }        // EXPERIMENT: run the background name harvester to grow the DB at scale
+        public bool RankedReveal { get; set; }   // EXPERIMENT (2026-06-25): de-anon hidden RANKED players via the god-leaderboard id-leak → smite.guru name (network-heavy, opt-in)
         public bool CommunityTags { get; set; }  // EXPERIMENT: share + use crowdsourced hidden-player tags (TagSync)
         public bool LogReveal { get; set; } = true;   // EXPERIMENT: EXACT reveal of hidden players from the local game logs (GameLog) — default on
         public string MyProfileId { get; set; } = "";    // "My profile" tab: the user's own pinned account
@@ -1824,6 +1985,8 @@ namespace SmiteGodLab
         Form _host;
         Microsoft.Web.WebView2.Core.CoreWebView2Environment _env;
         string _lastTitle = "";
+        bool _apiCleared;          // api.smite.guru Cloudflare cleared this session → later accounts fetch() page 1 directly (no re-navigate)
+        int _mockMax, _mockLatency;   // TEST ONLY (SMITE_TEST_MOCK / SMITE_TEST_MOCKLAT): serve synthetic api.smite.guru JSON to time the scan offline
         public string LastDiag => _lastTitle;
 
         public SmiteGuru(Form owner) { _owner = owner; }
@@ -1839,23 +2002,46 @@ namespace SmiteGodLab
                 _host = new Form { FormBorderStyle = FormBorderStyle.None, ShowInTaskbar = false, StartPosition = FormStartPosition.Manual, Location = new Point(-2600, -2600), Size = new Size(1200, 820) };
                 _wv = new Microsoft.Web.WebView2.WinForms.WebView2 { Dock = DockStyle.Fill, TabStop = false };
                 _host.Controls.Add(_wv);
+                // TEST ONLY (SMITE_TEST_SHOWHOST): bring the host on-screen + topmost so Cloudflare's managed challenge can solve in
+                // an automated/headless run (Turnstile needs a focused, painted window). Never set in normal use — the host stays hidden.
+                if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SMITE_TEST_SHOWHOST"))) { _host.Location = new Point(40, 40); _host.Size = new Size(700, 560); _host.TopMost = true; }
                 _host.Show();
+                try { if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SMITE_TEST_SHOWHOST"))) _host.Activate(); } catch { }
             }
-            // persistent profile dir → keep the cf_clearance cookie between page loads + runs (skip the CF challenge)
-            _env = await Microsoft.Web.WebView2.Core.CoreWebView2Environment.CreateAsync(null, Path.Combine(Theme.DataDir, "webview2"), null);
+            // persistent profile dir → keep the cf_clearance cookie between page loads + runs (skip the CF challenge).
+            // SPEED + robustness: the host window is hidden off-screen, so Chromium's occlusion/background detection would
+            // throttle its rendering + timers to a crawl — which stalls Cloudflare's JS challenge AND slows every fetch the
+            // page makes. Disable that throttling so the hidden WebView runs JS/fetch at full foreground speed at all times.
+            var opts = new Microsoft.Web.WebView2.Core.CoreWebView2EnvironmentOptions("--disable-features=CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling");
+            _env = await Microsoft.Web.WebView2.Core.CoreWebView2Environment.CreateAsync(null, Path.Combine(Theme.DataDir, "webview2"), opts);
             await _wv.EnsureCoreWebView2Async(_env);
             try { _wv.CoreWebView2.Settings.AreDevToolsEnabled = false; _wv.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false; _wv.CoreWebView2.Settings.IsStatusBarEnabled = false; } catch { }
+            int.TryParse(Environment.GetEnvironmentVariable("SMITE_TEST_MOCK"), out _mockMax);          // >0 → serve synthetic api JSON (offline scan timing)
+            int.TryParse(Environment.GetEnvironmentVariable("SMITE_TEST_MOCKLAT"), out _mockLatency);   // per-request artificial latency (ms) to model network round-trips
             // SPEED + courtesy: block everything we don't need. The match data is INLINE in the SSR'd document (window.__NUXT__),
             // so we only need smite.guru's HTML + Cloudflare's challenge — block all third-party hosts (ads/analytics/trackers)
             // and all images/media/fonts/css. Pages then load in a fraction of the time and we stop pulling their ad partners.
             try
             {
                 _wv.CoreWebView2.AddWebResourceRequestedFilter("*", Microsoft.Web.WebView2.Core.CoreWebView2WebResourceContext.All);
-                _wv.CoreWebView2.WebResourceRequested += (s, e) =>
+                _wv.CoreWebView2.WebResourceRequested += async (s, e) =>
                 {
                     try
                     {
                         string host = new Uri(e.Request.Uri).Host;
+                        // TEST MOCK: answer api.smite.guru from a synthetic fixture so the full scan can be timed offline (no live service).
+                        if (_mockMax > 0 && host.Equals("api.smite.guru", StringComparison.OrdinalIgnoreCase))
+                        {
+                            string body = MockApi(e.Request.Uri);
+                            if (body != null)
+                            {
+                                var d = e.GetDeferral();
+                                try { if (_mockLatency > 0) await Task.Delay(_mockLatency); e.Response = _env.CreateWebResourceResponse(new MemoryStream(System.Text.Encoding.UTF8.GetBytes(body)), 200, "OK", "Content-Type: text/plain; charset=utf-8\r\nAccess-Control-Allow-Origin: *"); }
+                                catch { }
+                                finally { d.Complete(); }
+                                return;
+                            }
+                        }
                         bool allowHost = host.EndsWith("smite.guru", StringComparison.OrdinalIgnoreCase) || host.EndsWith("cloudflare.com", StringComparison.OrdinalIgnoreCase);
                         var c = e.ResourceContext;
                         bool heavy = c == Microsoft.Web.WebView2.Core.CoreWebView2WebResourceContext.Image || c == Microsoft.Web.WebView2.Core.CoreWebView2WebResourceContext.Media
@@ -1869,6 +2055,45 @@ namespace SmiteGodLab
             _ready = true;
         }
 
+        // TEST ONLY: synthesize the api.smite.guru matches/season JSON for a given request URL so the scan can be timed without the
+        // live (currently flaky) service. Models ONE real season (id 12) of _mockMax pages × 20 games — identical work for old/new.
+        string MockApi(string uri)
+        {
+            int qi = uri.IndexOf('?');
+            string path = qi >= 0 ? uri.Substring(0, qi) : uri;
+            string query = qi >= 0 ? uri.Substring(qi + 1) : "";
+            if (path.Contains("/matches/pc/")) return "{\"match_id\":\"mock\",\"queue_id\":451,\"time\":\"2024-01-01 00:00:00\",\"winning_team\":1,\"duration\":1800,\"players\":[]}";
+            if (!path.Contains("/matches")) return null;
+            // id from /v3/profiles/<id>/matches → distinct rosters/match_ids per account (so accounts don't cross-dedup)
+            long pid = 0; int ip = path.IndexOf("/profiles/"); if (ip >= 0) { int a = ip + 10, b = path.IndexOf('/', a); if (b > a) long.TryParse(path.Substring(a, b - a), out pid); }
+            int season = 0, page = 1; bool hasSeason = false;
+            foreach (var kv in query.Split('&'))
+            {
+                var p = kv.Split('=');
+                if (p.Length != 2) continue;
+                if (p[0] == "season" && int.TryParse(p[1], out var sv)) { season = sv; hasSeason = true; }
+                else if (p[0] == "page" && int.TryParse(p[1], out var pv)) page = pv;
+            }
+            // Model NSeasons real seasons (SMITE_TEST_MOCKSEASONS, default 5) of _mockMax pages each — matches a typical multi-year
+            // account. OLD pays per-season batch+gap overhead; NEW fetches every page of every season in one pooled burst.
+            int.TryParse(Environment.GetEnvironmentVariable("SMITE_TEST_MOCKSEASONS"), out int nSeasons); if (nSeasons <= 0) nSeasons = 5;
+            const int CUR = 12, PERPAGE = 20;
+            bool active = hasSeason ? (season <= CUR && season > CUR - nSeasons) : true;   // season probe in range, OR global current-season top
+            int yr = 2025 - (CUR - (hasSeason ? season : CUR));                            // map season → a plausible year for the date span
+            int max = active ? _mockMax : 0;
+            var sb = new System.Text.StringBuilder();
+            sb.Append("{\"matches\":{\"cursor\":{\"current\":").Append(page).Append(",\"max\":").Append(max).Append("},\"data\":[");
+            if (max > 0 && page >= 1 && page <= max)
+                for (int i = 0; i < PERPAGE; i++)
+                {
+                    if (i > 0) sb.Append(',');
+                    string mid = "P" + pid + (hasSeason ? ("S" + season) : "G") + "p" + page + "m" + i;
+                    sb.Append("{\"match_id\":\"").Append(mid).Append("\",\"queue_id\":451,\"time\":\"").Append(yr).Append("-01-01 00:00:00\",\"winning_team\":1,\"duration\":1800,\"players\":[{\"id\":").Append(pid).Append(",\"name\":\"P").Append(pid).Append("\",\"champion\":1,\"team\":1},{\"id\":99,\"name\":\"Other\",\"champion\":2,\"team\":2}]}");
+                }
+            sb.Append("]}}");
+            return sb.ToString();
+        }
+
         // Run a script with a hard timeout — ExecuteScriptAsync can block for many seconds while CF's challenge runs, which
         // would otherwise wedge the poll loop and defeat its deadline.
         async Task<string> Eval(string script, int timeoutMs)
@@ -1879,6 +2104,101 @@ namespace SmiteGodLab
 
         static string CacheFilePath(long id) => Path.Combine(Theme.DataDir, "sguru_" + id + ".json");
         public static bool HasCache(long id) => File.Exists(CacheFilePath(id));
+
+        // ARCHIVER helpers: read a cached player's history off disk (no network) to expand the crawl frontier / queue scoreboards.
+        public static List<long> CachedRosterIds(long id)
+        {
+            var ids = new List<long>();
+            try { var c = JsonSerializer.Deserialize<CacheFile>(File.ReadAllText(CacheFilePath(id)), JOpt); if (c?.Matches != null) foreach (var m in c.Matches) if (m?.Players != null) foreach (var p in m.Players) if (p.Id > 0) ids.Add(p.Id); } catch { }
+            return ids;
+        }
+        public static List<string> CachedMatchIds(long id)
+        {
+            var ms = new List<string>();
+            try { var c = JsonSerializer.Deserialize<CacheFile>(File.ReadAllText(CacheFilePath(id)), JOpt); if (c?.Matches != null) foreach (var m in c.Matches) if (!string.IsNullOrEmpty(m?.MatchId)) ms.Add(m.MatchId); } catch { }
+            return ms;
+        }
+        // ARCHIVER: fetch one match's FULL scoreboard and persist the raw JSON verbatim to sgmatch_<id>.json (atomic), or write a
+        // sgmatch_<id>.dead tombstone if smite.guru no longer stores it. Returns true on success/dead (done), false on timeout (distress).
+        public static bool HasMatch(string matchId) => File.Exists(Path.Combine(Theme.DataDir, "sgmatch_" + matchId + ".json")) || File.Exists(Path.Combine(Theme.DataDir, "sgmatch_" + matchId + ".dead"));
+        public async Task<bool> GetMatchFullToDisk(string matchId, CancellationToken ct)
+        {
+            string outp = Path.Combine(Theme.DataDir, "sgmatch_" + matchId + ".json");
+            string dead = Path.Combine(Theme.DataDir, "sgmatch_" + matchId + ".dead");
+            if (File.Exists(outp) || File.Exists(dead)) return true;
+            await _gate.WaitAsync(ct);
+            try
+            {
+                await EnsureReady();
+                _wv.CoreWebView2.Navigate("https://api.smite.guru/v3/matches/pc/" + matchId);
+                var deadline = DateTime.UtcNow.AddSeconds(15);
+                string script = "(function(){try{var t=document.body?document.body.innerText:'';if(!t||t.charAt(0)!=='{')return null;var j=JSON.parse(t);if(j&&j.players&&j.match_id)return t;if(j&&j.error)return '__ERR__';return null;}catch(e){return null;}})()";
+                while (DateTime.UtcNow < deadline)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await Task.Delay(200, ct);
+                    var r = await Eval(script, 5000);
+                    if (string.IsNullOrEmpty(r) || r == "null") continue;
+                    string inner; try { inner = JsonSerializer.Deserialize<string>(r); } catch { continue; }
+                    if (inner == "__ERR__") { try { Theme.AtomicWriteText(dead, ""); } catch { } return true; }   // smite.guru has no stored detail → tombstone, never retry
+                    if (inner.Length > 2 && inner[0] == '{') { try { Theme.AtomicWriteText(outp, inner); } catch { } return true; }
+                }
+                return false;   // timeout → caller treats as distress
+            }
+            finally { _gate.Release(); }
+        }
+
+        // CONCURRENT match-detail archive — fetch a BATCH of match ids through an in-page fetch POOL (same-origin; CF cleared by a
+        // prior history fetch or a one-off navigate), persisting each raw scoreboard JSON to sgmatch_<id>.json (or a .dead
+        // tombstone when smite.guru no longer stores it). ~conc× faster than navigate-per-match — the burst technique applied to
+        // scoreboards. Returns the number newly persisted (incl. tombstones). Transient failures are left for the next round.
+        public async Task<int> FetchMatchDetailsToDisk(long clearId, IReadOnlyList<string> matchIds, int conc, CancellationToken ct)
+        {
+            var todo = matchIds.Where(m => !string.IsNullOrEmpty(m) && !HasMatch(m)).Distinct().ToList();
+            if (todo.Count == 0) return 0;
+            await _gate.WaitAsync(ct);
+            try
+            {
+                if (!_apiCleared) { var w = await NavigateApi(clearId, ct); if (w == null) return 0; _apiCleared = true; }
+                string arr = "[" + string.Join(",", todo.Select(m => JsonSerializer.Serialize(m))) + "]";
+                string fire =
+                    "(function(){var G=(window.__sgGen=(window.__sgGen||0)+1);var IDS=" + arr + ";var C=" + conc + ";var i=0;var out=[];window.__md=null;" +
+                    "async function one(id){for(var a=0;a<2;a++){try{var r=await fetch('https://api.smite.guru/v3/matches/pc/'+id,{credentials:'include'});" +
+                    "if(!r.ok){await new Promise(function(z){setTimeout(z,300+a*400);});continue;}var t=await r.text();var dead=false;" +
+                    "try{var j=JSON.parse(t);if(j&&j.error){dead=true;}else if(!(j&&j.players&&j.match_id)){await new Promise(function(z){setTimeout(z,300);});continue;}}catch(e){await new Promise(function(z){setTimeout(z,300);});continue;}" +
+                    "out.push({id:id,dead:dead,body:dead?'':t});return;}catch(e){await new Promise(function(z){setTimeout(z,300+a*400);});}}out.push({id:id,err:1});}" +
+                    "async function worker(){while(i<IDS.length&&window.__sgGen===G){var id=IDS[i++];await one(id);}}" +
+                    "(async function(){await Promise.all(Array.from({length:C},function(){return worker();}));if(window.__sgGen===G)window.__md=JSON.stringify(out);})();})();true";
+                await Eval(fire, 5000);
+                var deadline = DateTime.UtcNow.AddSeconds(90);
+                while (DateTime.UtcNow < deadline)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await Task.Delay(250, ct);
+                    var r = await Eval("window.__md", 12000);
+                    if (string.IsNullOrEmpty(r) || r == "null") continue;
+                    int saved = 0;
+                    try
+                    {
+                        var inner = JsonSerializer.Deserialize<string>(r);
+                        using var doc = JsonDocument.Parse(inner);
+                        foreach (var e in doc.RootElement.EnumerateArray())
+                        {
+                            if (e.TryGetProperty("err", out _)) continue;   // transient → retry a later round
+                            string id = e.GetProperty("id").GetString();
+                            if (string.IsNullOrEmpty(id)) continue;
+                            bool dead = e.TryGetProperty("dead", out var dv) && dv.ValueKind == JsonValueKind.True;
+                            if (dead) { try { Theme.AtomicWriteText(Path.Combine(Theme.DataDir, "sgmatch_" + id + ".dead"), ""); saved++; } catch { } }
+                            else if (e.TryGetProperty("body", out var bv)) { var body = bv.GetString(); if (!string.IsNullOrEmpty(body)) { try { Theme.AtomicWriteText(Path.Combine(Theme.DataDir, "sgmatch_" + id + ".json"), body); saved++; } catch { } } }
+                        }
+                    }
+                    catch { }
+                    return saved;
+                }
+                return 0;
+            }
+            finally { _gate.Release(); }
+        }
 
         // Navigate the WebView straight to the JSON API URL (page 1). This (a) clears api.smite.guru's OWN Cloudflare challenge
         // — its cf_clearance is separate from smite.guru's, and WebView2 solves it like any browser — and (b) gives page 1 +
@@ -1893,7 +2213,7 @@ namespace SmiteGodLab
             while (DateTime.UtcNow < deadline)
             {
                 ct.ThrowIfCancellationRequested();
-                await Task.Delay(300, ct);
+                await Task.Delay(120, ct);
                 var r = await Eval(script, 5000);
                 if (!string.IsNullOrEmpty(r) && r != "null")
                 {
@@ -1942,6 +2262,85 @@ namespace SmiteGodLab
                 catch { return (0, new(), new()); }
             }
             return (0, new(), new());
+        }
+
+        // FAST PATH: fetch an ARBITRARY set of (season,page) jobs in ONE in-browser dispatch driven by a concurrency-limited
+        // worker POOL (CONC fetches always in flight, no per-batch C# round-trip). Each job self-retries on !ok/throw with
+        // backoff, so completeness holds without a separate C# retry storm. C# polls only a tiny scalar progress object
+        // (done/total/max/fin) at fine granularity, then reads the full result ONCE when the pool drains. A generation token
+        // makes a superseded run's stragglers exit and never clobber the next run's globals. Returns (cursorMax, got-keys "s:p", matches).
+        async Task<(int max, HashSet<string> got, List<Match> matches)> FetchAllJobs(long id, IReadOnlyList<(int season, int page)> jobs, int conc, Action<int, int> progress, CancellationToken ct)
+        {
+            var empty = (0, new HashSet<string>(), new List<Match>());
+            if (jobs.Count == 0) return empty;
+            string arr = "[" + string.Join(",", jobs.Select(j => "[" + j.season + "," + j.page + "]")) + "]";
+            string fire =
+                "(function(){var G=(window.__sgGen=(window.__sgGen||0)+1);var ID=" + id + ";var J=" + arr + ";var C=" + conc + ";" +
+                "var st={done:0,total:J.length,max:0,fin:false,gen:G};window.__sgP=st;window.__sgR=null;var i=0;var got=[];var data=[];" +
+                "async function one(s,p){var u='https://api.smite.guru/v3/profiles/'+ID+'/matches?'+(s>0?('season='+s+'&'):'')+'page='+p;" +
+                "for(var a=0;a<3;a++){try{var r=await fetch(u,{credentials:'include'});if(!r.ok){await new Promise(z=>setTimeout(z,200+a*300));continue;}" +
+                "var j=await r.json();var m=j&&j.matches;if(!m)return;if(m.cursor&&m.cursor.max>st.max)st.max=m.cursor.max;" +
+                "if(Array.isArray(m.data)){if(m.data.length>0||(m.cursor&&p>=m.cursor.max))got.push(s+':'+p);for(var k=0;k<m.data.length;k++)data.push(m.data[k]);}return;" +
+                "}catch(e){await new Promise(z=>setTimeout(z,200+a*300));}}}" +
+                "async function worker(){while(i<J.length&&window.__sgGen===G){var job=J[i++];await one(job[0],job[1]);st.done++;}}" +
+                "(async function(){var ws=[];for(var w=0;w<C;w++)ws.push(worker());await Promise.all(ws);" +
+                "if(window.__sgGen===G){window.__sgR=JSON.stringify({max:st.max,got:got,data:data});st.fin=true;}})();" +
+                "})();true";
+            await Eval(fire, 5000);
+            // poll the cheap scalar progress object; never serialize the growing got/data arrays until the pool reports fin.
+            string pscript = "(function(){var s=window.__sgP;if(!s)return '';return JSON.stringify({d:s.done,t:s.total,m:s.max,f:s.fin,g:s.gen});})()";
+            var deadline = DateTime.UtcNow.AddSeconds(120);
+            int lastD = -1;
+            while (DateTime.UtcNow < deadline)
+            {
+                ct.ThrowIfCancellationRequested();
+                await Task.Delay(70, ct);
+                var pr = await Eval(pscript, 4000);
+                bool fin = false;
+                if (!string.IsNullOrEmpty(pr) && pr != "null")
+                {
+                    try
+                    {
+                        var inner = JsonSerializer.Deserialize<string>(pr);
+                        using var doc = JsonDocument.Parse(inner);
+                        int d = doc.RootElement.GetProperty("d").GetInt32();
+                        int t = doc.RootElement.GetProperty("t").GetInt32();
+                        fin = doc.RootElement.GetProperty("f").GetBoolean();
+                        if (d != lastD) { lastD = d; progress?.Invoke(Math.Max(1, d), Math.Max(1, t)); }
+                    }
+                    catch { }
+                }
+                if (!fin) continue;
+                var rr = await Eval("window.__sgR", 8000);
+                if (string.IsNullOrEmpty(rr) || rr == "null") continue;
+                try
+                {
+                    var inner = JsonSerializer.Deserialize<string>(rr);
+                    using var doc = JsonDocument.Parse(inner);
+                    int mx = doc.RootElement.GetProperty("max").GetInt32();
+                    var got = new HashSet<string>(doc.RootElement.GetProperty("got").EnumerateArray().Select(e => e.GetString()));
+                    var matches = JsonSerializer.Deserialize<List<Match>>(doc.RootElement.GetProperty("data").GetRawText(), JOpt) ?? new();
+                    return (mx, got, matches);
+                }
+                catch { return empty; }
+            }
+            return empty;
+        }
+
+        // Ensure api.smite.guru's Cloudflare challenge is cleared THIS SESSION and return page-1 matches + cursor.max. The first
+        // account navigates (solves CF once); every later account reuses the cleared origin and just fetch()es page 1 — saving a
+        // full navigate + poll cycle per account. If the direct probe comes back blocked (clearance lapsed), re-navigates.
+        async Task<(List<Match> page1, int max, bool ok)> EnsureCleared(long id, CancellationToken ct)
+        {
+            if (_apiCleared)
+            {
+                var (mx, got, ms) = await FetchAllJobs(id, new[] { (0, 1) }, 1, null, ct);
+                if (got.Contains("0:1")) return (ms, mx, true);   // direct same-origin fetch worked → CF still cleared
+            }
+            var w = await NavigateApi(id, ct);
+            if (w == null) return (new List<Match>(), 0, false);
+            _apiCleared = true;
+            return (w.Data, w.Cursor?.Max ?? 0, true);
         }
 
         // FULL-history scan via the JSON API in PARALLEL batches — typically the whole history in a few seconds. Navigate once
@@ -2003,6 +2402,54 @@ namespace SmiteGodLab
             finally { _gate.Release(); }
         }
 
+        // RECON (reverse-engineer the PUBLIC API surface): load smite.guru's own SPA, record every api.smite.guru call it makes
+        // on load, and download its frontend JS bundles to extract every endpoint/path string they reference — so we can find a
+        // bulk/enumeration/leaderboard endpoint that beats one-player-at-a-time snowballing. Reads only public assets.
+        public async Task<string> Recon(CancellationToken ct, string extraPath = null)
+        {
+            await _gate.WaitAsync(ct);
+            try
+            {
+                await EnsureReady();
+                _wv.CoreWebView2.Navigate("https://smite.guru/" + (extraPath ?? ""));
+                var deadline = DateTime.UtcNow.AddSeconds(45);
+                while (DateTime.UtcNow < deadline)   // wait for the SPA document to finish past Cloudflare
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await Task.Delay(600, ct);
+                    var rs = await Eval("(function(){try{return document.readyState;}catch(e){return 'e';}})()", 4000);
+                    if (!string.IsNullOrEmpty(rs) && rs.Contains("complete")) break;
+                }
+                await Task.Delay(3000, ct);   // let the SPA fire its initial XHRs
+                string fire =
+                    "window.__rc=null;(async function(){try{" +
+                    "var R=performance.getEntriesByType('resource').map(function(e){return e.name;});" +
+                    "var scripts=[].slice.call(document.scripts).map(function(s){return s.src;}).filter(Boolean);" +
+                    "var urls={};R.concat(scripts).forEach(function(u){urls[u]=1;});" +
+                    "var apiCalls=R.filter(function(u){return /api\\.smite\\.guru/.test(u);});" +
+                    "var js=Object.keys(urls).filter(function(u){return /\\.js(\\?|$)/.test(u)&&/smite\\.guru/.test(u);});" +
+                    "var ep={};" +
+                    "for(var i=0;i<js.length;i++){try{var t=await (await fetch(js[i])).text();" +
+                    "(t.match(/\\/(v\\d+|api)\\/[A-Za-z0-9_\\-\\/:{}.$]+/g)||[]).forEach(function(s){ep[s]=1;});" +
+                    "(t.match(/https?:\\/\\/[a-z0-9.\\-]*smite\\.guru[^\"'`\\s)]*/g)||[]).forEach(function(s){ep[s]=1;});" +
+                    "}catch(e){}}" +
+                    "window.__rc=JSON.stringify({js:js,apiCalls:apiCalls,endpoints:Object.keys(ep).sort(),nuxtKeys:window.__NUXT__?Object.keys(window.__NUXT__):[]});" +
+                    "}catch(e){window.__rc=JSON.stringify({err:String(e)});}})();true";
+                await Eval(fire, 5000);
+                var d2 = DateTime.UtcNow.AddSeconds(40);
+                while (DateTime.UtcNow < d2)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await Task.Delay(500, ct);
+                    var r = await Eval("window.__rc", 8000);
+                    if (string.IsNullOrEmpty(r) || r == "null") continue;
+                    try { return JsonSerializer.Deserialize<string>(r); } catch { return r; }
+                }
+                return "(recon timeout)";
+            }
+            finally { _gate.Release(); }
+        }
+
         // DIAGNOSTIC ONLY: navigate (clear CF) then fetch specific pages, reporting per-page match counts + date range, to
         // tell a hard offset cap (pages return empty) from a transient rate-limit. Used by the SMITE_TEST_DEEPPAGE hook.
         // Probe which SMITE seasons have data for this player (season=N&page=1 → cursor.max>0), one concurrent burst with a
@@ -2021,7 +2468,7 @@ namespace SmiteGodLab
             while (DateTime.UtcNow < deadline)
             {
                 ct.ThrowIfCancellationRequested();
-                await Task.Delay(300, ct);
+                await Task.Delay(90, ct);
                 var r = await Eval("window.__sgS", 5000);
                 if (string.IsNullOrEmpty(r) || r == "null") continue;
                 try
@@ -2048,87 +2495,64 @@ namespace SmiteGodLab
             try
             {
                 const int CAP = 179;   // per-season offset cap (page 180+ → HTTP 500)
-                const int CONC = 8;
+                const int CONC = 16;   // in-browser worker-pool size (HTTP/2 over Cloudflare multiplexes this over one connection)
                 var cache = LoadCache(id);
                 cache.SeasonDone ??= new();
                 var have = new HashSet<string>(cache.Matches.Where(m => m.MatchId != null).Select(m => m.MatchId));
                 var merged = new List<Match>(cache.Matches);
-                bool incremental = cache.Matches.Count > 0;
-                // navigate once → clears api.smite.guru CF + leaves the WebView same-origin so the season fetch()es just work
+                // clear CF once per session → page-1 + cursor.max; later accounts skip the navigate and fetch() page 1 directly
                 progress?.Invoke(1, 1);
-                var w1 = await NavigateApi(id, ct);
-                if (w1 == null) { merged.Sort((a, b) => string.CompareOrdinal(b.Time ?? "", a.Time ?? "")); return new History { Matches = merged, Deepest = cache.DeepestPage, Max = cache.CursorMax, Complete = false }; }
-                int globalMax = (w1.Cursor != null && w1.Cursor.Max > 0) ? w1.Cursor.Max : cache.CursorMax;
-                foreach (var m in w1.Data) if (m?.MatchId != null && have.Add(m.MatchId)) merged.Add(m);   // newest games (current season top)
+                var (page1, globalMaxRaw, ok) = await EnsureCleared(id, ct);
+                if (!ok) { merged.Sort((a, b) => string.CompareOrdinal(b.Time ?? "", a.Time ?? "")); return new History { Matches = merged, Deepest = cache.DeepestPage, Max = cache.CursorMax, Complete = false }; }
+                int globalMax = globalMaxRaw > 0 ? globalMaxRaw : cache.CursorMax;
+                foreach (var m in page1) if (m?.MatchId != null && have.Add(m.MatchId)) merged.Add(m);   // newest games (current season top)
                 var seasons = await DiscoverSeasons(id, ct);
                 if (seasons.Count == 0)   // season param unavailable for this profile → fall back to global pagination (capped)
                 {
                     int limit = Math.Min(globalMax > 0 ? globalMax : 1, maxPages);
-                    var gotG = new HashSet<int> { 1 };
-                    for (int start = 2; start <= limit; start += CONC)
-                    {
-                        ct.ThrowIfCancellationRequested();
-                        var batch = Enumerable.Range(start, Math.Min(CONC, limit - start + 1)).ToList();
-                        progress?.Invoke(batch[batch.Count - 1], limit);
-                        var (mx, gp, ms) = await FetchJsonBatch(id, batch, 0, ct);
-                        if (mx > 0) { globalMax = mx; limit = Math.Min(mx, maxPages); }
-                        foreach (var p in gp) gotG.Add(p);
-                        foreach (var m in ms) if (m?.MatchId != null && have.Add(m.MatchId)) merged.Add(m);
-                        await Task.Delay(120, ct);
-                    }
+                    var jobs = new List<(int, int)>(); for (int p = 2; p <= limit; p++) jobs.Add((0, p));
+                    var (mx, got, ms) = await FetchAllJobs(id, jobs, CONC, (d, t) => progress?.Invoke(d, Math.Max(t, 1)), ct);
+                    if (mx > 0) globalMax = mx;
+                    foreach (var m in ms) if (m?.MatchId != null && have.Add(m.MatchId)) merged.Add(m);
+                    var miss = jobs.Where(j => !got.Contains(j.Item1 + ":" + j.Item2)).ToList();   // self-retry inside the pool already covered most; one more cleanup pass for stragglers
+                    if (miss.Count > 0) { progress?.Invoke(-1, limit); var (m2, g2, ms2) = await FetchAllJobs(id, miss, CONC, null, ct); foreach (var k in g2) got.Add(k); foreach (var m in ms2) if (m?.MatchId != null && have.Add(m.MatchId)) merged.Add(m); }
+                    var gotG = new HashSet<int> { 1 }; foreach (var k in got) { var pp = k.Split(':'); if (pp.Length == 2 && int.TryParse(pp[1], out var pg)) gotG.Add(pg); }
                     int deepG = 1; while (gotG.Contains(deepG + 1)) deepG++;
                     merged.Sort((a, b) => string.CompareOrdinal(b.Time ?? "", a.Time ?? ""));
                     SaveCache(id, new CacheFile { CursorMax = globalMax, DeepestPage = deepG, FetchedAt = DateTime.UtcNow.ToString("o"), Matches = merged, SeasonDone = cache.SeasonDone });
                     return new History { Matches = merged, Deepest = deepG, Max = globalMax, Complete = globalMax > 0 && deepG >= globalMax };
                 }
                 int curSeason = seasons.Keys.Max();
-                int totalPages = seasons.Sum(kv => Math.Min(kv.Value, CAP));   // reachable pages across all seasons
-                int donePages = 0, fetchedPages = 0, cappedSeasons = 0;
-                bool anyGap = false;   // a fully-scanned season left pages unfetched after retries → NOT "full history"
-                foreach (var s in seasons.Keys.OrderByDescending(s => s))   // newest season first → fresh results appear soonest
+                int totalPages = seasons.Sum(kv => Math.Min(kv.Value, CAP));   // reachable pages across all seasons (progress denominator)
+                int cappedSeasons = 0;
+                // Build ONE job list across every season that still needs scanning (newest first), then fetch the whole thing in a
+                // single concurrency-pooled burst — no per-season/per-batch C# round-trips. Old fully-scanned seasons are skipped.
+                var allJobs = new List<(int, int)>();
+                var seasonLimit = new Dictionary<int, int>();
+                foreach (var s in seasons.Keys.OrderByDescending(s => s))
                 {
-                    int cm = seasons[s];
-                    int sLimit = Math.Min(cm, CAP);
+                    int cm = seasons[s]; int sLimit = Math.Min(cm, CAP); seasonLimit[s] = sLimit;
                     if (cm > CAP) cappedSeasons++;
                     bool isCurrent = (s == curSeason);
-                    // skip OLD seasons already fully fetched (they never change); the current season is always re-checked for new games
-                    if (!isCurrent && cache.SeasonDone.TryGetValue(s, out var doneCm) && doneCm >= cm) { donePages += sLimit; progress?.Invoke(Math.Min(donePages, totalPages), totalPages); continue; }
-                    var gotS = new HashSet<int>();
-                    bool brokeEarly = false; int reached = sLimit;   // reached = deepest page actually ATTEMPTED (the early-out stops short)
-                    for (int start = 1; start <= sLimit; start += CONC)
-                    {
-                        ct.ThrowIfCancellationRequested();
-                        var batch = Enumerable.Range(start, Math.Min(CONC, sLimit - start + 1)).ToList();
-                        donePages += batch.Count; fetchedPages += batch.Count;
-                        progress?.Invoke(Math.Min(donePages, totalPages), totalPages);
-                        var (mx, gp, ms) = await FetchJsonBatch(id, batch, s, ct);
-                        reached = batch[batch.Count - 1];
-                        foreach (var p in gp) gotS.Add(p);
-                        int before = merged.Count;
-                        foreach (var m in ms) if (m?.MatchId != null && have.Add(m.MatchId)) merged.Add(m);
-                        // current-season incremental: once a batch adds nothing new, we've reached already-cached games → stop deepening
-                        if (incremental && isCurrent && start > 1 && merged.Count == before && gp.Count == batch.Count) { brokeEarly = true; break; }
-                        await Task.Delay(120, ct);
-                    }
-                    // retry ONLY pages we actually attempted (NOT the ones the incremental early-out intentionally skipped — else it refetches the whole season)
-                    var missing = Enumerable.Range(1, reached).Where(p => !gotS.Contains(p)).ToList();
-                    for (int attempt = 0; attempt < 2 && missing.Count > 0; attempt++)
-                    {
-                        for (int k = 0; k < missing.Count; k += 6)
-                        {
-                            ct.ThrowIfCancellationRequested();
-                            var batch = missing.Skip(k).Take(6).ToList();
-                            progress?.Invoke(-1, totalPages);
-                            var (mx, gp, ms) = await FetchJsonBatch(id, batch, s, ct);
-                            foreach (var p in gp) gotS.Add(p);
-                            foreach (var m in ms) if (m?.MatchId != null && have.Add(m.MatchId)) merged.Add(m);
-                            await Task.Delay(150, ct);
-                        }
-                        missing = Enumerable.Range(1, reached).Where(p => !gotS.Contains(p)).ToList();
-                    }
-                    int deepS = 0; while (gotS.Contains(deepS + 1)) deepS++;
-                    if (deepS >= sLimit && cm <= CAP) cache.SeasonDone[s] = cm;   // fully fetched, non-capped → immutable, mark done
-                    else if (!brokeEarly && deepS < sLimit) anyGap = true;        // pages genuinely failed after retries (not an early-out) → don't claim complete
+                    if (!isCurrent && cache.SeasonDone.TryGetValue(s, out var doneCm) && doneCm >= cm) continue;   // immutable old season already complete → skip
+                    for (int p = 1; p <= sLimit; p++) allJobs.Add((s, p));
+                }
+                var (mxA, gotA, msA) = await FetchAllJobs(id, allJobs, CONC, (d, t) => progress?.Invoke(Math.Min(d, totalPages), totalPages), ct);
+                foreach (var m in msA) if (m?.MatchId != null && have.Add(m.MatchId)) merged.Add(m);
+                var missA = allJobs.Where(j => !gotA.Contains(j.Item1 + ":" + j.Item2)).ToList();   // straggler cleanup pass (pool already self-retried each job 3×)
+                if (missA.Count > 0) { progress?.Invoke(-1, totalPages); var (mxB, gotB, msB) = await FetchAllJobs(id, missA, CONC, null, ct); foreach (var k in gotB) gotA.Add(k); foreach (var m in msB) if (m?.MatchId != null && have.Add(m.MatchId)) merged.Add(m); }
+                // per-season completeness from the merged got-set
+                bool anyGap = false;
+                foreach (var kv in seasonLimit)
+                {
+                    int s = kv.Key, sLimit = kv.Value, cm = seasons[s];
+                    bool isCurrent = (s == curSeason);
+                    if (!isCurrent && cache.SeasonDone.TryGetValue(s, out var dCm) && dCm >= cm) continue;   // not scanned this round (already done)
+                    var gp = new HashSet<int>();
+                    foreach (var k in gotA) { var pp = k.Split(':'); if (pp.Length == 2 && int.TryParse(pp[0], out var sv) && sv == s && int.TryParse(pp[1], out var pg)) gp.Add(pg); }
+                    int deepS = 0; while (gp.Contains(deepS + 1)) deepS++;
+                    if (!isCurrent && deepS >= sLimit && cm <= CAP) cache.SeasonDone[s] = cm;   // fully fetched, non-capped, immutable → mark done (never the current season)
+                    else if (deepS < sLimit) anyGap = true;                                     // pages genuinely failed after retries → don't claim complete
                 }
                 merged.Sort((a, b) => string.CompareOrdinal(b.Time ?? "", a.Time ?? ""));
                 bool complete = cappedSeasons == 0 && !anyGap;   // full history ONLY if nothing capped AND no season left pages unfetched
@@ -2173,7 +2597,7 @@ namespace SmiteGodLab
             }
             catch { return null; }
             if (map.Count == 0) return null;
-            try { File.WriteAllText(f, JsonSerializer.Serialize(map)); } catch { }
+            try { Theme.AtomicWriteText(f, JsonSerializer.Serialize(map)); } catch { }   // atomic god/item name map write
             return map;
         }
 
@@ -2186,15 +2610,19 @@ namespace SmiteGodLab
                 await EnsureReady();
                 _wv.CoreWebView2.Navigate("https://api.smite.guru/v3/matches/pc/" + matchId);   // clears CF + body = the match JSON
                 MDetail md = null;
-                var deadline = DateTime.UtcNow.AddSeconds(30);
-                string script = "(function(){try{var t=document.body?document.body.innerText:'';if(!t||t.charAt(0)!=='{')return null;var j=JSON.parse(t);if(j&&j.players&&j.match_id)return t;return null;}catch(e){return null;}})()";
+                var deadline = DateTime.UtcNow.AddSeconds(15);   // CF clear + fetch; shorter so a missing/old match fails fast
+                // return the match JSON when ready, or "__ERR__" the moment smite.guru answers with {"error":...} (old match
+                // whose detail it no longer stores) so we bail immediately instead of polling the whole deadline.
+                string script = "(function(){try{var t=document.body?document.body.innerText:'';if(!t||t.charAt(0)!=='{')return null;var j=JSON.parse(t);if(j&&j.players&&j.match_id)return t;if(j&&j.error)return '__ERR__';return null;}catch(e){return null;}})()";
                 while (DateTime.UtcNow < deadline)
                 {
                     ct.ThrowIfCancellationRequested();
                     await Task.Delay(300, ct);
                     var r = await Eval(script, 5000);
                     if (string.IsNullOrEmpty(r) || r == "null") continue;
-                    try { var inner = JsonSerializer.Deserialize<string>(r); md = JsonSerializer.Deserialize<MDetail>(inner, JOpt); if (md != null) break; } catch { }
+                    string inner; try { inner = JsonSerializer.Deserialize<string>(r); } catch { continue; }
+                    if (inner == "__ERR__") break;   // smite.guru has no stored detail for this match → fail fast
+                    try { md = JsonSerializer.Deserialize<MDetail>(inner, JOpt); if (md != null) break; } catch { }
                 }
                 if (md == null) return (null, null, null);
                 _champs ??= await LoadIdNameMap("champions", "https://api.smite.guru/v3/champions", ct);
@@ -2205,10 +2633,69 @@ namespace SmiteGodLab
         }
 
         CacheFile LoadCache(long id) { try { var f = CacheFilePath(id); if (File.Exists(f)) { var c = JsonSerializer.Deserialize<CacheFile>(File.ReadAllText(f), JOpt) ?? new(); c.Matches = (c.Matches ?? new()).Where(m => m != null).ToList(); return c; } } catch { } return new(); }
-        void SaveCache(long id, CacheFile c) { try { File.WriteAllText(CacheFilePath(id), JsonSerializer.Serialize(c)); } catch { } }
+        void SaveCache(long id, CacheFile c) { try { Theme.AtomicWriteText(CacheFilePath(id), JsonSerializer.Serialize(c)); } catch { } }   // atomic: irreplaceable old-season history must survive a kill mid-write
         public void Wipe(long id) { try { var f = CacheFilePath(id); if (File.Exists(f)) File.Delete(f); } catch { } }
         // gated wipe — serialized through _gate so a forced refresh can't race an in-flight GetHistory's SaveCache
         public async Task WipeAsync(long id, CancellationToken ct = default) { await _gate.WaitAsync(ct); try { var f = CacheFilePath(id); if (File.Exists(f)) File.Delete(f); } catch { } finally { _gate.Release(); } }
+        // Resolve a batch of player ids → (name, account level, clan tag) from smite.guru's permanent profile cache.
+        // /v3/profiles/{id}/matches page-1 carries a `player` object (name/level/team) that is present even for accounts
+        // CURRENTLY Hi-Rez-private, as long as smite.guru ever indexed them — this is the id→name bridge GodBoard needs to
+        // turn a leaked leaderboard id into a real name. Navigate once to clear CF, then ONE concurrency-limited in-browser
+        // fetch pool (a superseded run's stragglers exit via the __gbGen token, like FetchAllJobs). Unknown/never-indexed
+        // ids simply don't appear in the result (smite.guru 404s them) → the caller treats them as unresolved.
+        public async Task<Dictionary<string, (string name, int level, string clan)>> ResolveProfilesBatch(IReadOnlyList<string> ids, CancellationToken ct)
+        {
+            var outMap = new Dictionary<string, (string name, int level, string clan)>();
+            if (ids == null || ids.Count == 0) return outMap;
+            await _gate.WaitAsync(ct);
+            try
+            {
+                await EnsureReady();
+                if (!_apiCleared) { var w = await NavigateApi(long.TryParse(ids[0], out var f0) ? f0 : 0, ct); if (w != null) _apiCleared = true; }   // clear api.smite.guru CF once
+                string arr = "[" + string.Join(",", ids.Select(i => JsonSerializer.Serialize(i))) + "]";
+                string fire =
+                    "(function(){var G=(window.__gbGen=(window.__gbGen||0)+1);var IDS=" + arr + ";var C=8;var i=0;" +
+                    "var st={done:0,total:IDS.length,fin:false};window.__gbP=st;window.__gbR=null;var out={};" +
+                    "async function one(id){var u='https://api.smite.guru/v3/profiles/'+id+'/matches?page=1';" +
+                    "for(var a=0;a<3;a++){try{var r=await fetch(u,{credentials:'include'});if(!r.ok){await new Promise(z=>setTimeout(z,150+a*250));continue;}" +
+                    "var j=await r.json();var p=j&&j.player;if(p){out[id]={name:p.name||'',level:p.level||0,clan:p.team||''};}return;" +
+                    "}catch(e){await new Promise(z=>setTimeout(z,150+a*250));}}}" +
+                    "async function worker(){while(i<IDS.length&&window.__gbGen===G){var id=IDS[i++];await one(id);st.done++;}}" +
+                    "(async function(){var ws=[];for(var w=0;w<C;w++)ws.push(worker());await Promise.all(ws);" +
+                    "if(window.__gbGen===G){window.__gbR=JSON.stringify(out);st.fin=true;}})();})();true";
+                await Eval(fire, 5000);
+                var deadline = DateTime.UtcNow.AddSeconds(60);
+                while (DateTime.UtcNow < deadline)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await Task.Delay(150, ct);
+                    var pr = await Eval("(function(){var s=window.__gbP;return s?JSON.stringify({f:s.fin}):'';})()", 4000);
+                    bool fin = false;
+                    if (!string.IsNullOrEmpty(pr) && pr != "null") { try { using var d = JsonDocument.Parse(JsonSerializer.Deserialize<string>(pr)); fin = d.RootElement.GetProperty("f").GetBoolean(); } catch { } }
+                    if (!fin) continue;
+                    var rr = await Eval("window.__gbR", 8000);
+                    if (string.IsNullOrEmpty(rr) || rr == "null") continue;
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(JsonSerializer.Deserialize<string>(rr));
+                        foreach (var p in doc.RootElement.EnumerateObject())
+                        {
+                            string nm = p.Value.TryGetProperty("name", out var n) ? (n.GetString() ?? "") : "";
+                            int lv = p.Value.TryGetProperty("level", out var l) && l.ValueKind == JsonValueKind.Number ? l.GetInt32() : 0;
+                            string cl = p.Value.TryGetProperty("clan", out var c) ? (c.GetString() ?? "") : "";
+                            outMap[p.Name] = (nm, lv, cl);
+                        }
+                    }
+                    catch { }
+                    break;
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch { }
+            finally { _gate.Release(); }
+            return outMap;
+        }
+
         // Tear down the WebView2 + host form on app exit (must run on the UI thread, which FormClosed does), so the
         // msedgewebview2.exe child process and the webview2 profile-dir lock are released instead of lingering.
         public void Shutdown()
@@ -2217,6 +2704,258 @@ namespace SmiteGodLab
             try { _host?.Dispose(); } catch { }
             try { _gate?.Dispose(); } catch { }
             _wv = null; _host = null; _env = null; _ready = false;
+        }
+    }
+
+    // ===================== Whispers: standalone (game-closed) MCTS chat =====================
+    // One persisted whisper conversation with a player.
+    // St: "" normal · "queued" (sent before the engine finished logging in — still cancellable) · "cancelled".
+    sealed class WMsg  { public long T { get; set; } public string Dir { get; set; } = "in"; public string Text { get; set; } = ""; public string St { get; set; } = ""; }
+    // Pin = sticks to the top of the list. Hidden = soft-deleted (removed from the list but history kept; reopening restores it).
+    sealed class WConv { public string Key { get; set; } = ""; public string Display { get; set; } = ""; public string Id { get; set; } = ""; public long Last { get; set; } public List<WMsg> Msgs { get; set; } = new(); public bool Pin { get; set; } public bool Hidden { get; set; } }
+    // A flicker-free panel (double-buffered) — used for the conversation list + rows so in-place updates don't repaint-flash.
+    sealed class BufPanel : Panel { public BufPanel() { DoubleBuffered = true; } }
+
+    // Spawns + manages the headless Probe5 MCTS engine and relays messages through the WHISPER_DIR file pair.
+    sealed class WhisperEngine
+    {
+        readonly string _exe, _dir, _relay;
+        System.Diagnostics.Process _proc;
+        System.Threading.Thread _worker;
+        volatile bool _run;
+        long _inPos;
+        readonly object _outLock = new object();
+        readonly Queue<string> _outQ = new Queue<string>();
+        public event Action<string> Status;          // "connecting" | "connected" | "stopped"
+        public event Action<string, string> Inbound; // (sender, text)
+        public event Action<string, bool> Presence;  // (player name, online) — from REQUEST_PLAYER_INFO responses
+        long _presPos;
+        public string State { get; private set; } = "stopped";
+
+        // Login method: "steam" (default — uses the Steam SMITE ticket, so Steam shows the game running) or
+        // "hirez" (Hi-Rez username/password — no Steam, no "playing" status, and skips the EOS/Steam startup waits).
+        string _loginMode = "steam", _stdUser = "", _stdPass = "";
+        public void SetLogin(string mode, string user, string pass)
+        {
+            _loginMode = (mode == "hirez") ? "hirez" : "steam";
+            _stdUser = user ?? ""; _stdPass = pass ?? "";
+        }
+        public string LoginMode { get { return _loginMode; } }
+
+        public WhisperEngine(string exe, string relayDir)
+        {
+            _exe = exe; _dir = Path.GetDirectoryName(exe); _relay = relayDir;
+            // Backstop: if the app exits without FormClosing (rare graceful paths), still kill the child engine.
+            try { AppDomain.CurrentDomain.ProcessExit += (s, e) => { try { Stop(); } catch { } }; } catch { }
+        }
+        public bool Running { get { try { return _proc != null && !_proc.HasExited; } catch { return false; } } }
+
+        // A crash or force-kill of a previous app run leaves Probe5.exe orphaned — and several orphans all log in as the
+        // same account, so the chat server CLOSE_CONNECTIONs the duplicates and whisper delivery silently dies. Probe5 is
+        // our private engine (unique name), so clearing every instance before we spawn a fresh one is safe.
+        static void KillStaleEngines()
+        {
+            try
+            {
+                foreach (var p in System.Diagnostics.Process.GetProcessesByName("Probe5"))
+                { try { p.Kill(); p.WaitForExit(1500); } catch { } finally { try { p.Dispose(); } catch { } } }
+            }
+            catch { }
+        }
+
+        public void Start()
+        {
+            if (Running) return;
+            KillStaleEngines();
+            try { Directory.CreateDirectory(_relay); } catch { }
+            try { File.Delete(Path.Combine(_relay, "whisper_out.txt")); } catch { }
+            try { File.Delete(Path.Combine(_relay, "whisper_in.txt")); } catch { }
+            try { File.Delete(Path.Combine(_relay, "presence.tsv")); } catch { }
+            _presPos = 0;
+            _inPos = 0;
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = _exe,
+                Arguments = "-pid=017 -steam -anon -seekfreeloadingpcconsole 5",
+                WorkingDirectory = _dir,
+                UseShellExecute = false, CreateNoWindow = true,
+                RedirectStandardOutput = true, RedirectStandardError = true,
+            };
+            var e = psi.EnvironmentVariables;
+            e["ACFLAG"] = "1"; e["SENDID"] = "0"; e["CLIENTTYPE"] = "1";
+            e["GAMETICKET"] = "0"; e["NORECON"] = "0"; e["PUMPPATCH"] = "0"; e["POLLFL"] = "1";
+            e["MESSENGER"] = "1"; e["CHATCAP"] = "1"; e["FULLCONFIGS"] = "1"; e["DIAGFIELDS"] = "0"; e["STORELOG"] = "0";
+            e["CHATDIAG"] = "0";
+            e["KEEPSECS"] = "86400"; e["WHISPER_DIR"] = _relay; e["WHISPER_TO"] = "";
+            if (_loginMode == "hirez")
+            {
+                // Hi-Rez username/password: no Steam ticket + no in-process EOS (so Steam shows nothing and connect is faster).
+                e["STD"] = "1"; e["STDUSER"] = _stdUser; e["STDPASS"] = _stdPass;
+                e["LOGINFIX"] = "0"; e["EOSINPROC"] = "0";
+            }
+            else
+            {
+                e["STD"] = "0"; e["LOGINFIX"] = "1"; e["EOSINPROC"] = "1";
+            }
+            // VERHEX / SMITEBIN intentionally unset -> Probe5 auto-detects the install + version
+            SetState("connecting");
+            try
+            {
+                _proc = new System.Diagnostics.Process { StartInfo = psi, EnableRaisingEvents = true };
+                _proc.OutputDataReceived += (s, a) => OnLine(a.Data);
+                _proc.ErrorDataReceived += (s, a) => OnLine(a.Data);
+                _proc.Exited += (s, a) => SetState("stopped");
+                _proc.Start(); _proc.BeginOutputReadLine(); _proc.BeginErrorReadLine();
+            }
+            catch { SetState("stopped"); return; }
+            _run = true;
+            _worker = new System.Threading.Thread(Worker) { IsBackground = true };
+            _worker.Start();
+        }
+
+        // Live ring buffer of the engine's stdout/stderr, captured as it streams (probe5_out.txt is only written on
+        // exit, so this is the freshest engine log for diagnostics / log export).
+        readonly System.Collections.Generic.List<string> _log = new System.Collections.Generic.List<string>();
+        readonly object _logLock = new object();
+        public string RelayDir { get { return _relay; } }
+        public string[] RecentLog() { lock (_logLock) { return _log.ToArray(); } }
+        void OnLine(string line)
+        {
+            if (line == null) return;
+            lock (_logLock) { _log.Add(DateTime.Now.ToString("HH:mm:ss") + " " + line); if (_log.Count > 5000) _log.RemoveRange(0, _log.Count - 5000); }
+            if (line.Contains("LOGGED IN & READY") || line.Contains("loggedOn=True")) SetState("connected");
+            else if (line.Contains("FATAL") || line.Contains("EXCEPTION:")) SetState("stopped");
+        }
+        void SetState(string s) { if (State == s) return; State = s; try { Status?.Invoke(s); } catch { } }
+
+        void Worker()
+        {
+            string inbox = Path.Combine(_relay, "whisper_in.txt");
+            string outbox = Path.Combine(_relay, "whisper_out.txt");
+            string presFile = Path.Combine(_relay, "presence.tsv");
+            while (_run)
+            {
+                try
+                {
+                    // Hold _outLock across the whole exists-check + write + dequeue so Cancel() can't interleave
+                    // (it deletes whisper_out.txt under the same lock) — otherwise a cancelled message could still go out.
+                    lock (_outLock)
+                    {
+                        if (_outQ.Count > 0 && !File.Exists(outbox))
+                        {
+                            File.WriteAllText(outbox, _outQ.Peek(), new UTF8Encoding(false));
+                            _outQ.Dequeue();
+                        }
+                    }
+                }
+                catch { }
+                try
+                {
+                    if (File.Exists(inbox))
+                        using (var fs = new FileStream(inbox, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                        {
+                            if (fs.Length < _inPos) _inPos = 0;
+                            if (fs.Length > _inPos)
+                            {
+                                SetState("connected");   // any inbound traffic (whisper or send-confirmation) proves we're logged in
+                                fs.Seek(_inPos, SeekOrigin.Begin);
+                                using (var sr = new StreamReader(fs, Encoding.UTF8))
+                                {
+                                    string ln;
+                                    while ((ln = sr.ReadLine()) != null)
+                                    {
+                                        if (ln.Trim().Length == 0) continue;
+                                        var parts = ln.Split(new[] { '\t' }, 3);
+                                        string sender = parts.Length >= 3 ? parts[1] : "";
+                                        string text = parts.Length >= 3 ? parts[2] : ln;
+                                        if (text.Length > 0) try { Inbound?.Invoke(sender, text); } catch { }
+                                    }
+                                    _inPos = fs.Position;
+                                }
+                            }
+                        }
+                }
+                catch { }
+                try
+                {
+                    if (File.Exists(presFile))
+                        using (var fs = new FileStream(presFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                        {
+                            if (fs.Length < _presPos) _presPos = 0;
+                            if (fs.Length > _presPos)
+                            {
+                                SetState("connected");   // a presence reply also proves the backend is talking to us
+                                fs.Seek(_presPos, SeekOrigin.Begin);
+                                using (var sr = new StreamReader(fs, Encoding.UTF8))
+                                {
+                                    string ln;
+                                    while ((ln = sr.ReadLine()) != null)
+                                    {
+                                        var parts = ln.Split('\t');   // id \t name \t 780flag (0=online,1=offline)
+                                        if (parts.Length >= 3 && parts[1].Length > 0)
+                                            try { Presence?.Invoke(parts[1], parts[2].Trim() == "0"); } catch { }
+                                    }
+                                    _presPos = fs.Position;
+                                }
+                            }
+                        }
+                }
+                catch { }
+                System.Threading.Thread.Sleep(150);
+            }
+        }
+        public void Query(System.Collections.Generic.IEnumerable<string> names)   // REQUEST_PLAYER_INFO for each (one per line)
+        {
+            try
+            {
+                var lines = new System.Collections.Generic.List<string>();
+                foreach (var n in names) if (!string.IsNullOrWhiteSpace(n) && !lines.Contains(n.Trim())) lines.Add(n.Trim());
+                if (lines.Count == 0) return;
+                File.WriteAllText(Path.Combine(_relay, "query_out.txt"), string.Join("\n", lines), new UTF8Encoding(false));
+            }
+            catch { }
+        }
+
+        public void Send(string to, string msg)
+        {
+            if (string.IsNullOrWhiteSpace(to) || string.IsNullOrEmpty(msg)) return;
+            lock (_outLock) { _outQ.Enqueue(to + "|" + msg); }
+        }
+        // Retract a queued send before it goes out. Works while it's still in the in-memory queue, or sitting in
+        // whisper_out.txt un-consumed (Probe5 only reads it once logged in, so it's safe to delete while connecting).
+        // Returns false if it already left for the server (can't unsend).
+        public bool Cancel(string to, string msg)
+        {
+            string payload = to + "|" + msg;
+            string outbox = Path.Combine(_relay, "whisper_out.txt");
+            // Everything under _outLock so the Worker's exists-check+write+dequeue can't interleave with our delete.
+            lock (_outLock)
+            {
+                bool removed = false;
+                if (_outQ.Count > 0)
+                {
+                    var keep = new Queue<string>();
+                    while (_outQ.Count > 0)
+                    {
+                        var it = _outQ.Dequeue();
+                        if (!removed && it == payload) { removed = true; continue; }
+                        keep.Enqueue(it);
+                    }
+                    while (keep.Count > 0) _outQ.Enqueue(keep.Dequeue());
+                }
+                if (!removed && State != "connected")
+                {
+                    try { if (File.Exists(outbox) && File.ReadAllText(outbox).Trim() == payload) { File.Delete(outbox); removed = true; } }
+                    catch { }
+                }
+                return removed;
+            }
+        }
+        public void Stop()
+        {
+            _run = false;
+            try { if (_proc != null && !_proc.HasExited) _proc.Kill(); } catch { }
+            SetState("stopped");
         }
     }
 
@@ -2266,9 +3005,13 @@ namespace SmiteGodLab
         Button openBtn, rescanBtn, applyBtn, reloadBtn, restoreBtn, addBtn, inspectBtn;
         Button[] navBtns;                            // left rail: 0 God Inspector, 1 Player Tracker, 2 Friend List, 3 Settings (tracker Track/Saved/Favorites/Friends are sub-tabs inside the view)
         int navIdx;
-        Panel settingsHost, friendListHost, codexHost;   // Settings / Friend List / Codex tab content
+        Panel settingsHost, friendListHost, codexHost, whispersHost;   // Settings / Friend List / Codex / Whispers tab content
+        Action _wsOnShow;                            // entering the Whispers tab: ensure the engine is started
+        Action _wsAutoStart;                          // app startup: connect the engine in the background IF that option is on
+        Action<string, string> _openWhisper;         // open/create a conversation with (player name, player id) — id may be "" for typed names
         Action _codexJumpReveal;   // set by BuildCodexPanel; scrolls the Codex to the hidden-player-reveal section (Settings link)
         SmiteGuru _sguru;          // lazily-created SmiteGuru fetcher (Encounters tab); holds the hidden WebView2
+        System.Threading.CancellationTokenSource _archiveCts;   // SMITE_ARCHIVE bulk crawl → canceled on FormClosed
         Action _flShow;                              // entering the Friend List tab: seed once, else resume the live poller
         Action _flPause;                             // leaving the Friend List tab: pause the live poller
         Button friendAddBtn;                         // ＋ add-current-player-to-Friend-List toggle (tracker)
@@ -2303,6 +3046,42 @@ namespace SmiteGodLab
 
         [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
         struct RECT { public int Left, Top, Right, Bottom; }
+
+        // ---- DPAPI (Windows per-user encryption) — used to remember the Hi-Rez password without storing it in plaintext.
+        [StructLayout(LayoutKind.Sequential)] struct DATA_BLOB { public int cbData; public IntPtr pbData; }
+        [DllImport("crypt32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool CryptProtectData(ref DATA_BLOB pDataIn, string szDataDescr, IntPtr pOptionalEntropy, IntPtr pvReserved, IntPtr pPromptStruct, int dwFlags, ref DATA_BLOB pDataOut);
+        [DllImport("crypt32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool CryptUnprotectData(ref DATA_BLOB pDataIn, IntPtr ppszDataDescr, IntPtr pOptionalEntropy, IntPtr pvReserved, IntPtr pPromptStruct, int dwFlags, ref DATA_BLOB pDataOut);
+        [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr hMem);
+        static string DpapiProtect(string plain)
+        {
+            if (string.IsNullOrEmpty(plain)) return "";
+            var inB = new DATA_BLOB(); var outB = new DATA_BLOB();
+            try
+            {
+                byte[] data = Encoding.UTF8.GetBytes(plain);
+                inB.cbData = data.Length; inB.pbData = Marshal.AllocHGlobal(data.Length); Marshal.Copy(data, 0, inB.pbData, data.Length);
+                if (!CryptProtectData(ref inB, "SmiteInspector", IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0, ref outB)) return "";
+                byte[] o = new byte[outB.cbData]; Marshal.Copy(outB.pbData, o, 0, outB.cbData);
+                return Convert.ToBase64String(o);
+            }
+            catch { return ""; }
+            finally { if (inB.pbData != IntPtr.Zero) Marshal.FreeHGlobal(inB.pbData); if (outB.pbData != IntPtr.Zero) LocalFree(outB.pbData); }
+        }
+        static string DpapiUnprotect(string b64)
+        {
+            if (string.IsNullOrEmpty(b64)) return "";
+            var inB = new DATA_BLOB(); var outB = new DATA_BLOB();
+            try
+            {
+                byte[] data = Convert.FromBase64String(b64);
+                inB.cbData = data.Length; inB.pbData = Marshal.AllocHGlobal(data.Length); Marshal.Copy(data, 0, inB.pbData, data.Length);
+                if (!CryptUnprotectData(ref inB, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0, ref outB)) return "";
+                byte[] o = new byte[outB.cbData]; Marshal.Copy(outB.pbData, o, 0, outB.cbData);
+                return Encoding.UTF8.GetString(o);
+            }
+            catch { return ""; }
+            finally { if (inB.pbData != IntPtr.Zero) Marshal.FreeHGlobal(inB.pbData); if (outB.pbData != IntPtr.Zero) LocalFree(outB.pbData); }
+        }
         // True physical client width of the form. Managed ClientSize inflates on child controls (and the form) at this
         // app's mixed DPI, so layout math that needs real pixels must read it from Win32 GetClientRect on the top-level form.
         int PhysicalClientWidth() { return GetClientRect(Handle, out var r) ? r.Right - r.Left : ClientSize.Width; }
@@ -2441,6 +3220,9 @@ namespace SmiteGodLab
             settingsHost.Dock = DockStyle.Fill; settingsHost.Visible = false;
             codexHost = BuildCodexPanel();
             codexHost.Dock = DockStyle.Fill; codexHost.Visible = false;
+            whispersHost = BuildWhispersPanel();
+            whispersHost.Dock = DockStyle.Fill; whispersHost.Visible = false;
+            bodyHost.Controls.Add(whispersHost);
             bodyHost.Controls.Add(codexHost);
             bodyHost.Controls.Add(settingsHost);
             bodyHost.Controls.Add(friendListHost);
@@ -2461,8 +3243,8 @@ namespace SmiteGodLab
             var navFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, BackColor = Theme.Panel, Padding = new Padding(S(8), S(4), S(8), S(8)) };
             // navBtns indexed by MODE: 0 God Inspector, 1 Player Tracker, 2 Friend List, 3 Settings, 4 Codex.
             // Shown in a custom order: Player Tracker on top, then Friend List, then God Inspector, then Codex, then Settings.
-            navBtns = new[] { MkNav("God Inspector"), MkNav("Player Tracker"), MkNav("Friend List"), MkNav("Settings"), MkNav("Codex") };
-            foreach (var k in new[] { 1, 2, 0, 4, 3 }) navFlow.Controls.Add(navBtns[k]);
+            navBtns = new[] { MkNav("God Inspector"), MkNav("Player Tracker"), MkNav("Friend List"), MkNav("Settings"), MkNav("Codex"), MkNav("Whispers") };
+            foreach (var k in new[] { 1, 2, 5, 0, 4, 3 }) navFlow.Controls.Add(navBtns[k]);
             for (int i = 0; i < navBtns.Length; i++) { int k = i; navBtns[i].Click += (s, e) => SelectNav(k); }
             sideRail.Controls.Add(navFlow); sideRail.Controls.Add(brandWrap); sideRail.Controls.Add(railLine);
 
@@ -2504,6 +3286,7 @@ namespace SmiteGodLab
             if (idx == 2) { SwitchMode(2); _flShow?.Invoke(); return; }
             if (idx == 3) { SwitchMode(3); return; }
             if (idx == 4) { SwitchMode(4); return; }
+            if (idx == 5) { SwitchMode(5); _wsOnShow?.Invoke(); return; }
             bool wasTracker = curMode == 1;
             SwitchMode(1);
             if (!wasTracker) _trkSubTab?.Invoke(1);   // entering the tracker → default to the Track tab (index 1; 0 is My profile)
@@ -2514,12 +3297,13 @@ namespace SmiteGodLab
         {
             curMode = mode;
             if (mode != 2) _flPause?.Invoke();   // stop the Friend List live poller whenever another tab is showing (zero FL calls while hidden)
-            bool insp = mode == 0, trk = mode == 1, fl = mode == 2, set = mode == 3, cod = mode == 4;
+            bool insp = mode == 0, trk = mode == 1, fl = mode == 2, set = mode == 3, cod = mode == 4, wsp = mode == 5;
             split.Visible = insp;
             trackerHost.Visible = trk;
             if (friendListHost != null) friendListHost.Visible = fl;
             if (settingsHost != null) settingsHost.Visible = set;
             if (codexHost != null) codexHost.Visible = cod;
+            if (whispersHost != null) whispersHost.Visible = wsp;
             bottomBar.Visible = insp;
             try { root.RowStyles[3].Height = insp ? S(48) : 0; } catch { }   // bottom bar (inspector only)
             try { root.RowStyles[0].Height = insp ? S(54) : 0; } catch { }   // top toolbar (inspector only)
@@ -2577,6 +3361,7 @@ namespace SmiteGodLab
             try { SetWindowTheme(trackMatchLv.Handle, "DarkMode_Explorer", null); } catch { }
             try { SetWindowTheme(trackSuggest.Handle, "DarkMode_Explorer", null); } catch { }
             CleanupOldExe();   // clear the renamed-aside exe a previous update left behind
+            BeginInvoke(new Action(() => { try { _wsAutoStart?.Invoke(); } catch { } }));   // optional: pre-connect the Whispers engine
             if (settings.CheckUpdates && !_updateChecked) { _updateChecked = true; BeginInvoke(new Action(async () => await CheckForUpdate(false))); }
             // Test hook (no-op in production): open a scoreboard directly so verification can screenshot the reveal.
             var tmid = Environment.GetEnvironmentVariable("SMITE_TEST_MATCHID");
@@ -2614,6 +3399,29 @@ namespace SmiteGodLab
                     }
                     catch (Exception ex) { try { File.WriteAllText(outp, "ERR " + ex.GetType().Name + ": " + ex.Message); } catch { } }
                 }));
+            // SMITE_TEST_GBLIVE: end-to-end LIVE test of the god-board reveal chain (getgodleaderboard id-leak →
+            // SmiteGuru.ResolveProfilesBatch name → GodBoard.BestMatch clan+level). Synthetic slot = Maman Brigitte (god
+            // 4301), Duel board (440), clan "Team Rival", lvl 160 → should reveal CaptainTwig (id 834980, that clan/level).
+            var tgbl = Environment.GetEnvironmentVariable("SMITE_TEST_GBLIVE");
+            if (!string.IsNullOrEmpty(tgbl))
+                BeginInvoke(new Action(async () =>
+                {
+                    string outp = Path.Combine(Theme.DataDir, "gblive_test.txt");
+                    try
+                    {
+                        File.WriteAllText(outp, "started");
+                        NameDb.Enabled = true; GodBoard.Load();
+                        _sguru ??= new SmiteGuru(this);
+                        var slot = new GodBoard.Slot { GodId = "4301", GodName = "Maman Brigitte", Tf = 1, Level = 160, Clan = "Team Rival", ClanId = 0, Mastery = 0, Queues = new List<int> { 440 } };
+                        var map = await GodBoard.ResolveSlots(new[] { slot }, (ids, c) => _sguru.ResolveProfilesBatch(ids, c), System.Threading.CancellationToken.None);
+                        var sb = new System.Text.StringBuilder();
+                        sb.AppendLine("slot: Maman Brigitte / Duel(440) / clan 'Team Rival' / lvl 160  (expect ✦ CaptainTwig)");
+                        if (map != null && map.Count > 0) foreach (var kv in map) sb.AppendLine("  REVEAL " + kv.Key + " -> '" + kv.Value.name + "' conf " + kv.Value.conf);
+                        else sb.AppendLine("  (no reveal — board/CF/clan-match miss)");
+                        File.WriteAllText(outp, sb.ToString());
+                    }
+                    catch (Exception ex) { try { File.WriteAllText(outp, "ERR " + ex.GetType().Name + ": " + ex.Message); } catch { } }
+                }));
             // SMITE_TEST_RAWFETCH="clearId|url": test alternate pagination params past the offset cap. Diagnostic only.
             var trf = Environment.GetEnvironmentVariable("SMITE_TEST_RAWFETCH");
             if (!string.IsNullOrEmpty(trf))
@@ -2629,6 +3437,16 @@ namespace SmiteGodLab
                         var sb = new System.Text.StringBuilder();
                         foreach (var u in urls) { sb.AppendLine("URL: " + u.Trim()); sb.AppendLine(await _sguru.RawFetch(cid, u.Trim(), System.Threading.CancellationToken.None)); sb.AppendLine(); File.WriteAllText(outp, sb.ToString()); }
                     }
+                    catch (Exception ex) { try { File.WriteAllText(outp, "ERR " + ex.GetType().Name + ": " + ex.Message); } catch { } }
+                }));
+            // SMITE_TEST_RECON[=path]: load smite.guru's SPA, dump every api call it makes + every endpoint string in its JS bundles → recon.txt.
+            var trc = Environment.GetEnvironmentVariable("SMITE_TEST_RECON");
+            if (!string.IsNullOrEmpty(trc))
+                BeginInvoke(new Action(async () =>
+                {
+                    string outp = Path.Combine(Theme.DataDir, "recon.txt");
+                    string path = (trc == "1" || trc.Equals("root", StringComparison.OrdinalIgnoreCase)) ? null : trc;   // "1"/"root" → homepage; else treat as a sub-path
+                    try { File.WriteAllText(outp, "started"); _sguru ??= new SmiteGuru(this); var res = await _sguru.Recon(System.Threading.CancellationToken.None, path); File.WriteAllText(outp, res); }
                     catch (Exception ex) { try { File.WriteAllText(outp, "ERR " + ex.GetType().Name + ": " + ex.Message); } catch { } }
                 }));
             // SMITE_TEST_DEEPPAGE="id:p1,p2,p3": probe whether deep pages are reachable (hard cap vs rate-limit). Diagnostic only.
@@ -2696,15 +3514,47 @@ namespace SmiteGodLab
                             string bNewest = bm.Count > 0 ? bm[0].Time : "(none)";
                             bNames = $"{bm.Count} games (cursorMax {bh.Max}, deepest {bh.Deepest}, complete {bh.Complete}), span {bOldest} -> {bNewest}; A({aId}) appears in {aInB} of B's games; names: " + (distinct.Count > 0 ? string.Join(", ", distinct) : "(none)");
                         }
-                        File.WriteAllText(sgOut, $"A({aId}) matches: {matches.Count}  (cursorMax {histA.Max}, deepest {histA.Deepest}, complete {histA.Complete})\nelapsed: {sw.Elapsed.TotalSeconds:0}s\nA scan span: {oldest}  ->  {newest}\nA games per year: {string.Join("  ", byYear)}\nhidden-slot games: {hidAll} of {matches.Count} total; 2024: {hid2024} of {m2024.Count} 2024-games (2024 range {r2024})\nencounters {aId} vs {bId} (by id): {enc}  (allied {allied}, against {against})\nencounter dates: first {firstD}  last {lastD}\nname-search in A history: {nameHits}\nlast page title: {_sguru.LastDiag}\npage1 match0 roster: {sample}\nB own-history: {bNames}");
+                        File.WriteAllText(sgOut, $"A({aId}) matches: {matches.Count}  (cursorMax {histA.Max}, deepest {histA.Deepest}, complete {histA.Complete})\nelapsed: {sw.Elapsed.TotalSeconds:0.000}s\nA scan span: {oldest}  ->  {newest}\nA games per year: {string.Join("  ", byYear)}\nhidden-slot games: {hidAll} of {matches.Count} total; 2024: {hid2024} of {m2024.Count} 2024-games (2024 range {r2024})\nencounters {aId} vs {bId} (by id): {enc}  (allied {allied}, against {against})\nencounter dates: first {firstD}  last {lastD}\nname-search in A history: {nameHits}\nlast page title: {_sguru.LastDiag}\npage1 match0 roster: {sample}\nB own-history: {bNames}");
                     }
                     catch (Exception ex) { try { File.WriteAllText(sgOut, "ERR " + ex.GetType().Name + ": " + ex.Message); } catch { } }
                 }));
+            // SMITE_ARCHIVE=1: bulk-archive smite.guru into Theme.DataDir before it shuts down. Snowball BFS over the social graph
+            // from seeds (favorites/recents/own profile + already-cached players + SMITE_ARCHIVE_SEED ids), saving each player's
+            // full history, then (phase 2) every reachable match's full scoreboard. Resumable via archive_crawl.json, gentle,
+            // cancelable on close. Point SMITE_TEST_DATADIR at the archive folder (e.g. E:\Claude\Data).
+            if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SMITE_ARCHIVE")))
+                BeginInvoke(new Action(async () => { try { await ArchiveCrawl(); } catch (OperationCanceledException) { } catch (Exception ex) { try { File.WriteAllText(Path.Combine(Theme.DataDir, "archive_status.txt"), "FATAL " + ex.GetType().Name + ": " + ex.Message); } catch { } } }));
             // Self-tests that WRITE may run ONLY against the throwaway test DataDir — never the user's real Documents\Smite
             // Inspector (these seed fake players/tags and must never pollute real data or the community store).
             bool testDir = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("SMITE_TEST_DATADIR"));
             var tgl = Environment.GetEnvironmentVariable("SMITE_TEST_GAMELOG");
             if (testDir && !string.IsNullOrEmpty(tgl)) { try { File.WriteAllText(Path.Combine(Theme.DataDir, "gamelog_selftest.txt"), GameLog.SelfTest()); } catch { } }
+            // SMITE_TEST_GODBOARD: unit-test GodBoard.BestMatch (the slot↔leaked-id join). Pure, no network. Verifies the
+            // safe-by-design decisions: clan-exact+close-level reveals; same-clan/same-god near-ties stay Hidden; a clan
+            // MISMATCH or a clanless slot stays Hidden (v1); a large level gap is rejected even with a clan match.
+            var tgb = Environment.GetEnvironmentVariable("SMITE_TEST_GODBOARD");
+            if (testDir && !string.IsNullOrEmpty(tgb)) { try {
+                Func<string, int, GodBoard.Cand> C = (id, lv) => new GodBoard.Cand { Id = id, Name = "P" + id, Clan = "FTOA", Level = lv };
+                // 1) clan-exact, unique, exact level → reveal
+                var r1 = GodBoard.BestMatch("FTOA", 150, new[] { C("1", 150), new GodBoard.Cand { Id = "2", Name = "P2", Clan = "Other", Level = 150 } });
+                // 2) two same-clan candidates at the SAME level → ambiguous → Hidden
+                var r2 = GodBoard.BestMatch("FTOA", 150, new[] { C("1", 150), C("2", 150) });
+                // 3) clanless slot → Hidden (v1 asserts only on a clan)
+                var r3 = GodBoard.BestMatch("", 150, new[] { new GodBoard.Cand { Id = "1", Name = "P1", Clan = "", Level = 150 } });
+                // 4) clan MISMATCH (no candidate in the slot's clan) → Hidden
+                var r4 = GodBoard.BestMatch("FTOA", 150, new[] { new GodBoard.Cand { Id = "1", Name = "P1", Clan = "Other", Level = 150 } });
+                // 5) clan-exact but a huge level gap (smite.guru saw lvl 60, slot is 150) → rejected (different account)
+                var r5 = GodBoard.BestMatch("FTOA", 150, new[] { C("1", 60) });
+                // 6) clan-exact, smite.guru level slightly stale (lower) → still reveals
+                var r6 = GodBoard.BestMatch("FTOA", 150, new[] { C("1", 146), new GodBoard.Cand { Id = "2", Name = "P2", Clan = "Other", Level = 150 } });
+                File.WriteAllText(Path.Combine(Theme.DataDir, "godboard_selftest.txt"),
+                    "clan-exact-unique: '" + (r1.name ?? "<none>") + "' conf" + r1.conf + "  (expect P1)\n" +
+                    "same-clan-tie:     '" + (r2.name ?? "<none>") + "'  (expect <none>)\n" +
+                    "clanless:          '" + (r3.name ?? "<none>") + "'  (expect <none>)\n" +
+                    "clan-mismatch:     '" + (r4.name ?? "<none>") + "'  (expect <none>)\n" +
+                    "level-gap:         '" + (r5.name ?? "<none>") + "'  (expect <none>)\n" +
+                    "stale-level-ok:    '" + (r6.name ?? "<none>") + "'  (expect P1)\n");
+            } catch (Exception ex) { try { File.WriteAllText(Path.Combine(Theme.DataDir, "godboard_selftest.txt"), "ERR " + ex.Message); } catch { } } }
             var tex = Environment.GetEnvironmentVariable("SMITE_TEST_EXCLUDE");
             if (testDir && !string.IsNullOrEmpty(tex)) { try {
                 NameDb.Enabled = true; NameDb.Learn("90001", "ExclAlice", 0, 100, "X", 200, "Thor", 50);
@@ -2749,6 +3599,131 @@ namespace SmiteGodLab
             // (golden master), which is the safe way to refactor/optimize the matcher without altering any reveal decision.
             var tmh = Environment.GetEnvironmentVariable("SMITE_TEST_MATCHER");
             if (testDir && !string.IsNullOrEmpty(tmh)) { try { File.WriteAllText(Path.Combine(Theme.DataDir, "matcher_harness.txt"), RunMatcherHarness()); } catch (Exception ex) { try { File.WriteAllText(Path.Combine(Theme.DataDir, "matcher_harness.txt"), "ERR " + ex.GetType().Name + ": " + ex.Message); } catch { } } }
+        }
+
+        // ===== smite.guru bulk archiver (SMITE_ARCHIVE) ================================================================
+        // Snowball BFS over the social graph: fetch each player full history (saves sguru_<id>.json), pull the 10-player
+        // rosters out, enqueue everyone new one hop deeper, repeat — then Phase 2 fetches every reachable match scoreboard
+        // (sgmatch_<id>.json). Resumable (archive_crawl.json journal, atomic), gentle (single-flight via SmiteGuru._gate +
+        // delay + distress backoff), cancelable on close. BFS-by-depth means the user own sphere is captured first; we will
+        // NOT finish a full mirror of a multi-million-player DB, but whatever we grab is the most relevant slice.
+        sealed class ArcNode { public long Id { get; set; } public int Depth { get; set; } }
+        sealed class ArcState
+        {
+            public int Version { get; set; } = 1;
+            public string Phase { get; set; } = "Histories";   // Histories -> Scoreboards -> Done
+            public List<ArcNode> Frontier { get; set; } = new();
+            public HashSet<long> Visited { get; set; } = new();
+            public int MaxDepth { get; set; } = 2;   // bounds frontier growth; raise via SMITE_ARCHIVE_MAXDEPTH for more breadth
+            public int Players { get; set; }
+            public int Scoreboards { get; set; }
+            public string StartedAt { get; set; } = "";
+        }
+
+        // Seeds: explicit SMITE_ARCHIVE_SEED list, the user own profile + in-memory favorites/recents, and every player ALREADY
+        // cached in the archive dir (so a re-run keeps snowballing from where it left off even if the journal was lost).
+        List<long> SeedArchiveIds(string dir)
+        {
+            var ids = new List<long>();
+            void Add(string s) { if (long.TryParse((s ?? "").Trim(), out var v) && v > 0) ids.Add(v); }
+            var env = Environment.GetEnvironmentVariable("SMITE_ARCHIVE_SEED");
+            if (!string.IsNullOrEmpty(env)) foreach (var s in env.Split(',', ';')) Add(s);
+            Add(settings?.MyProfileId);
+            try { foreach (var f in favorites) Add(f?.Id); } catch { }
+            try { foreach (var r in recents) Add(r?.Id); } catch { }
+            try { foreach (var fn in Directory.GetFiles(dir, "sguru_*.json")) { var n = Path.GetFileNameWithoutExtension(fn); if (n.Length > 6) Add(n.Substring(6)); } } catch { }
+            return ids.Distinct().ToList();
+        }
+
+        async Task ArchiveCrawl()
+        {
+            string dir = Theme.DataDir;
+            string jp = Path.Combine(dir, "archive_crawl.json");
+            string statusFile = Path.Combine(dir, "archive_status.txt");
+            _archiveCts ??= new System.Threading.CancellationTokenSource();
+            var ct = _archiveCts.Token;
+            _sguru ??= new SmiteGuru(this);
+
+            ArcState st;
+            try { st = File.Exists(jp) ? (JsonSerializer.Deserialize<ArcState>(File.ReadAllText(jp)) ?? new ArcState()) : new ArcState(); }
+            catch { st = new ArcState(); }
+            if (st.Version != 1) st = new ArcState();
+            if (string.IsNullOrEmpty(st.StartedAt)) st.StartedAt = DateTime.UtcNow.ToString("o");
+            if (int.TryParse(Environment.GetEnvironmentVariable("SMITE_ARCHIVE_MAXDEPTH"), out var mdEnv) && mdEnv > 0) st.MaxDepth = mdEnv;
+
+            var seen = new HashSet<long>(st.Visited);
+            foreach (var n in st.Frontier) seen.Add(n.Id);
+            foreach (var id in SeedArchiveIds(dir)) if (id > 0 && seen.Add(id)) st.Frontier.Add(new ArcNode { Id = id, Depth = 0 });
+
+            void Save() { try { Theme.AtomicWriteText(jp, JsonSerializer.Serialize(st)); } catch { } }
+            void Status(string s) { try { File.WriteAllText(statusFile, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + s + "\nphase=" + st.Phase + " players=" + st.Visited.Count + " frontier=" + st.Frontier.Count + " scoreboards=" + st.Scoreboards + " (started " + st.StartedAt + ")"); } catch { } }
+
+            var rnd = new Random();
+            int interDelay = 1500;
+            if (int.TryParse(Environment.GetEnvironmentVariable("SMITE_ARCHIVE_DELAYMS"), out var dEnv) && dEnv >= 0) interDelay = dEnv;
+
+            // ---- Phase 1: histories (priority BFS by depth → user sphere first) ----
+            try
+            {
+            int zeroStreak = 0, sinceSave = 0;
+            while (st.Phase == "Histories" && st.Frontier.Count > 0 && !ct.IsCancellationRequested)
+            {
+                int bi = 0; for (int i = 1; i < st.Frontier.Count; i++) if (st.Frontier[i].Depth < st.Frontier[bi].Depth) bi = i;
+                var node = st.Frontier[bi]; st.Frontier.RemoveAt(bi);
+                if (st.Visited.Contains(node.Id)) continue;
+
+                List<long> roster;
+                if (SmiteGuru.HasCache(node.Id))
+                {
+                    roster = SmiteGuru.CachedRosterIds(node.Id);   // already archived → expand the frontier without touching the network
+                }
+                else
+                {
+                    Status("fetching history for " + node.Id + " (depth " + node.Depth + ")");
+                    var h = await _sguru.GetHistory(node.Id, 400, null, ct);
+                    if (h.Matches.Count == 0 && !h.Complete)
+                    {
+                        st.Frontier.Insert(0, node);   // origin likely unreachable (504) → requeue, back off, bail after a few so a re-run resumes
+                        if (++zeroStreak >= 4) { Status("paused — smite.guru origin unreachable; re-run to resume"); Save(); return; }
+                        await Task.Delay(8000, ct); continue;
+                    }
+                    zeroStreak = 0;
+                    roster = new List<long>();
+                    foreach (var m in h.Matches) if (m?.Players != null) foreach (var p in m.Players) if (p.Id > 0) roster.Add(p.Id);
+                    await Task.Delay(interDelay + rnd.Next(0, 750), ct);   // gentle pacing only after a real network fetch
+                }
+                st.Visited.Add(node.Id); st.Players = st.Visited.Count;
+                if (node.Depth + 1 <= st.MaxDepth)
+                    foreach (var rid in roster) if (rid > 0 && seen.Add(rid)) st.Frontier.Add(new ArcNode { Id = rid, Depth = node.Depth + 1 });
+                if (++sinceSave >= 25) { Save(); sinceSave = 0; }   // debounce: cached histories self-heal the frontier on re-seed, so losing a few frontier entries is harmless
+                Status("archived " + node.Id);
+            }
+            if (st.Phase == "Histories" && st.Frontier.Count == 0 && !ct.IsCancellationRequested) { st.Phase = "Scoreboards"; Save(); }
+
+            // ---- Phase 2: scoreboards — the rich data (10 players + full stats per match), fetched in CONCURRENT batches ----
+            if (st.Phase == "Scoreboards" && !ct.IsCancellationRequested)
+            {
+                int conc = 16; if (int.TryParse(Environment.GetEnvironmentVariable("SMITE_ARCHIVE_SBCONC"), out var cEnv) && cEnv > 0) conc = cEnv;
+                long clearId = st.Visited.Count > 0 ? st.Visited.First() : 0;
+                int sbZero = 0;
+                foreach (var pid in st.Visited.ToList())
+                {
+                    if (ct.IsCancellationRequested) break;
+                    var mids = SmiteGuru.CachedMatchIds(pid).Distinct().Where(m => !SmiteGuru.HasMatch(m)).ToList();
+                    for (int k = 0; k < mids.Count && !ct.IsCancellationRequested; k += conc)
+                    {
+                        var batch = mids.Skip(k).Take(conc).ToList();
+                        Status("scoreboards x" + batch.Count + " (player " + pid + ")");
+                        int saved = await _sguru.FetchMatchDetailsToDisk(clearId, batch, conc, ct);
+                        if (saved == 0) { if (++sbZero >= 4) { Status("paused (scoreboards) — origin unreachable; re-run to resume"); Save(); return; } await Task.Delay(8000, ct); continue; }
+                        sbZero = 0; st.Scoreboards += saved; Save();
+                        await Task.Delay(interDelay + rnd.Next(0, 500), ct);
+                    }
+                }
+                if (!ct.IsCancellationRequested) { st.Phase = "Done"; Save(); Status("DONE"); }
+            }
+            }
+            finally { Save(); }   // always persist the journal on exit (cancel / app close / error) so a re-run resumes cleanly
         }
 
         // Deterministic matcher characterization harness (SMITE_TEST_MATCHER). No RNG/time-of-day dependence beyond Today (all
@@ -3805,6 +4780,33 @@ namespace SmiteGodLab
             foreach (var q in RankedQueues) { int t = GI(r, q + "_Tier"); if (t > 0) (d ??= new())[q] = (t, GI(r, "Rank_Stat_" + q)); }
             return d;
         }
+
+        // When the user manually names a hidden player, recover that account's REAL player_id via the getplayeridbyname
+        // NAME→id leak (verified 2026-06-25: this endpoint returns the real id + portal + privacy_flag even for privacy=y
+        // accounts, while getplayer masks the same id to 0). A manual ★ tag on a hidden slot otherwise has NO id (the
+        // completed match zeroes it), so it can only re-match by fuzzy fingerprint; anchoring the learned name by the real
+        // id makes the SAME account recognised by id in other matches. GUARD: only anchor if the named account is itself
+        // PRIVATE (privacy_flag=y) — a public account would not be hidden in the scoreboard, so a privacy=n hit means the
+        // typed name belongs to a different (public) player and must not be id-anchored to this hidden slot. Best-effort.
+        async Task ConfirmHiddenNameAsync(string nick, int clanId, string clan, int acct, int mast, string god, List<string> companions, List<string> neighbors)
+        {
+            try
+            {
+                if (!NameDb.Enabled || string.IsNullOrWhiteSpace(nick)) return;
+                var raw = await SmiteApi.Call("getplayeridbyname", nick.Trim());
+                using var doc = JsonDocument.Parse(raw);
+                if (doc.RootElement.ValueKind != JsonValueKind.Array || doc.RootElement.GetArrayLength() == 0) return;
+                var e0 = doc.RootElement[0];
+                string id = e0.TryGetProperty("player_id", out var pe) ? (pe.ValueKind == JsonValueKind.Number ? pe.GetInt64().ToString() : (pe.GetString() ?? "")) : "";
+                string priv = e0.TryGetProperty("privacy_flag", out var fe) ? (fe.GetString() ?? "") : "";
+                int portal = 0; if (e0.TryGetProperty("portal_id", out var po)) { if (po.ValueKind == JsonValueKind.Number) portal = po.GetInt32(); else int.TryParse(po.GetString(), out portal); }
+                if (string.IsNullOrEmpty(id) || id == "0") return;
+                if (!string.Equals(priv, "y", StringComparison.OrdinalIgnoreCase)) return;   // anchor ONLY a private account (a hidden slot's real account is private)
+                NameDb.Learn(id, nick.Trim(), portal, clanId, clan, acct, god, mast, companions, neighbors);   // id-anchored → recognised by real id in other matches
+                NameDb.Save(true);
+            }
+            catch { }
+        }
         // A getplayer row is privacy-flagged when the API tags ret_msg with "Privacy" OR strips every name
         // (a console account still has Name set, so both-blank only happens for a hidden profile).
         static bool IsPrivateRow(JsonElement p)
@@ -4193,11 +5195,15 @@ namespace SmiteGodLab
 
             var chkReveal = MkChk("Also fingerprint-guess hidden players from learned names (for matches you weren't in)", settings.RevealHidden); chkReveal.BackColor = Theme.Bg; chkReveal.Location = new Point(S(2), y);
             var chkHarv = MkChk("Run background name harvester (uses API quota to grow the DB)", settings.Harvest); chkHarv.BackColor = Theme.Bg; chkHarv.Enabled = settings.RevealHidden;
-            chkReveal.CheckedChanged += (s, e) => { settings.RevealHidden = chkReveal.Checked; NameDb.Enabled = chkReveal.Checked; chkHarv.Enabled = chkReveal.Checked; if (!chkReveal.Checked) { chkHarv.Checked = false; StopHarvester(); } SaveSettings(); RefreshReveal(); };
+            var chkRanked = MkChk("De-anonymize hidden RANKED players via leaderboards (queries smite.guru)", settings.RankedReveal); chkRanked.BackColor = Theme.Bg; chkRanked.Enabled = settings.RevealHidden;
+            chkReveal.CheckedChanged += (s, e) => { settings.RevealHidden = chkReveal.Checked; NameDb.Enabled = chkReveal.Checked; chkHarv.Enabled = chkReveal.Checked; chkRanked.Enabled = chkReveal.Checked; if (!chkReveal.Checked) { chkHarv.Checked = false; chkRanked.Checked = false; settings.RankedReveal = false; StopHarvester(); } SaveSettings(); RefreshReveal(); };
             Add(chkReveal); y += S(28);
             chkHarv.Location = new Point(S(2), y);
             chkHarv.CheckedChanged += (s, e) => { settings.Harvest = chkHarv.Checked; SaveSettings(); if (chkHarv.Checked && settings.RevealHidden) StartHarvester(); else StopHarvester(); RefreshReveal(); };
             Add(chkHarv); y += S(26);
+            chkRanked.Location = new Point(S(2), y);
+            chkRanked.CheckedChanged += (s, e) => { settings.RankedReveal = chkRanked.Checked; SaveSettings(); };
+            Add(chkRanked); y += S(26);
             lblHarv = Lbl("", Theme.Dim, 8.5f, y); Add(lblHarv); y += S(24);
 
             lblCounts = Lbl("", Theme.Dim, 8.5f, y); Add(lblCounts); y += S(24);
@@ -4251,6 +5257,786 @@ namespace SmiteGodLab
             }
             _avatarCache[url] = img;
             return img;
+        }
+
+        // The Whispers tab: a WhatsApp-style messenger that whispers live SMITE players with the game CLOSED.
+        // Left = conversation list + new-whisper; right = the selected thread; top = connection status.
+        Panel BuildWhispersPanel()
+        {
+            string wDir       = Path.Combine(Theme.DataDir, "Whispers");
+            string relayDir   = Path.Combine(wDir, "relay");
+            string convFile   = Path.Combine(wDir, "conversations.json");
+            try { Directory.CreateDirectory(relayDir); } catch { }
+
+            string FindProbe()
+            {
+                foreach (var p in new[] {
+                    Path.Combine(Theme.AppDir, "whisper", "Probe5.exe"),
+                    Path.Combine(Theme.AppDir, "_work", "mctsprobe", "Probe5.exe"),
+                    @"E:\Claude\Apps\Smite Ressurection\_work\mctsprobe\Probe5.exe",
+                }) { try { if (File.Exists(p)) return p; } catch { } }
+                return null;
+            }
+            string probeExe = FindProbe();
+
+            // Fold confusable Cyrillic/Greek lookalikes to ASCII so "Darius" and "Darіus" are the SAME conversation.
+            string NormKey(string s)
+            {
+                if (string.IsNullOrEmpty(s)) return "";
+                var sb = new StringBuilder(s.Length);
+                foreach (char c0 in s.Trim().ToLowerInvariant())
+                {
+                    char c = c0;
+                    switch (c)
+                    {
+                        case 'а': c = 'a'; break; case 'е': c = 'e'; break; case 'о': c = 'o'; break; case 'р': c = 'p'; break;
+                        case 'с': c = 'c'; break; case 'х': c = 'x'; break; case 'у': c = 'y'; break; case 'к': c = 'k'; break;
+                        case 'м': c = 'm'; break; case 'т': c = 't'; break; case 'н': c = 'h'; break; case 'в': c = 'b'; break;
+                        case 'і': c = 'i'; break; case 'ї': c = 'i'; break; case 'ј': c = 'j'; break; case 'ѕ': c = 's'; break;
+                        case 'α': c = 'a'; break; case 'ο': c = 'o'; break; case 'ν': c = 'v'; break; case 'ρ': c = 'p'; break;
+                        case 'τ': c = 't'; break; case 'ι': c = 'i'; break; case 'κ': c = 'k'; break; case 'χ': c = 'x'; break;
+                        case 'υ': c = 'u'; break; case 'ε': c = 'e'; break; case 'β': c = 'b'; break;
+                    }
+                    sb.Append(c);
+                }
+                return sb.ToString();
+            }
+            var convs = new Dictionary<string, WConv>(StringComparer.OrdinalIgnoreCase);
+            try { if (File.Exists(convFile)) convs = JsonSerializer.Deserialize<Dictionary<string, WConv>>(File.ReadAllText(convFile)) ?? convs; } catch { }
+            // migrate old (un-normalized) keys → normalized, merging any duplicates
+            {
+                var merged = new Dictionary<string, WConv>(StringComparer.OrdinalIgnoreCase);
+                foreach (var kv in convs)
+                {
+                    string k = NormKey(string.IsNullOrEmpty(kv.Value.Display) ? kv.Key : kv.Value.Display);
+                    if (k.Length == 0) continue;
+                    if (merged.TryGetValue(k, out var ex)) { ex.Msgs.AddRange(kv.Value.Msgs); ex.Msgs.Sort((a, b) => a.T.CompareTo(b.T)); ex.Last = Math.Max(ex.Last, kv.Value.Last); if (string.IsNullOrEmpty(ex.Id)) ex.Id = kv.Value.Id; ex.Pin = ex.Pin || kv.Value.Pin; ex.Hidden = ex.Hidden && kv.Value.Hidden; }
+                    else { kv.Value.Key = k; merged[k] = kv.Value; }
+                }
+                convs = merged;
+            }
+            // A "queued" marker only means "waiting for this session's login to finish" — stale across restarts, so clear it.
+            foreach (var c in convs.Values) foreach (var m in c.Msgs) if (m.St == "queued") m.St = "";
+            void SaveConvs() { try { Directory.CreateDirectory(wDir); Theme.AtomicWriteText(convFile, JsonSerializer.Serialize(convs)); } catch { } }
+
+            WhisperEngine engine = probeExe != null ? new WhisperEngine(probeExe, relayDir) : null;
+            string activeKey = null;
+
+            // ---- login method (Steam ticket vs Hi-Rez username/password) ----
+            // Persist the choice + username; the password is kept in memory only (re-entered each app session).
+            string loginFile = Path.Combine(wDir, "login.json");
+            string loginMode = "steam", loginUser = "", loginPass = "";
+            bool loginAuto = false;       // connect the engine in the background when the app opens
+            bool loginRemember = false;   // remember the Hi-Rez password (stored DPAPI-encrypted, per Windows user)
+            try { if (File.Exists(loginFile)) { using var ld = JsonDocument.Parse(File.ReadAllText(loginFile));
+                if (ld.RootElement.TryGetProperty("mode", out var lm)) loginMode = lm.GetString() ?? "steam";
+                if (ld.RootElement.TryGetProperty("user", out var lu)) loginUser = lu.GetString() ?? "";
+                if (ld.RootElement.TryGetProperty("auto", out var la)) loginAuto = la.GetBoolean();
+                if (ld.RootElement.TryGetProperty("remember", out var lr)) loginRemember = lr.GetBoolean();
+                if (loginRemember && ld.RootElement.TryGetProperty("pass", out var lp)) loginPass = DpapiUnprotect(lp.GetString() ?? "");
+            } } catch { }
+            if (loginMode != "hirez") loginMode = "steam";
+            void SaveLogin() { try { Directory.CreateDirectory(wDir); Theme.AtomicWriteText(loginFile, JsonSerializer.Serialize(new { mode = loginMode, user = loginUser, auto = loginAuto, remember = loginRemember, pass = loginRemember ? DpapiProtect(loginPass) : "" })); } catch { } }
+            void ApplyLogin() { if (engine != null) engine.SetLogin(loginMode, loginUser, loginPass); }
+            ApplyLogin();
+            // Hi-Rez mode can only connect once a password is supplied (it's never persisted).
+            bool LoginReady() { return loginMode == "steam" || (loginMode == "hirez" && loginUser.Length > 0 && loginPass.Length > 0); }
+
+            var root = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg };
+
+            // ---- top status bar ----
+            var statusBar = new Panel { Dock = DockStyle.Top, Height = S(40), BackColor = Theme.Panel };
+            var statusLine = new Panel { Dock = DockStyle.Bottom, Height = S(1), BackColor = Theme.Line };
+            var dot = new Panel { Size = new Size(S(11), S(11)), Location = new Point(S(16), S(15)), BackColor = Theme.Dim };
+            var statusLbl = new Label { AutoSize = true, Location = new Point(S(34), S(12)), ForeColor = Theme.Dim, Font = Theme.F(10f, FontStyle.Bold), BackColor = Theme.Panel, Text = "disconnected" };
+            var topBtns = new Panel { Dock = DockStyle.Right, Width = S(238), BackColor = Theme.Panel };
+            var logsBtn = new Button { Dock = DockStyle.Left, Width = S(122), Text = "Export Logs", FlatStyle = FlatStyle.Flat, BackColor = Theme.Panel, ForeColor = Theme.Dim, Font = Theme.F(9f, FontStyle.Bold), Cursor = Cursors.Hand };
+            logsBtn.FlatAppearance.BorderColor = Theme.Line;
+            var loginBtn = new Button { Dock = DockStyle.Right, Width = S(108), Text = "⚙ Login", FlatStyle = FlatStyle.Flat, BackColor = Theme.Panel, ForeColor = Theme.Dim, Font = Theme.F(9f, FontStyle.Bold), Cursor = Cursors.Hand };
+            loginBtn.FlatAppearance.BorderColor = Theme.Line;
+            topBtns.Controls.Add(logsBtn); topBtns.Controls.Add(loginBtn);
+            statusBar.Controls.Add(dot); statusBar.Controls.Add(statusLbl); statusBar.Controls.Add(topBtns); statusBar.Controls.Add(statusLine);
+            var blink = new System.Windows.Forms.Timer { Interval = 450 };
+            bool blinkOn = false;
+            blink.Tick += (s, e) => { blinkOn = !blinkOn; dot.BackColor = blinkOn ? Theme.Accent : Theme.Panel; };
+            bool _gameOpen = false;   // a SAME-ACCOUNT SMITE game is running -> its chat session conflicts with ours
+            // Only a STEAM SMITE can be the messenger's own account (NuclearFart logs in via Steam) and steal our chat
+            // session. An Epic install is necessarily a DIFFERENT Hi-Rez account (e.g. CEOofSlash) and doesn't conflict —
+            // so we must NOT warn for it. Distinguish by the running exe's install path.
+            bool CheckGameOpen()
+            {
+                try
+                {
+                    foreach (var p in System.Diagnostics.Process.GetProcessesByName("Smite"))
+                    {
+                        string path = "";
+                        try { path = (p.MainModule != null ? p.MainModule.FileName : "") ?? ""; } catch { }
+                        try { p.Dispose(); } catch { }
+                        if (path.Replace('/', '\\').ToLowerInvariant().Contains("steamapps")) return true;
+                    }
+                }
+                catch { }
+                return false;
+            }
+
+            void SetStatus(string st)
+            {
+                // The messenger and a SAME-ACCOUNT live SMITE game can't share one chat session — the server
+                // CLOSE_CONNECTIONs the duplicate, so whispers silently stop delivering. Warn only for that case.
+                if (_gameOpen)
+                {
+                    blink.Stop(); dot.BackColor = Theme.Accent;
+                    statusLbl.Text = "⚠ SMITE is open on Steam — close it to whisper";
+                    statusLbl.ForeColor = Theme.Accent;
+                    return;
+                }
+                if (st == "connected") { blink.Stop(); dot.BackColor = Theme.Green; statusLbl.Text = "connected"; statusLbl.ForeColor = Theme.Green; return; }
+                int n = QueuedCount();
+                if (st == "connecting") { statusLbl.ForeColor = Theme.Accent; if (!blink.Enabled) blink.Start(); statusLbl.Text = n > 0 ? "connecting… (" + n + " queued)" : "connecting…"; }
+                else { blink.Stop(); dot.BackColor = Color.FromArgb(120, 50, 50); statusLbl.ForeColor = Theme.Dim; statusLbl.Text = n > 0 ? "disconnected (" + n + " queued)" : "disconnected"; }
+            }
+
+            // ---- left column: new-whisper + conversation list ----
+            var left = new Panel { Dock = DockStyle.Left, Width = S(280), BackColor = Theme.Panel };
+            var leftLine = new Panel { Dock = DockStyle.Right, Width = S(1), BackColor = Theme.Line };
+            var newRow = new Panel { Dock = DockStyle.Top, Height = S(46), BackColor = Theme.Panel, Padding = new Padding(S(10), S(8), S(10), S(6)) };
+            var pickBtn = new Button { Dock = DockStyle.Right, Width = S(34), Text = "…", FlatStyle = FlatStyle.Flat, BackColor = Theme.Input, ForeColor = Theme.Text, Font = Theme.F(12f, FontStyle.Bold), Cursor = Cursors.Hand };
+            pickBtn.FlatAppearance.BorderColor = Theme.Line;
+            var newName = new TextBox { Dock = DockStyle.Fill, BackColor = Theme.Input, ForeColor = Theme.Text, BorderStyle = BorderStyle.FixedSingle, Font = Theme.F(10f), Text = "" };
+            var newHint = new Label { Text = "New whisper — type a name + Enter", Dock = DockStyle.Bottom, Height = S(0), ForeColor = Theme.Dim, Font = Theme.F(8f) };
+            newRow.Controls.Add(newName); newRow.Controls.Add(pickBtn);
+            var convList = new BufPanel { Dock = DockStyle.Fill, BackColor = Theme.Panel, AutoScroll = true };
+            left.Controls.Add(convList); left.Controls.Add(newRow); left.Controls.Add(leftLine);
+
+            // ---- right column: thread header + messages + input ----
+            var right = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg };
+            var threadHead = new Panel { Dock = DockStyle.Top, Height = S(38), BackColor = Theme.Bg };
+            var threadHeadLine = new Panel { Dock = DockStyle.Bottom, Height = S(1), BackColor = Theme.Line };
+            var peerLbl = new Label { AutoSize = true, Location = new Point(S(16), S(9)), ForeColor = Theme.Text, Font = Theme.F(12f, FontStyle.Bold), BackColor = Theme.Bg, Text = "" };
+            var peerDot = new Panel { Size = new Size(S(9), S(9)), BackColor = Theme.Dim, Visible = false };
+            var peerStatus = new Label { AutoSize = true, Location = new Point(S(40), S(11)), ForeColor = Theme.Dim, Font = Theme.F(9.5f, FontStyle.Bold), BackColor = Theme.Bg, Text = "" };
+            threadHead.Controls.Add(peerLbl); threadHead.Controls.Add(peerDot); threadHead.Controls.Add(peerStatus); threadHead.Controls.Add(threadHeadLine);
+            // runtime presence: conv key -> last status code (3 in-game,4 online,1 lobby,2 god-select,0 offline,-1 unknown); + last-check time
+            var presCode = new Dictionary<string, int>();
+            var presWhen = new Dictionary<string, DateTime>();
+            var lastSeen = new Dictionary<string, DateTime>();   // last time we received a msg from them = they're ONLINE now (real-time, no API)
+            var qstatus = new Dictionary<string, (int code, DateTime when)>();   // live status from the backend (REQUEST_PLAYER_INFO -> token 780)
+            // Live conversation-row controls, kept across renders so the list updates IN PLACE (no flicker / no scroll-jump).
+            var rowMap = new Dictionary<string, (Panel row, Label nm, Label sub, Panel dot, Panel pin)>();
+            var rowOrder = new List<string>();
+            // Char ranges of clickable "✕ cancel" tokens in the thread -> the queued WMsg they cancel (rebuilt each RenderThread).
+            var cancelRanges = new List<(int a, int b, WMsg m)>();
+            void LayoutPresence()
+            {
+                int x = peerLbl.Left + TextRenderer.MeasureText(peerLbl.Text, peerLbl.Font).Width + S(14);
+                peerDot.Location = new Point(x, S(15)); peerStatus.Location = new Point(x + S(15), S(11));
+            }
+            void ShowPresence(int code, string txt, Color col)
+            {
+                peerDot.Visible = true;
+                peerDot.BackColor = code <= 0 ? Theme.Dim : col;
+                peerStatus.ForeColor = code <= 0 ? Theme.Dim : col;
+                peerStatus.Text = txt;   // caller supplies the exact wording
+                LayoutPresence();
+            }
+            string AgoText(DateTime t)
+            {
+                double s = (DateTime.Now - t).TotalSeconds;
+                if (s < 60) return "active just now";
+                if (s < 3600) return "active " + (int)(s / 60) + "m ago";
+                if (s < 86400) return "active " + (int)(s / 3600) + "h ago";
+                return "active " + (int)(s / 86400) + "d ago";
+            }
+            // Presence: instant Online on recent activity; otherwise the LIVE backend status (REQUEST_PLAYER_INFO ->
+            // token 780) which works for ANY player cross-platform; else "active X ago" / unknown.
+            (int code, string txt, Color col) PresenceDisplay(string key)
+            {
+                bool hasQ = qstatus.TryGetValue(key, out var q);
+                bool hasS = lastSeen.TryGetValue(key, out var seen);
+                bool qFresh = hasQ && (DateTime.Now - q.when).TotalSeconds < 60;   // live backend status (polled every 5s)
+                bool sFresh = hasS && (DateTime.Now - seen).TotalSeconds < 60;     // they messaged us very recently
+                if (qFresh)
+                {
+                    // backend status is authoritative; but a message NEWER than the last poll proves they're online
+                    if (sFresh && seen > q.when) return (4, "Online", StatusInfo(4, "").col);
+                    return q.code == 4 ? (4, "Online", StatusInfo(4, "").col) : (0, "Offline", Theme.Dim);
+                }
+                if (sFresh) return (4, "Online", StatusInfo(4, "").col);
+                if (hasS) return (-2, AgoText(seen), Theme.Dim);
+                return (-1, "status unknown", Theme.Dim);
+            }
+            var thread = new RichTextBox { Dock = DockStyle.Fill, BackColor = Theme.Bg, ForeColor = Theme.Text, BorderStyle = BorderStyle.None, ReadOnly = true, Font = Theme.F(10.5f), HideSelection = true };
+            var inputRow = new Panel { Dock = DockStyle.Bottom, Height = S(52), BackColor = Theme.Panel, Padding = new Padding(S(10), S(9), S(10), S(9)) };
+            var sendBtn = new Button { Dock = DockStyle.Right, Width = S(86), Text = "Send", FlatStyle = FlatStyle.Flat, BackColor = Theme.Accent, ForeColor = Color.White, Font = Theme.F(10f, FontStyle.Bold), Cursor = Cursors.Hand, Enabled = false };
+            sendBtn.FlatAppearance.BorderSize = 0;
+            var input = new TextBox { Dock = DockStyle.Fill, BackColor = Theme.Input, ForeColor = Theme.Text, BorderStyle = BorderStyle.FixedSingle, Font = Theme.F(11f), Enabled = false };
+            inputRow.Controls.Add(input); inputRow.Controls.Add(sendBtn);
+            var emptyHint = new Label { Dock = DockStyle.Fill, ForeColor = Theme.Dim, Font = Theme.F(11f), TextAlign = ContentAlignment.MiddleCenter, Text = probeExe == null ? "Whisper engine not found.\nBuild Probe5.exe into a 'whisper' folder next to the app." : "Pick or start a conversation on the left.\nThe game stays closed — you log in directly." };
+            right.Controls.Add(thread); right.Controls.Add(emptyHint); right.Controls.Add(threadHead); right.Controls.Add(inputRow);
+            thread.Visible = false;
+
+            root.Controls.Add(right); root.Controls.Add(left); root.Controls.Add(statusBar);
+
+            // ---- rendering helpers ----
+            string FmtTime(long t) { try { return DateTimeOffset.FromUnixTimeSeconds(t).LocalDateTime.ToString("HH:mm"); } catch { return ""; } }
+            void AppendThread(WMsg m)
+            {
+                thread.SelectionStart = thread.TextLength; thread.SelectionLength = 0;
+                if (m.Dir == "sys")
+                {
+                    thread.SelectionColor = Color.FromArgb(210, 150, 60); thread.SelectionFont = Theme.F(9f, FontStyle.Italic);
+                    thread.AppendText("⚠  " + m.Text + "\n");
+                    thread.SelectionStart = thread.TextLength; thread.ScrollToCaret(); return;
+                }
+                bool outg = m.Dir == "out";
+                bool queued = outg && m.St == "queued";
+                bool cancelled = outg && m.St == "cancelled";
+                thread.SelectionColor = Theme.Dim; thread.SelectionFont = Theme.F(8.5f);
+                thread.AppendText((queued ? "⏳ " : "") + FmtTime(m.T) + "  ");
+                thread.SelectionColor = outg ? Theme.Blue : Theme.Green; thread.SelectionFont = Theme.F(10.5f, FontStyle.Bold);
+                thread.AppendText((outg ? "You" : (activeKey != null && convs.ContainsKey(activeKey) ? convs[activeKey].Display : "")) + ": ");
+                thread.SelectionColor = cancelled ? Theme.Dim : Theme.Text;
+                thread.SelectionFont = Theme.F(10.5f, cancelled ? FontStyle.Strikeout : FontStyle.Regular);
+                thread.AppendText(m.Text);
+                if (queued)
+                {
+                    // "queued — will send when connected", plus a clickable ✕ cancel (mapped to this WMsg by char range)
+                    thread.SelectionColor = Theme.Dim; thread.SelectionFont = Theme.F(8.5f, FontStyle.Italic);
+                    thread.AppendText("   queued · ");
+                    int a = thread.TextLength;
+                    thread.SelectionColor = Theme.Accent; thread.SelectionFont = Theme.F(8.5f, FontStyle.Bold);
+                    thread.AppendText("✕ cancel");
+                    cancelRanges.Add((a, thread.TextLength, m));
+                }
+                else if (cancelled)
+                {
+                    thread.SelectionColor = Theme.Dim; thread.SelectionFont = Theme.F(8.5f, FontStyle.Italic);
+                    thread.AppendText("   cancelled");
+                }
+                thread.SelectionColor = Theme.Text; thread.SelectionFont = Theme.F(10.5f); thread.AppendText("\n");
+                thread.SelectionStart = thread.TextLength; thread.ScrollToCaret();
+            }
+            void RenderThread(string key)
+            {
+                cancelRanges.Clear();
+                thread.Clear();
+                if (key != null && convs.TryGetValue(key, out var c)) foreach (var m in c.Msgs) AppendThread(m);
+            }
+            // Click the red "✕ cancel" on a queued message to retract it (works until the engine actually sends it).
+            void CancelQueued(WMsg m)
+            {
+                string key = activeKey;   // snapshot (this runs on the UI thread, but keep it stable through the call)
+                if (m == null || m.St != "queued" || key == null) return;
+                string disp = convs.TryGetValue(key, out var c) ? c.Display : null;
+                bool removed = engine != null && disp != null && engine.Cancel(disp, m.Text);
+                m.St = removed ? "cancelled" : "";   // couldn't retract (already left for the server) -> treat as sent
+                SaveConvs();
+                RenderThread(key); RenderConvList(true);
+                RefreshConnLabel();
+            }
+            thread.MouseDown += (s, e) =>
+            {
+                if (e.Button != MouseButtons.Left || cancelRanges.Count == 0) return;
+                int ci = thread.GetCharIndexFromPosition(e.Location);
+                if (ci < 0) return;   // click outside the text bounds
+                foreach (var r in cancelRanges) if (ci >= r.a && ci < r.b) { CancelQueued(r.m); break; }
+            };
+            // The preview line under each conversation name (last message, with a ⏳/✕ marker for queued/cancelled sends).
+            string SnippetFor(WConv c)
+            {
+                if (c.Msgs.Count == 0) return "";
+                var lm = c.Msgs[c.Msgs.Count - 1];
+                string s = (lm.Dir == "out" ? "You: " : "") + lm.Text;
+                if (lm.St == "queued") s = "⏳ " + s;
+                else if (lm.St == "cancelled") s = "✕ " + s;
+                if (s.Length > 34) s = s.Substring(0, 33) + "…";
+                return s;
+            }
+            ContextMenuStrip BuildRowMenu(string key)
+            {
+                var ctx = new ContextMenuStrip { BackColor = Theme.Panel, ForeColor = Theme.Text };
+                bool pinned = convs.TryGetValue(key, out var c) && c.Pin;
+                var pin = new ToolStripMenuItem(pinned ? "Unpin conversation" : "Pin conversation") { ForeColor = Theme.Text };
+                pin.Click += (s, e) => TogglePin(key);
+                var del = new ToolStripMenuItem("Delete conversation") { ForeColor = Theme.Text };
+                del.Click += (s, e) => DeleteConv(key);
+                ctx.Items.Add(pin); ctx.Items.Add(del);
+                return ctx;
+            }
+            void TogglePin(string key)
+            {
+                if (!convs.TryGetValue(key, out var c)) return;
+                c.Pin = !c.Pin; SaveConvs(); RenderConvList(true);   // order changed -> full rebuild
+            }
+            // Refresh only the mutable bits of an existing row (highlight, name, snippet, presence dot, pin bar) — no repaint
+            // unless a value actually changed. This is what keeps the list from flickering on every 5s presence poll.
+            void UpdateRow(string key)
+            {
+                if (!rowMap.TryGetValue(key, out var r) || !convs.TryGetValue(key, out var c)) return;
+                var bg = key == activeKey ? Color.FromArgb(34, 34, 40) : Theme.Panel;
+                if (r.row.BackColor != bg) r.row.BackColor = bg;
+                if (r.nm.BackColor != bg) r.nm.BackColor = bg;
+                if (r.sub.BackColor != bg) r.sub.BackColor = bg;
+                if (r.nm.Text != c.Display) r.nm.Text = c.Display;
+                string snip = SnippetFor(c);
+                if (r.sub.Text != snip) r.sub.Text = snip;
+                var pdd = PresenceDisplay(key);
+                var dc = pdd.code > 0 ? pdd.col : Theme.Dim;
+                if (r.dot.BackColor != dc) r.dot.BackColor = dc;
+                if (r.pin.Visible != c.Pin) r.pin.Visible = c.Pin;
+            }
+            // Pinned first, then most-recent, then name (stable so the order never flaps between identical-timestamp ticks).
+            void RenderConvList(bool force = false)
+            {
+                var ordered = convs.Where(k => !k.Value.Hidden)
+                                   .OrderByDescending(k => k.Value.Pin)
+                                   .ThenByDescending(k => k.Value.Last)
+                                   .ThenBy(k => k.Key, StringComparer.OrdinalIgnoreCase)
+                                   .Select(k => k.Key).ToList();
+                // Fast path: same set+order as last render -> just update the rows in place (no Clear, no flicker, no scroll-jump).
+                bool sameShape = !force && ordered.Count == rowOrder.Count;
+                if (sameShape) for (int i = 0; i < ordered.Count; i++) if (ordered[i] != rowOrder[i] || !rowMap.ContainsKey(ordered[i])) { sameShape = false; break; }
+                if (sameShape) { foreach (var key in ordered) UpdateRow(key); return; }
+
+                // Structural change (new/removed/reordered conversation) -> rebuild.
+                convList.SuspendLayout(); convList.Controls.Clear(); rowMap.Clear(); rowOrder.Clear();
+                int y = S(4);
+                foreach (var key in ordered)
+                {
+                    var c = convs[key];
+                    var rowp = new BufPanel { Location = new Point(S(6), y), Size = new Size(left.Width - S(20), S(52)), BackColor = key == activeKey ? Color.FromArgb(34, 34, 40) : Theme.Panel, Cursor = Cursors.Hand };
+                    var pinBar = new Panel { Size = new Size(S(3), S(52)), Location = new Point(0, 0), BackColor = Theme.Accent, Visible = c.Pin };   // accent edge = pinned
+                    var nm = new Label { AutoSize = true, Location = new Point(S(12), S(7)), ForeColor = Theme.Text, Font = Theme.F(10.5f, FontStyle.Bold), BackColor = rowp.BackColor, Text = c.Display };
+                    var sub = new Label { AutoSize = true, Location = new Point(S(12), S(28)), ForeColor = Theme.Dim, Font = Theme.F(8.5f), BackColor = rowp.BackColor, Text = SnippetFor(c) };
+                    var pdot = new Panel { Size = new Size(S(9), S(9)), Location = new Point(rowp.Width - S(22), S(21)), BackColor = Theme.Dim };
+                    { var pdd = PresenceDisplay(key); if (pdd.code > 0) pdot.BackColor = pdd.col; }
+                    rowp.Controls.Add(pinBar); rowp.Controls.Add(nm); rowp.Controls.Add(sub); rowp.Controls.Add(pdot);
+                    string k2 = key;
+                    EventHandler open = (s, e) => OpenConv(k2);
+                    rowp.Click += open; nm.Click += open; sub.Click += open;
+                    var ctx = BuildRowMenu(k2);
+                    rowp.ContextMenuStrip = ctx; nm.ContextMenuStrip = ctx; sub.ContextMenuStrip = ctx;
+                    convList.Controls.Add(rowp);
+                    rowMap[key] = (rowp, nm, sub, pdot, pinBar); rowOrder.Add(key);
+                    y += S(56);
+                }
+                convList.ResumeLayout();
+            }
+            void AppendSystem(string text)
+            {
+                thread.SelectionStart = thread.TextLength; thread.SelectionLength = 0;
+                thread.SelectionColor = Theme.Dim; thread.SelectionFont = Theme.F(8.5f, FontStyle.Italic);
+                thread.AppendText("ℹ  " + text + "\n");
+                thread.SelectionStart = thread.TextLength; thread.ScrollToCaret();
+            }
+            // The chat engine knows each player's REAL Hi-Rez id (the number in "0-9-0:<id>") from the message itself
+            // — reliable cross-platform, unlike name lookup which fails for Epic accounts. Read chatcap's id->name map.
+            string LookupChatId(string display)
+            {
+                try
+                {
+                    string f = Path.Combine(relayDir, "idname.tsv");
+                    if (!File.Exists(f)) return "";
+                    string want = NormKey(display);
+                    foreach (var line in File.ReadAllLines(f))
+                    {
+                        var p = line.Split('\t');
+                        if (p.Length >= 2 && NormKey(p[1]) == want)
+                        { string id = p[0]; int ci = id.LastIndexOf(':'); return ci >= 0 ? id.Substring(ci + 1) : id; }
+                    }
+                }
+                catch { }
+                return "";
+            }
+            async System.Threading.Tasks.Task<string> ResolveId(WConv c)
+            {
+                string chatId = LookupChatId(c.Display);   // prefer the real id the chat gave us (works for Epic/cross-platform; beats a bad name-lookup)
+                if (!string.IsNullOrEmpty(chatId)) { if (c.Id != chatId) { c.Id = chatId; SaveConvs(); } return chatId; }
+                if (!string.IsNullOrEmpty(c.Id)) return c.Id;
+                try
+                {
+                    using var doc = JsonDocument.Parse(await SmiteApi.Call("getplayeridbyname", c.Display));
+                    if (doc.RootElement.ValueKind == JsonValueKind.Array && doc.RootElement.GetArrayLength() > 0)
+                    {
+                        string id = GS(doc.RootElement[0], "player_id");
+                        if (!string.IsNullOrEmpty(id) && id != "0") { c.Id = id; SaveConvs(); return id; }
+                    }
+                }
+                catch { }
+                return "";
+            }
+            // Ask the chat backend for live status of ALL open conversations in ONE batch (REQUEST_PLAYER_INFO each).
+            // Replies land in presence.tsv -> engine.Presence event -> qstatus -> PresenceDisplay. Works for ANY player.
+            void CheckPresence(string key) { QueryAllPresence(); }
+            void QueryAllPresence()
+            {
+                if (engine == null || convs.Count == 0) return;
+                var names = new List<string>();
+                foreach (var c in convs.Values) if (!c.Hidden) names.Add(c.Display);   // don't poll soft-deleted threads
+                if (names.Count > 0) engine.Query(names);
+            }
+            // Soft delete: hide the row but KEEP the full message history. Reopening (whisper them again, pick from
+            // Friends, or an incoming message) restores the thread exactly as it was.
+            void DeleteConv(string key)
+            {
+                if (key == null || !convs.TryGetValue(key, out var c)) return;
+                c.Hidden = true; c.Pin = false; SaveConvs();   // keep c.Msgs intact
+                if (activeKey == key)
+                {
+                    activeKey = null; thread.Clear(); thread.Visible = false; emptyHint.Visible = true;
+                    peerLbl.Text = ""; peerDot.Visible = false; peerStatus.Text = ""; input.Enabled = sendBtn.Enabled = false;
+                }
+                RenderConvList(true);
+            }
+            void OpenConv(string key)
+            {
+                if (key == null || !convs.TryGetValue(key, out var oc)) return;
+                bool wasHidden = oc.Hidden;
+                if (wasHidden) { oc.Hidden = false; SaveConvs(); }   // reopening a soft-deleted thread brings it back, history and all
+                activeKey = key;
+                peerLbl.Text = convs[key].Display;
+                var pd0 = PresenceDisplay(key); ShowPresence(pd0.code, pd0.txt, pd0.col);
+                CheckPresence(key);
+                emptyHint.Visible = false; thread.Visible = true;
+                input.Enabled = sendBtn.Enabled = engine != null;
+                RenderThread(key); RenderConvList(wasHidden);   // unhiding changes the list shape -> force rebuild
+                input.Focus();
+            }
+            string EnsureConv(string display, string id = null)
+            {
+                string key = NormKey(display);
+                if (key.Length == 0) return null;
+                if (!convs.ContainsKey(key)) { convs[key] = new WConv { Key = key, Display = display.Trim(), Id = id ?? "", Last = DateTimeOffset.UtcNow.ToUnixTimeSeconds() }; SaveConvs(); }
+                else if (!string.IsNullOrEmpty(id) && string.IsNullOrEmpty(convs[key].Id)) { convs[key].Id = id; SaveConvs(); }
+                return key;
+            }
+            WMsg AddMsg(string key, string dir, string text, string st = "")
+            {
+                if (!convs.TryGetValue(key, out var c)) return null;
+                if (c.Hidden && dir != "sys") c.Hidden = false;   // a real message (in or out) restores a soft-deleted thread
+                var m = new WMsg { T = DateTimeOffset.UtcNow.ToUnixTimeSeconds(), Dir = dir, Text = text, St = st };
+                c.Msgs.Add(m); c.Last = m.T; SaveConvs();
+                if (key == activeKey) AppendThread(m);
+                RenderConvList();
+                return m;
+            }
+
+            // Pending sends awaiting the server's delivery echo. If the echo (\x01SENT) doesn't arrive within a
+            // few seconds, the message was rejected (spam filter) or undeliverable (offline) -> warn.
+            var pending = new List<(string text, string key, DateTime at)>();
+
+            int QueuedCount() { int n = 0; foreach (var c in convs.Values) foreach (var m in c.Msgs) if (m.Dir == "out" && m.St == "queued") n++; return n; }
+            // Re-render the whole status bar (game warning > connection state + queued count).
+            void RefreshConnLabel() { SetStatus(engine == null ? "stopped" : engine.State); }
+            // Login finished: every message we queued during connect now actually sends — flip it to a normal send and
+            // start the delivery watch so spam/offline still gets flagged.
+            void FlushQueued()
+            {
+                bool any = false;
+                foreach (var kv in convs)
+                    foreach (var m in kv.Value.Msgs)
+                        if (m.Dir == "out" && m.St == "queued") { m.St = ""; any = true; pending.Add((m.Text, kv.Key, DateTime.Now)); }
+                if (any) { SaveConvs(); if (activeKey != null) RenderThread(activeKey); RenderConvList(true); }
+            }
+
+            // ---- engine wiring (events arrive off-thread -> marshal to UI) ----
+            void Ui(Action a) { try { if (IsHandleCreated) BeginInvoke(a); } catch { } }
+            if (engine != null)
+            {
+                engine.Status += st => Ui(() => { SetStatus(st); if (st == "connected") FlushQueued(); else RefreshConnLabel(); });
+                engine.Inbound += (sender, text) => Ui(() =>
+                {
+                    if (!string.IsNullOrEmpty(sender) && sender[0] == (char)1)   // delivery confirmation, not a message
+                    {
+                        // NOTE: the server echoes ACCEPTED messages even for OFFLINE recipients (it queues them),
+                        // so this confirms acceptance — NOT that the recipient is online. Do not infer presence.
+                        for (int i = pending.Count - 1; i >= 0; i--) if (pending[i].text == text) { pending.RemoveAt(i); break; }
+                        // The server accepted it, so it definitely LEFT — clear any lingering "queued" marker on it
+                        // (e.g. a reconnect meant the "connected" state event never fired to flush it).
+                        bool cleared = false;
+                        foreach (var kv in convs) { foreach (var m in kv.Value.Msgs) if (m.Dir == "out" && m.St == "queued" && m.Text == text) { m.St = ""; cleared = true; break; } if (cleared) break; }
+                        if (cleared) { SaveConvs(); if (activeKey != null) RenderThread(activeKey); RenderConvList(true); RefreshConnLabel(); }
+                        return;
+                    }
+                    string disp = string.IsNullOrWhiteSpace(sender) ? (activeKey != null ? convs[activeKey].Display : "?") : sender;
+                    string key = EnsureConv(disp);
+                    if (key != null)
+                    {
+                        AddMsg(key, "in", text);
+                        lastSeen[key] = DateTime.Now;   // they messaged us -> online RIGHT NOW (drives PresenceDisplay)
+                        if (activeKey == key) { var pd = PresenceDisplay(key); ShowPresence(pd.code, pd.txt, pd.col); }
+                        RenderConvList();
+                    }
+                });
+                engine.Presence += (name, online) => Ui(() =>
+                {
+                    string key = NormKey(name);
+                    qstatus[key] = (online ? 4 : 0, DateTime.Now);
+                    if (convs.ContainsKey(key))
+                    {
+                        if (activeKey == key) { var pd = PresenceDisplay(key); ShowPresence(pd.code, pd.txt, pd.col); }
+                        RenderConvList();
+                    }
+                });
+            }
+
+            void DoSend()
+            {
+                if (engine == null || activeKey == null) return;
+                string msg = input.Text.Trim(); if (msg.Length == 0) return;
+                string key = activeKey;
+                bool connected = engine.State == "connected";   // sample BEFORE Send so a mid-send flip can't double-handle it
+                engine.Send(convs[key].Display, msg);
+                // Engine still logging in -> the message is QUEUED. Show it as queued (with a ✕ cancel) and bail; the
+                // delivery/offline checks happen later, when login finishes and FlushQueued() actually sends it.
+                if (!connected)
+                {
+                    AddMsg(key, "out", msg, "queued");
+                    if (engine.State == "connected") FlushQueued();   // login finished during this send -> promote it now
+                    RefreshConnLabel();
+                    input.Clear(); input.Focus();
+                    return;
+                }
+                AddMsg(key, "out", msg);
+                // Instant offline feedback (mirrors in-game): if our live presence poll already
+                // shows them offline, say so right now instead of waiting for the no-echo timeout.
+                // Otherwise queue for the delivery watcher (catches spam/repetition rejections).
+                bool knownOffline = qstatus.TryGetValue(key, out var q)
+                                    && (DateTime.Now - q.when).TotalSeconds < 60 && q.code == 0;
+                if (knownOffline)
+                {
+                    string snip = msg.Length > 40 ? msg.Substring(0, 39) + "…" : msg;
+                    AddMsg(key, "sys", "\"" + snip + "\" they're offline — it wasn't delivered.");
+                }
+                else
+                {
+                    pending.Add((msg, key, DateTime.Now));
+                }
+                input.Clear(); input.Focus();
+            }
+            // warn about sends the server never echoed back (rejected / undeliverable)
+            var deliverTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+            deliverTimer.Tick += (s, e) =>
+            {
+                var now = DateTime.Now;
+                for (int i = pending.Count - 1; i >= 0; i--)
+                {
+                    // Wait 6s for the server's accept echo — under a burst it can lag a few seconds, and a delivered
+                    // message that just echoes late must NOT be mislabelled "rejected".
+                    if ((now - pending[i].at).TotalSeconds < 6) continue;
+                    var p = pending[i]; pending.RemoveAt(i);
+                    string snip = p.text.Length > 40 ? p.text.Substring(0, 39) + "…" : p.text;
+                    // No echo within the window ⇒ not accepted. Blame offline if we know they're offline, else spam.
+                    if (convs.ContainsKey(p.key))
+                    {
+                        bool offline = qstatus.TryGetValue(p.key, out var q) && (DateTime.Now - q.when).TotalSeconds < 90 && q.code == 0;
+                        string reason = _gameOpen
+                            ? "your Steam SMITE is open — close it; the messenger can't share that account's chat session."
+                            : offline
+                            ? "they're offline — it wasn't delivered."
+                            : "SMITE's spam/repetition filter rejected it — try rephrasing.";
+                        AddMsg(p.key, "sys", "\"" + snip + "\" " + reason);
+                    }
+                }
+            };
+            deliverTimer.Start();
+            sendBtn.Click += (s, e) => DoSend();
+            input.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; DoSend(); } };
+
+            // Start the engine, honouring the chosen login method. In Hi-Rez mode we can't connect without a password
+            // (never persisted), so prompt for it instead of spawning a doomed login.
+            void TryStartEngine()
+            {
+                if (engine == null || engine.Running) return;
+                if (!LoginReady()) { OpenLoginSettings(); return; }
+                ApplyLogin();
+                engine.Start();
+            }
+            // Strong diagnostic export: one timestamped .zip on the Desktop holding a full report + the live engine log
+            // + every relay log. Built so a friend can send it back when something doesn't work.
+            void ExportLogs()
+            {
+                // Ask first, then let the user choose where to save the zip.
+                if (MessageBox.Show(this,
+                    "Export diagnostic logs for debugging?\n\nThis bundles the engine + relay logs and a system report into one .zip you can share. It does NOT include your password or your message history.",
+                    "Export Logs", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+                string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                string zipPath;
+                using (var sfd = new SaveFileDialog { Title = "Save diagnostic logs", FileName = "SmiteInspector-logs-" + stamp + ".zip", Filter = "Zip archive (*.zip)|*.zip", DefaultExt = "zip", AddExtension = true, OverwritePrompt = true })
+                {
+                    try { sfd.InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory); } catch { }
+                    if (sfd.ShowDialog(this) != DialogResult.OK || string.IsNullOrEmpty(sfd.FileName)) return;
+                    zipPath = sfd.FileName;
+                }
+                try
+                {
+                    void AddText(System.IO.Compression.ZipArchive z, string name, string content)
+                    { try { var en = z.CreateEntry(name); using (var w = new StreamWriter(en.Open(), new UTF8Encoding(false))) w.Write(content ?? ""); } catch { } }
+                    void AddFile(System.IO.Compression.ZipArchive z, string name, string path)
+                    { try { var en = z.CreateEntry(name); using (var es = en.Open()) using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) fs.CopyTo(es); } catch { } }
+                    string ProcInfo(string pname)
+                    {
+                        try
+                        {
+                            var ps = System.Diagnostics.Process.GetProcessesByName(pname);
+                            if (ps.Length == 0) return "not running";
+                            var sb2 = new StringBuilder();
+                            foreach (var pr in ps) { string mp; try { mp = pr.MainModule != null ? pr.MainModule.FileName : ""; } catch { mp = "<path unavailable>"; } sb2.Append("\r\n    pid " + pr.Id + "  " + mp); try { pr.Dispose(); } catch { } }
+                            return sb2.ToString();
+                        }
+                        catch (Exception e) { return "err: " + e.Message; }
+                    }
+
+                    var sb = new StringBuilder();
+                    var ver = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
+                    int visible = 0; foreach (var c in convs.Values) if (!c.Hidden) visible++;
+                    sb.AppendLine("SMITE 1 Inspector — Whispers diagnostic report");
+                    sb.AppendLine("Generated: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " local / " + DateTime.UtcNow.ToString("HH:mm:ss") + " UTC");
+                    sb.AppendLine("=====================================================");
+                    sb.AppendLine("[App]");
+                    sb.AppendLine("  Version:  " + (ver != null ? ver.ToString() : "?"));
+                    sb.AppendLine("  AppDir:   " + Theme.AppDir);
+                    sb.AppendLine("  DataDir:  " + Theme.DataDir);
+                    sb.AppendLine("[System]");
+                    sb.AppendLine("  OS:       " + System.Runtime.InteropServices.RuntimeInformation.OSDescription);
+                    sb.AppendLine("  .NET:     " + System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription);
+                    sb.AppendLine("  Arch:     " + System.Runtime.InteropServices.RuntimeInformation.OSArchitecture + "  procs=" + Environment.ProcessorCount);
+                    sb.AppendLine("  TimeZone: " + TimeZoneInfo.Local.DisplayName);
+                    sb.AppendLine("[Whispers engine]");
+                    sb.AppendLine("  Probe5:   " + (probeExe ?? "NOT FOUND"));
+                    sb.AppendLine("  Relay:    " + relayDir);
+                    sb.AppendLine("  Login:    mode=" + loginMode + "  user-set=" + (loginUser.Length > 0 ? "yes" : "no") + "  auto-connect=" + loginAuto + "  login-ready=" + LoginReady());
+                    sb.AppendLine("  Engine:   running=" + (engine != null && engine.Running) + "  state=" + (engine != null ? engine.State : "<no engine>"));
+                    sb.AppendLine("  Status:   \"" + statusLbl.Text + "\"   game-conflict-warn=" + _gameOpen);
+                    sb.AppendLine("[Running processes]");
+                    sb.AppendLine("  Smite.exe:  " + ProcInfo("Smite"));
+                    sb.AppendLine("  Probe5.exe: " + ProcInfo("Probe5"));
+                    sb.AppendLine("  steam:      " + ProcInfo("steam"));
+                    sb.AppendLine("[Conversations]");
+                    sb.AppendLine("  total=" + convs.Count + "  visible=" + visible + "   (counts only — message history is NOT exported)");
+                    sb.AppendLine("=====================================================");
+                    sb.AppendLine("Included: report.txt, engine-live.log, relay/* (probe5_out.txt, chatcap.log, loginfix.log,");
+                    sb.AppendLine("  eosinproc.log, presence.tsv, idname.tsv, myparams.txt, whisper_in/out.txt ...), login.json.");
+                    sb.AppendLine("Privacy: relay logs can contain whisper text + your Hi-Rez username. They do NOT contain your");
+                    sb.AppendLine("  password. Your conversation history (conversations.json) is NOT included.");
+
+                    using (var zip = new System.IO.Compression.ZipArchive(File.Create(zipPath), System.IO.Compression.ZipArchiveMode.Create))
+                    {
+                        AddText(zip, "report.txt", sb.ToString());
+                        if (engine != null) AddText(zip, "engine-live.log", string.Join("\r\n", engine.RecentLog()));
+                        try { if (Directory.Exists(relayDir)) foreach (var f in Directory.GetFiles(relayDir)) AddFile(zip, "relay/" + Path.GetFileName(f), f); } catch { }
+                        try { if (File.Exists(loginFile)) AddFile(zip, "login.json", loginFile); } catch { }
+                    }
+                    try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("explorer.exe", "/select,\"" + zipPath + "\"") { UseShellExecute = true }); } catch { }
+                    MessageBox.Show(this, "Logs exported to:\n\n" + zipPath + "\n\nSend this .zip file for debugging.", "Export Logs", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, "Could not export logs:\n" + ex.Message, "Export Logs", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            }
+
+            // Options: login method (Steam ticket vs Hi-Rez username/password) + auto-connect on app startup.
+            // The username/password fields are only shown for Hi-Rez; the dialog resizes around them.
+            void OpenLoginSettings()
+            {
+                int W = S(520);
+                var dlg = new Form { Text = "Options", FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false, ShowIcon = false, BackColor = Theme.Bg, ForeColor = Theme.Text, Font = Theme.F(10f), ClientSize = new Size(W, S(260)) };
+                var hdr = new Label { Text = "LOGIN METHOD", AutoSize = true, Location = new Point(S(20), S(16)), ForeColor = Theme.Dim, Font = Theme.F(8f, FontStyle.Bold) };
+                var rSteam = new RadioButton { Text = "Steam  —  uses your Steam SMITE (Steam shows the game running)", AutoSize = true, Location = new Point(S(18), S(38)), ForeColor = Theme.Text, Checked = loginMode == "steam" };
+                var rHirez = new RadioButton { Text = "Hi-Rez login  —  username + password, no Steam status (faster)", AutoSize = true, Location = new Point(S(18), S(66)), ForeColor = Theme.Text, Checked = loginMode == "hirez" };
+                // Hi-Rez-only credential block (shown/hidden by Sync)
+                int credY = S(98);
+                var lblU = new Label { Text = "Hi-Rez username", AutoSize = true, Location = new Point(S(22), credY), ForeColor = Theme.Dim, Font = Theme.F(8.5f) };
+                var tbU = new TextBox { Location = new Point(S(22), credY + S(18)), Width = W - S(44), BackColor = Theme.Input, ForeColor = Theme.Text, BorderStyle = BorderStyle.FixedSingle, Text = loginUser };
+                var lblP = new Label { Text = "Password", AutoSize = true, Location = new Point(S(22), credY + S(48)), ForeColor = Theme.Dim, Font = Theme.F(8.5f) };
+                var tbP = new TextBox { Location = new Point(S(22), credY + S(66)), Width = W - S(44), BackColor = Theme.Input, ForeColor = Theme.Text, BorderStyle = BorderStyle.FixedSingle, UseSystemPasswordChar = true, Text = loginPass };
+                var chkRemember = new CheckBox { Text = "Remember me  (stores the password encrypted on this PC)", AutoSize = true, Location = new Point(S(20), credY + S(94)), ForeColor = Theme.Text, Checked = loginRemember };
+                var note = new Label { Text = "Experimental. A SMITE account created through Steam may not have a\nHi-Rez password — if Hi-Rez login fails, use Steam.", AutoSize = true, Location = new Point(S(22), credY + S(122)), ForeColor = Theme.Dim, Font = Theme.F(8f, FontStyle.Italic) };
+                int credH = S(166);   // vertical space the credential block occupies when visible
+                // Auto-connect option + buttons (repositioned below the cred block when Hi-Rez is selected)
+                var chkAuto = new CheckBox { Text = "Connect automatically when the app opens", AutoSize = true, ForeColor = Theme.Text, Checked = loginAuto };
+                var chkNote = new Label { Text = "Ready the moment you open Whispers. In Steam mode this shows SMITE\nrunning on Steam the whole time the app is open.", AutoSize = true, ForeColor = Theme.Dim, Font = Theme.F(8f, FontStyle.Italic) };
+                var btnSave = new Button { Text = "Save && Connect", FlatStyle = FlatStyle.Flat, BackColor = Theme.Accent, ForeColor = Color.White, Font = Theme.F(9.5f, FontStyle.Bold), Width = S(160), Height = S(34), Cursor = Cursors.Hand };
+                btnSave.FlatAppearance.BorderSize = 0;
+                var btnCancel = new Button { Text = "Cancel", FlatStyle = FlatStyle.Flat, BackColor = Theme.Input, ForeColor = Theme.Text, Font = Theme.F(9.5f), Width = S(110), Height = S(34), Cursor = Cursors.Hand };
+                btnCancel.FlatAppearance.BorderColor = Theme.Line;
+                void Sync()
+                {
+                    bool h = rHirez.Checked;
+                    lblU.Visible = tbU.Visible = lblP.Visible = tbP.Visible = note.Visible = chkRemember.Visible = h;
+                    int y = S(98) + (h ? credH : 0);
+                    chkAuto.Location = new Point(S(20), y);
+                    chkNote.Location = new Point(S(38), y + S(24));
+                    btnSave.Location = new Point(S(20), y + S(58));
+                    btnCancel.Location = new Point(S(20) + btnSave.Width + S(12), y + S(58));
+                    dlg.ClientSize = new Size(W, y + S(58) + S(34) + S(18));
+                }
+                rSteam.CheckedChanged += (s, e) => Sync(); rHirez.CheckedChanged += (s, e) => Sync();
+                btnCancel.Click += (s, e) => dlg.Close();
+                btnSave.Click += (s, e) =>
+                {
+                    string newMode = rHirez.Checked ? "hirez" : "steam";
+                    if (newMode == "hirez" && (tbU.Text.Trim().Length == 0 || tbP.Text.Length == 0))
+                    { MessageBox.Show(dlg, "Enter your Hi-Rez username and password.", "Options", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+                    bool modeChanged = newMode != loginMode || (newMode == "hirez" && (tbU.Text.Trim() != loginUser || tbP.Text != loginPass));
+                    loginMode = newMode; loginUser = tbU.Text.Trim(); loginPass = tbP.Text; loginAuto = chkAuto.Checked; loginRemember = chkRemember.Checked;
+                    SaveLogin(); ApplyLogin();
+                    dlg.Close();
+                    // Reconnect only if the login method/credentials actually changed.
+                    if (modeChanged) { try { if (engine != null && engine.Running) engine.Stop(); } catch { } SetStatus("stopped"); }
+                    if (root.Visible && engine != null && !engine.Running && LoginReady()) TryStartEngine();
+                };
+                dlg.Controls.Add(hdr); dlg.Controls.Add(rSteam); dlg.Controls.Add(rHirez);
+                dlg.Controls.Add(lblU); dlg.Controls.Add(tbU); dlg.Controls.Add(lblP); dlg.Controls.Add(tbP); dlg.Controls.Add(chkRemember); dlg.Controls.Add(note);
+                dlg.Controls.Add(chkAuto); dlg.Controls.Add(chkNote); dlg.Controls.Add(btnSave); dlg.Controls.Add(btnCancel);
+                dlg.AcceptButton = btnSave; dlg.CancelButton = btnCancel;
+                Sync();
+                try { dlg.ShowDialog(this); } finally { dlg.Dispose(); }
+            }
+
+            void StartConvFromName(string name, string id = null)
+            {
+                string key = EnsureConv(name, id);
+                if (key == null) return;
+                TryStartEngine();
+                OpenConv(key);
+            }
+            newName.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; var n = newName.Text.Trim(); newName.Clear(); StartConvFromName(n); } };
+
+            // "…" -> pick a friend (online first) from the saved Friend List
+            pickBtn.Click += (s, e) =>
+            {
+                var menu = new ContextMenuStrip { BackColor = Theme.Panel, ForeColor = Theme.Text };
+                var ordered = friendList.OrderBy(f => f.Name, StringComparer.OrdinalIgnoreCase).ToList();
+                if (ordered.Count == 0) menu.Items.Add(new ToolStripMenuItem("No saved friends — add some in Friend List") { Enabled = false });
+                foreach (var f in ordered)
+                {
+                    var it = new ToolStripMenuItem(f.Name) { ForeColor = Theme.Text };
+                    string nm = f.Name, fid = f.Id;
+                    it.Click += (s2, e2) => StartConvFromName(nm, fid);
+                    menu.Items.Add(it);
+                }
+                menu.Show(pickBtn, new Point(0, pickBtn.Height));
+            };
+
+            // refresh the active conversation's presence rapidly while the tab is open, + instantly on window focus
+            // Poll EVERY open conversation in one batch (not just the active one) so none go stale.
+            var presTimer = new System.Windows.Forms.Timer { Interval = 5000 };
+            presTimer.Tick += (s, e) => { bool g = CheckGameOpen(); if (g != _gameOpen) { _gameOpen = g; RefreshConnLabel(); } if (root.Visible) QueryAllPresence(); };
+            presTimer.Start();
+            this.Activated += (s, e) => { if (root.Visible) QueryAllPresence(); };
+            loginBtn.Click += (s, e) => OpenLoginSettings();
+            logsBtn.Click += (s, e) => ExportLogs();
+
+            // exposed hooks
+            _wsOnShow = () => { _gameOpen = CheckGameOpen(); SetStatus(engine == null ? "stopped" : engine.State); if (engine != null && !engine.Running && LoginReady()) TryStartEngine(); RenderConvList(); QueryAllPresence(); };
+            _wsAutoStart = () => { _gameOpen = CheckGameOpen(); if (loginAuto && engine != null && !engine.Running && LoginReady()) TryStartEngine(); SetStatus(engine == null ? "stopped" : engine.State); };
+            _openWhisper = (name, id) => StartConvFromName(name, id);
+            this.FormClosing += (s, e) => { try { engine?.Stop(); } catch { } };
+
+            RenderConvList();
+            return root;
         }
 
         // The Friend List tab: your saved buddies + their live status (online / in game / offline).
@@ -4319,18 +6105,19 @@ namespace SmiteGodLab
             var dSub = new Label { Location = new Point(S(132), S(60)), AutoSize = true, Font = Theme.F(9.5f), ForeColor = Theme.Dim, BackColor = Theme.Panel };
             var dSeen = new Label { Location = new Point(S(132), S(84)), AutoSize = true, Font = Theme.F(9f), ForeColor = Theme.Dim, BackColor = Theme.Panel };
             var dPrompt = new Label { Location = new Point(S(22), S(134)), AutoSize = true, Font = Theme.F(9.5f), ForeColor = Theme.Dim, BackColor = Theme.Panel, Text = "Open this player's full profile?" };
-            var dOpen = MkBtn("Open profile  →", 156, false, Theme.Blue, Color.White); dOpen.Location = new Point(S(22), S(160));
+            var dOpen = MkBtn("Open profile  →", 150, false, Theme.Blue, Color.White); dOpen.Location = new Point(S(22), S(160));
+            var dWhisper = MkBtn("💬  Whisper", 132, false, Theme.Input, Theme.Accent); dWhisper.Location = new Point(S(180), S(160));
             var dViewGame = MkBtn("● View current game", 184, false, Theme.Input, Theme.Green); dViewGame.Location = new Point(S(22), S(198));
             var dNoteLbl = new Label { Location = new Point(S(22), S(246)), AutoSize = true, Font = Theme.F(9f, FontStyle.Bold), ForeColor = Theme.Dim, BackColor = Theme.Panel, Text = "NOTES" };
             var dNote = new TextBox { Location = new Point(S(22), S(268)), Size = new Size(S(320), S(120)), Multiline = true, ScrollBars = ScrollBars.Vertical, BorderStyle = BorderStyle.FixedSingle, BackColor = Theme.Input, ForeColor = Theme.Text, Font = Theme.F(9.5f) };
             var dHint = new Label { Location = new Point(S(22), S(26)), AutoSize = true, Font = Theme.F(10f), ForeColor = Theme.Dim, BackColor = Theme.Panel, Text = "Click a friend to preview their profile." };
-            detail.Controls.Add(dAvatar); detail.Controls.Add(dName); detail.Controls.Add(dSub); detail.Controls.Add(dSeen); detail.Controls.Add(dPrompt); detail.Controls.Add(dOpen); detail.Controls.Add(dViewGame); detail.Controls.Add(dNoteLbl); detail.Controls.Add(dNote); detail.Controls.Add(dHint);
+            detail.Controls.Add(dAvatar); detail.Controls.Add(dName); detail.Controls.Add(dSub); detail.Controls.Add(dSeen); detail.Controls.Add(dPrompt); detail.Controls.Add(dOpen); detail.Controls.Add(dWhisper); detail.Controls.Add(dViewGame); detail.Controls.Add(dNoteLbl); detail.Controls.Add(dNote); detail.Controls.Add(dHint);
 
             string detailId = null;
             string noteId = null;   // the friend whose note is currently in dNote (so we can flush it on switch/leave)
             void FlushNote() { if (noteId != null) { var fe = friendList.FirstOrDefault(f => f.Id == noteId); if (fe != null && (fe.Note ?? "") != dNote.Text) { fe.Note = dNote.Text; SaveFriendList(); } } }
             dNote.Leave += (s, e) => FlushNote();
-            void HideDetail() { FlushNote(); noteId = null; detailId = null; dImg = null; dAvatar.Visible = dName.Visible = dSub.Visible = dSeen.Visible = dPrompt.Visible = dOpen.Visible = dViewGame.Visible = dNoteLbl.Visible = dNote.Visible = false; dHint.Visible = true; }
+            void HideDetail() { FlushNote(); noteId = null; detailId = null; dImg = null; dAvatar.Visible = dName.Visible = dSub.Visible = dSeen.Visible = dPrompt.Visible = dOpen.Visible = dWhisper.Visible = dViewGame.Visible = dNoteLbl.Visible = dNote.Visible = false; dHint.Visible = true; }
             async void ShowDetail(PlayerRow r)   // async void → wrap the whole body so a stray throw can't crash the message loop
             {
                 try
@@ -4356,7 +6143,8 @@ namespace SmiteGodLab
                     dViewGame.ForeColor = inGame ? Theme.Green : Color.FromArgb(95, 95, 95);
                     dViewGame.Text = inGame ? "● View current game" : "Not in a game";
                     dHint.Visible = false;
-                    dAvatar.Visible = dName.Visible = dSub.Visible = dSeen.Visible = dPrompt.Visible = dOpen.Visible = dViewGame.Visible = dNoteLbl.Visible = dNote.Visible = true;
+                    dWhisper.Tag = r;
+                    dAvatar.Visible = dName.Visible = dSub.Visible = dSeen.Visible = dPrompt.Visible = dOpen.Visible = dWhisper.Visible = dViewGame.Visible = dNoteLbl.Visible = dNote.Visible = true;
                     dImg = null; dAvatar.Invalidate();
                     var img = await LoadAvatar(r.Avatar);
                     if (detailId == r.Id) { dImg = img; dAvatar.Invalidate(); }   // ignore if the user clicked a different friend meanwhile
@@ -4364,6 +6152,7 @@ namespace SmiteGodLab
                 catch { }
             }
             dOpen.Click += async (s, e) => { if (dOpen.Tag is PlayerRow rr) { _trkResetSecondary?.Invoke(); SelectNav(1); if (_trkLoadPlayer != null) await _trkLoadPlayer(rr.Id, rr.Name); } };
+            dWhisper.Click += (s, e) => { if (dWhisper.Tag is PlayerRow rr) { SelectNav(5); _openWhisper?.Invoke(rr.Name, rr.Id); } };
             dViewGame.Click += async (s, e) => { if (dViewGame.Enabled && dViewGame.Tag is PlayerRow rr) await ViewLiveGame(rr.Id); };
             HideDetail();
 
@@ -4675,7 +6464,7 @@ namespace SmiteGodLab
                         e.Cancel = true;
                 }
             };
-            this.FormClosed += (s, e) => { FlushNote(); flPoll.Stop(); flPoll.Dispose(); NameDb.Save(true); GameLog.Shutdown(); try { _sguru?.Shutdown(); } catch { } try { SaveFavs(); SaveJson(FriendListFile, friendList); SaveJson(HiddenFile, hiddenTags); } catch { } };   // force-flush + release the WebView2 process/profile lock + final save-on-close so a transiently-dropped list save isn't lost
+            this.FormClosed += (s, e) => { try { _archiveCts?.Cancel(); } catch { } FlushNote(); flPoll.Stop(); flPoll.Dispose(); NameDb.Save(true); GameLog.Shutdown(); try { _sguru?.Shutdown(); } catch { } try { SaveFavs(); SaveJson(FriendListFile, friendList); SaveJson(HiddenFile, hiddenTags); } catch { } };   // force-flush + release the WebView2 process/profile lock + final save-on-close so a transiently-dropped list save isn't lost
             return host;
         }
 
@@ -4683,6 +6472,7 @@ namespace SmiteGodLab
         {
             LoadFavs(); LoadHiddenTags(); LoadRecents();
             NameDb.Load(); NameDb.Enabled = settings.RevealHidden;   // experiment/reveal-hidden-names
+            GodBoard.Load();   // god-leaderboard id-leak → smite.guru name cache (experiment 2026-06-25)
             GameLog.Init(); GameLog.Enabled = settings.LogReveal;   // EXACT reveal from local game logs (combat log)
             if (settings.RevealHidden && settings.Harvest) StartHarvester();
             TagSync.Init(); TagSync.Enabled = settings.CommunityTags;   // crowdsourced shared tags
@@ -4693,17 +6483,19 @@ namespace SmiteGodLab
                 var subBar = new Panel { Dock = DockStyle.Top, Height = S(42), BackColor = Theme.Panel };
                 var subBarLine = new Panel { Dock = DockStyle.Bottom, Height = S(1), BackColor = Theme.Line };
                 var subFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, BackColor = Theme.Panel, Padding = new Padding(S(14), S(2), 0, 0) };
-                var primaryTabs = new[] { MkSubTab("My profile"), MkSubTab("Track"), MkSubTab("Favorites"), MkSubTab("Recent Profiles"), MkSubTab("Custom Hidden Tags") };
-                foreach (var t in primaryTabs) subFlow.Controls.Add(t);
+                var primaryTabs = new[] { MkSubTab("My profile"), MkSubTab("Track"), MkSubTab("Favorites"), MkSubTab("Recent Profiles"), MkSubTab("Hidden Tags"), MkSubTab("Encounters") };   // index 5 = Encounters (top-level now, was a Track sub-tab)
+                // 6 primary tabs now (Encounters added) — at high DPI the default tab padding overflows the strip and clips the
+                // last tab, so pack the primary row tighter (the secondary strip keeps the roomier MkSubTab default).
+                foreach (var t in primaryTabs) { t.Width = Math.Max(S(72), TextRenderer.MeasureText(t.Text, t.Font).Width + S(20)); subFlow.Controls.Add(t); }
                 subBar.Controls.Add(subFlow); subBar.Controls.Add(subBarLine);
 
                 // --- secondary (player-context) sub-tab strip (Overview / Achievements / Friends) — only while a player is loaded ---
                 var subBar2 = new Panel { Dock = DockStyle.Top, Height = S(38), BackColor = Theme.Bg, Visible = false };
                 var subBar2Line = new Panel { Dock = DockStyle.Bottom, Height = S(1), BackColor = Theme.Line };
                 var subFlow2 = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = false, BackColor = Theme.Bg, Padding = new Padding(S(28), S(0), 0, 0) };
-                var secondaryTabs = new[] { MkSubTab("Overview"), MkSubTab("Masteries"), MkSubTab("Matches"), MkSubTab("Achievements"), MkSubTab("Friend List"), MkSubTab("Encounters (Experimental)") };
+                var secondaryTabs = new[] { MkSubTab("Overview"), MkSubTab("Masteries"), MkSubTab("Matches"), MkSubTab("Achievements"), MkSubTab("Friend List") };   // Encounters moved up to a primary tab
                 foreach (var t in secondaryTabs) { t.Height = S(36); subFlow2.Controls.Add(t); }
-                int curPrimary = 1;   // 0 My profile · 1 Track · 2 Favorites · 3 Recent Profiles · 4 Custom Hidden Tags (declared early: used by Lookup/_trkLoadPlayer closures)
+                int curPrimary = 1;   // 0 My profile · 1 Track · 2 Favorites · 3 Recent Profiles · 4 Hidden Tags · 5 Encounters (declared early: used by Lookup/_trkLoadPlayer closures)
                 subBar2.Controls.Add(subFlow2); subBar2.Controls.Add(subBar2Line);
 
                 // --- search bar ---
@@ -4962,6 +6754,7 @@ namespace SmiteGodLab
                 // every account on each side and finds games where ANY A-account met ANY B-account (union by match id).
                 var encBtn = MkBtn("Compare", 100, false, Theme.Blue, Color.White); encBtn.Location = new Point(S(330), S(9));
                 var encRefresh = MkBtn("↻ Refresh", 96, false); encRefresh.Location = new Point(S(438), S(9));
+                var encCancel = MkBtn("✕ Cancel", 96, false, Theme.Input, Theme.Accent); encCancel.Location = new Point(S(540), S(9)); encCancel.Visible = false;   // shown only while a scan is running
                 var encStatus = new Label { AutoSize = true, ForeColor = Theme.Dim, Font = Theme.F(8.5f), Location = new Point(S(24), S(128)), MaximumSize = new Size(S(940), 0), Text = "" };
                 var boxA = new TextBox { BorderStyle = BorderStyle.None, BackColor = Theme.Input, ForeColor = Theme.Text, Font = Theme.F(10.5f) };
                 var boxB = new TextBox { BorderStyle = BorderStyle.None, BackColor = Theme.Input, ForeColor = Theme.Text, Font = Theme.F(10.5f) };
@@ -4975,13 +6768,57 @@ namespace SmiteGodLab
                 var presA = MkBtn("★", 30, false); presA.Location = new Point(S(270), S(49)); encTip.SetToolTip(presA, "Presets — save or load this person's accounts");
                 var addB = MkBtn("＋", 30, false); addB.Location = new Point(S(572), S(49)); encTip.SetToolTip(addB, "Tie another account / smurf to player B");
                 var presB = MkBtn("★", 30, false); presB.Location = new Point(S(606), S(49)); encTip.SetToolTip(presB, "Presets — save or load this person's accounts");
-                var chipsA = new FlowLayoutPanel { Location = new Point(S(24), S(86)), Size = new Size(S(290), S(36)), FlowDirection = FlowDirection.LeftToRight, WrapContents = true, AutoScroll = false, BackColor = Theme.Bg };
-                var chipsB = new FlowLayoutPanel { Location = new Point(S(360), S(86)), Size = new Size(S(290), S(36)), FlowDirection = FlowDirection.LeftToRight, WrapContents = true, AutoScroll = false, BackColor = Theme.Bg };
-                encTop.Controls.Add(boxAhost); encTop.Controls.Add(boxBhost); encTop.Controls.Add(addA); encTop.Controls.Add(presA); encTop.Controls.Add(addB); encTop.Controls.Add(presB); encTop.Controls.Add(chipsA); encTop.Controls.Add(chipsB); encTop.Controls.Add(encBtn); encTop.Controls.Add(encRefresh); encTop.Controls.Add(encStatus);
+                // AutoSize height: when several accounts are tied, the chips wrap to extra rows and the panel grows DOWN (a fixed
+                // height clipped the 2nd row into a thin sliver — the "bar under NuclearFart" glitch). RelayoutEncTop() then pushes
+                // the status/loading line below the taller of the two chip stacks.
+                var chipsA = new FlowLayoutPanel { Location = new Point(S(24), S(86)), AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, MinimumSize = new Size(S(290), 0), MaximumSize = new Size(S(290), 0), FlowDirection = FlowDirection.LeftToRight, WrapContents = true, AutoScroll = false, BackColor = Theme.Bg };
+                var chipsB = new FlowLayoutPanel { Location = new Point(S(360), S(86)), AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, MinimumSize = new Size(S(290), 0), MaximumSize = new Size(S(290), 0), FlowDirection = FlowDirection.LeftToRight, WrapContents = true, AutoScroll = false, BackColor = Theme.Bg };
+                encTop.Controls.Add(boxAhost); encTop.Controls.Add(boxBhost); encTop.Controls.Add(addA); encTop.Controls.Add(presA); encTop.Controls.Add(addB); encTop.Controls.Add(presB); encTop.Controls.Add(chipsA); encTop.Controls.Add(chipsB); encTop.Controls.Add(encBtn); encTop.Controls.Add(encRefresh); encTop.Controls.Add(encCancel); encTop.Controls.Add(encStatus);
+                // Blinking red-bordered "Loading scoreboard…" indicator — a match fetch takes a few seconds, so without this the
+                // click looked dead and users clicked again → stacked windows. A re-entrancy guard (encScoreBusy) also blocks that.
+                bool encBusyOn = true, encScoreBusy = false;
+                var encBusy = new Panel { Visible = false, Size = new Size(S(248), S(30)), Location = new Point(S(24), S(124)), BackColor = Theme.Bg };
+                encBusy.Paint += (s, e) =>
+                {
+                    var g = e.Graphics; g.SmoothingMode = SmoothingMode.AntiAlias;
+                    var col = encBusyOn ? Theme.Accent : Color.FromArgb(70, Theme.Accent.R, Theme.Accent.G, Theme.Accent.B);
+                    using (var pen = new Pen(col, S(2))) g.DrawRectangle(pen, S(1), S(1), encBusy.Width - S(3), encBusy.Height - S(3));
+                    TextRenderer.DrawText(g, "⏳  Loading scoreboard…", Theme.F(9.5f, FontStyle.Bold), encBusy.ClientRectangle, encBusyOn ? Theme.Text : Theme.Dim, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                };
+                var encBusyTimer = new System.Windows.Forms.Timer { Interval = 450 };
+                encBusyTimer.Tick += (s, e) => { encBusyOn = !encBusyOn; encBusy.Invalidate(); };
+                encTop.Controls.Add(encBusy);
+                void ShowEncBusy(bool on) { if (on) { encBusyOn = true; encBusy.Visible = true; encBusy.BringToFront(); encBusyTimer.Start(); } else { encBusyTimer.Stop(); encBusy.Visible = false; } }
+                // Blinking red "scanning…" indicator on the RIGHT (mirrors the scoreboard one) so an in-progress history scan reads as
+                // clearly LIVE. The plain encStatus label (left) is reused for the FINAL summary once the scan settles.
+                bool encScanOn = true; string encScanText = "";
+                var encScan = new Panel { Visible = false, Size = new Size(S(440), S(32)), BackColor = Theme.Bg };
+                encScan.Paint += (s, e) =>
+                {
+                    var g = e.Graphics; g.SmoothingMode = SmoothingMode.AntiAlias;
+                    var col = encScanOn ? Theme.Accent : Color.FromArgb(70, Theme.Accent.R, Theme.Accent.G, Theme.Accent.B);
+                    using (var pen = new Pen(col, S(2))) g.DrawRectangle(pen, S(1), S(1), encScan.Width - S(3), encScan.Height - S(3));
+                    using (var dot = new SolidBrush(col)) g.FillEllipse(dot, S(12), encScan.Height / 2 - S(4), S(9), S(9));
+                    TextRenderer.DrawText(g, encScanText, Theme.F(9f, FontStyle.Bold), new Rectangle(S(28), 0, encScan.Width - S(36), encScan.Height), encScanOn ? Theme.Text : Theme.Dim, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+                };
+                var encScanTimer = new System.Windows.Forms.Timer { Interval = 450 };
+                encScanTimer.Tick += (s, e) => { encScanOn = !encScanOn; encScan.Invalidate(); };
+                encTop.Controls.Add(encScan);
+                encTip.SetToolTip(encScan, "Reading each account's full match history from smite.guru to find games the two players shared. Very active accounts take longer — results appear as soon as the first side is scanned.");
+                void ShowEncScan(bool on, string text = "") { if (on) { encScanText = text; encScanOn = true; encScan.Location = new Point(S(24), encStatus.Top - S(5)); encScan.Visible = true; encScan.BringToFront(); encScanTimer.Start(); } else { encScanTimer.Stop(); encScan.Visible = false; } }
+                void SetEncScan(string text) { encScanText = text; if (encScan.Visible) encScan.Invalidate(); }
+                async Task OpenScoreboard(string matchId)
+                {
+                    if (encScoreBusy || string.IsNullOrEmpty(matchId)) return;   // one fetch at a time → no stacked windows on repeated clicks
+                    encScoreBusy = true; ShowEncBusy(true);
+                    try { await ShowSguruMatch(matchId); }
+                    finally { encScoreBusy = false; ShowEncBusy(false); }
+                }
                 var encScroll = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg, AutoScroll = true, Padding = new Padding(S(22), S(4), S(16), S(16)) };
                 var encFlow = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, BackColor = Theme.Bg };
                 encScroll.Controls.Add(encFlow);
                 encPanel.Controls.Add(encScroll); encPanel.Controls.Add(encTop);
+                BeginInvoke(new Action(() => { try { RelayoutEncTop(); } catch { } }));   // initial status/encTop placement (no chips yet)
                 System.Threading.CancellationTokenSource encCts = null;
                 // alias line is rendered immediately (shared-match names) then enriched in place once B's own-history names load
                 Label encAliasLbl = null; List<string> encSharedAliases = new(); List<string> encExclude = new();   // encExclude = B's typed account names (kept out of the "also seen as" line)
@@ -4989,7 +6826,18 @@ namespace SmiteGodLab
                 var accA = new List<string>(); var accB = new List<string>();
                 List<EncPreset> encPresets = new();
                 try { var pf0 = Path.Combine(Theme.DataDir, "enc_presets.json"); if (File.Exists(pf0)) encPresets = (JsonSerializer.Deserialize<EncPresetFile>(File.ReadAllText(pf0)) ?? new()).Presets ?? new(); } catch { }
-                void SaveEncPresets() { try { File.WriteAllText(Path.Combine(Theme.DataDir, "enc_presets.json"), JsonSerializer.Serialize(new EncPresetFile { Presets = encPresets })); } catch { } }
+                void SaveEncPresets() { try { Theme.AtomicWriteText(Path.Combine(Theme.DataDir, "enc_presets.json"), JsonSerializer.Serialize(new EncPresetFile { Presets = encPresets })); } catch { } }   // atomic
+                // Reflow the status/loading line to sit just below the (possibly multi-row) chip stacks, and size encTop to match,
+                // so wrapped chips push everything down instead of being clipped or overlapping the status text.
+                void RelayoutEncTop()
+                {
+                    int chH = Math.Max(chipsA.Height, chipsB.Height);          // 0 when no accounts are tied
+                    int top = S(86) + Math.Max(S(34), chH) + S(6);
+                    encStatus.Location = new Point(S(24), top);
+                    encBusy.Location = new Point(S(24), top - S(4));
+                    encScan.Location = new Point(S(24), top - S(5));   // blinking scan box sits at the status line (left, always on-screen)
+                    encTop.Height = top + S(46);                                // room for a (possibly 2-line) status / the loading box
+                }
                 void RebuildChips(FlowLayoutPanel host, List<string> acc)
                 {
                     host.SuspendLayout(); host.Controls.Clear();
@@ -5002,6 +6850,7 @@ namespace SmiteGodLab
                         host.Controls.Add(chip);
                     }
                     host.ResumeLayout(true);
+                    RelayoutEncTop();
                 }
                 void AddAccount(TextBox box, List<string> acc, FlowLayoutPanel host)
                 {
@@ -5047,10 +6896,14 @@ namespace SmiteGodLab
                 presB.Click += (s, e) => ShowPresetMenu(presB, boxB, accB, chipsB);
                 string EncQueue(int q) => q switch { 426 => "Conquest", 451 => "Ranked Conquest", 459 => "Conquest", 435 => "Arena", 448 => "Joust", 450 => "Ranked Joust", 440 => "Ranked Duel", 445 => "Assault", 466 => "Clash", 10189 => "Slash", 504 => "Slash", _ => "Queue " + q };
                 string EncDate(string iso) => DateTime.TryParse(iso, null, System.Globalization.DateTimeStyles.RoundtripKind, out var d) ? d.ToString("yyyy-MM-dd") : (iso ?? "");
-                Panel MakeEncRow(SmiteGuru.Match m, bool allied, bool aWon)
+                Panel MakeEncRow(SmiteGuru.Match m, bool allied, bool aWon, string acctTag = "")
                 {
                     int w = AchRowWidth();
-                    var row = new Panel { Size = new Size(Math.Min(w, S(620)), S(34)), Margin = new Padding(0, 0, 0, S(5)), BackColor = Theme.Bg, Cursor = Cursors.Hand };
+                    bool hasTag = !string.IsNullOrEmpty(acctTag);
+                    // Two-line row when an account tag is present: the main columns sit in a fixed S(34) top band and the "which
+                    // account met which" line goes underneath (full width, so it never clips at the right edge like a wider row would).
+                    int band = S(34);
+                    var row = new Panel { Size = new Size(Math.Min(w, S(620)), hasTag ? S(54) : band), Margin = new Padding(0, 0, 0, S(5)), BackColor = Theme.Bg, Cursor = Cursors.Hand };
                     var accent = allied ? Theme.Green : Theme.Accent;
                     string dateStr = EncDate(m.Time), queueStr = EncQueue(m.QueueId);   // precompute once — Paint fires on every hover/scroll
                     bool hover = false;   // click a row → open that game's scoreboard (smite.guru match_id == Hi-Rez match id)
@@ -5060,15 +6913,17 @@ namespace SmiteGodLab
                         var border = Color.FromArgb(hover ? 150 : 46, accent.R, accent.G, accent.B);
                         DrawPill(g, new Rectangle(0, 0, row.Width - 1, row.Height - 1), S(6), hover ? Theme.Input : Theme.Panel, border);
                         using (var ab = new SolidBrush(accent)) g.FillRectangle(ab, S(1), S(7), S(3), row.Height - S(14));
-                        TextRenderer.DrawText(g, dateStr, Theme.F(9f), new Rectangle(S(14), 0, S(104), row.Height), Theme.Text, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
-                        TextRenderer.DrawText(g, queueStr, Theme.F(9f), new Rectangle(S(126), 0, S(170), row.Height), Theme.Dim, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
-                        TextRenderer.DrawText(g, allied ? "ALLIES" : "ENEMIES", Theme.F(8f, FontStyle.Bold), new Rectangle(S(304), 0, S(86), row.Height), accent, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
-                        TextRenderer.DrawText(g, aWon ? "WIN" : "LOSS", Theme.F(8.5f, FontStyle.Bold), new Rectangle(S(396), 0, S(70), row.Height), aWon ? Theme.Green : Theme.AccentHi, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
-                        TextRenderer.DrawText(g, hover ? "View scoreboard ›" : "›", Theme.F(8.5f, FontStyle.Bold), new Rectangle(row.Width - S(154), 0, S(146), row.Height), hover ? accent : Theme.Dim, TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                        TextRenderer.DrawText(g, dateStr, Theme.F(9f), new Rectangle(S(14), 0, S(104), band), Theme.Text, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                        TextRenderer.DrawText(g, queueStr, Theme.F(9f), new Rectangle(S(126), 0, S(170), band), Theme.Dim, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                        TextRenderer.DrawText(g, allied ? "ALLIES" : "ENEMIES", Theme.F(8f, FontStyle.Bold), new Rectangle(S(304), 0, S(86), band), accent, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                        TextRenderer.DrawText(g, aWon ? "WIN" : "LOSS", Theme.F(8.5f, FontStyle.Bold), new Rectangle(S(396), 0, S(70), band), aWon ? Theme.Green : Theme.AccentHi, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                        TextRenderer.DrawText(g, hover ? "View scoreboard ›" : "›", Theme.F(8.5f, FontStyle.Bold), new Rectangle(row.Width - S(154), 0, S(146), band), hover ? accent : Theme.Dim, TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                        if (hasTag)   // second line: which tied account this encounter is from (only when a side has smurfs)
+                            TextRenderer.DrawText(g, acctTag, Theme.F(8.5f, FontStyle.Bold), new Rectangle(S(14), band - S(2), row.Width - S(28), row.Height - band), Theme.Blue, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
                     };
                     row.MouseEnter += (s, e) => { hover = true; row.Invalidate(); };
                     row.MouseLeave += (s, e) => { hover = false; row.Invalidate(); };
-                    row.Click += async (s, e) => { if (!string.IsNullOrEmpty(m.MatchId)) await ShowSguruMatch(m.MatchId); };   // SmiteGuru scoreboard (works for old matches; Hi-Rez drops them)
+                    row.Click += async (s, e) => await OpenScoreboard(m.MatchId);   // SmiteGuru scoreboard (guarded + blinking "Loading…" so repeated clicks don't stack windows)
                     return row;
                 }
                 void RenderEnc(HashSet<long> aIds, HashSet<long> bIds, List<string> aNames, List<string> bNames, List<SmiteGuru.Match> all, IReadOnlyCollection<string> bOwnNames)
@@ -5084,13 +6939,16 @@ namespace SmiteGodLab
                     foreach (var m in all) if (m.Players != null) foreach (var p in m.Players) { if (p.Id == 0 || string.IsNullOrWhiteSpace(p.Name)) continue; var nm = p.Name.Trim(); if (bNameSet.Contains(nm)) bIds.Add(p.Id); if (aNameSet.Contains(nm)) aIds.Add(p.Id); }
                     bool IsA(SmiteGuru.Player p) => (p.Id != 0 && aIds.Contains(p.Id)) || (!string.IsNullOrWhiteSpace(p.Name) && aNameSet.Contains(p.Name.Trim()));
                     bool IsB(SmiteGuru.Player p) => (p.Id != 0 && bIds.Contains(p.Id)) || (!string.IsNullOrWhiteSpace(p.Name) && bNameSet.Contains(p.Name.Trim()));
-                    var hits = new List<(SmiteGuru.Match m, bool allied, bool aWon, string bAt)>();
+                    // when more than one account is tied to a side, each row tags WHICH account met which (aAt = the A-account that
+                    // played that game, bAt = the B-account) so the user can see the encounter's source smurf.
+                    bool multiA = aNames.Count > 1, multiB = bNames.Count > 1;
+                    var hits = new List<(SmiteGuru.Match m, bool allied, bool aWon, string aAt, string bAt)>();
                     foreach (var m in all)
                     {
                         if (m.Players == null) continue;
                         var ap = m.Players.FirstOrDefault(IsA); if (ap == null) continue;
                         var bp = m.Players.FirstOrDefault(p => p != ap && IsB(p) && !IsA(p)); if (bp == null) continue;   // opponent must be a DIFFERENT identity (guards same-person-on-both-sides)
-                        hits.Add((m, ap.Team == bp.Team, m.WinningTeam == ap.Team, bp.Name));
+                        hits.Add((m, ap.Team == bp.Team, m.WinningTeam == ap.Team, ap.Name, bp.Name));
                     }
                     if (hits.Count == 0)
                     {
@@ -5129,7 +6987,7 @@ namespace SmiteGodLab
                     void Repop()
                     {
                         rowsHost.SuspendLayout(); rowsHost.Controls.Clear();
-                        IEnumerable<(SmiteGuru.Match m, bool allied, bool aWon, string bAt)> sel = curFilter switch
+                        IEnumerable<(SmiteGuru.Match m, bool allied, bool aWon, string aAt, string bAt)> sel = curFilter switch
                         {
                             "enemies" => hits.Where(h => !h.allied),
                             "allies" => hits.Where(h => h.allied),
@@ -5137,7 +6995,13 @@ namespace SmiteGodLab
                             "losses" => hits.Where(h => !h.aWon),
                             _ => hits
                         };
-                        foreach (var h in sel) rowsHost.Controls.Add(MakeEncRow(h.m, h.allied, h.aWon));
+                        foreach (var h in sel)
+                        {
+                            string a = (h.aAt ?? "").Trim(), b = (h.bAt ?? "").Trim();
+                            // when either side has smurfs, label every row with the exact pairing so the source account is unambiguous
+                            string tag = (multiA || multiB) ? ((a.Length > 0 ? a : "(hidden)") + "  vs  " + (b.Length > 0 ? b : "(hidden)")) : "";
+                            rowsHost.Controls.Add(MakeEncRow(h.m, h.allied, h.aWon, tag));
+                        }
                         rowsHost.ResumeLayout(true);
                     }
                     void AddChip(string key, string label)
@@ -5180,23 +7044,24 @@ namespace SmiteGodLab
                     encCts?.Cancel();   // signal any in-flight compare to stop; only the newest run owns the UI (guarded below)
                     var myCts = new System.Threading.CancellationTokenSource(); encCts = myCts; var ct = myCts.Token;
                     _sguru ??= new SmiteGuru(this);
-                    encBtn.Enabled = false; encRefresh.Enabled = false;
-                    encStatus.ForeColor = Theme.Dim; encStatus.Text = "Resolving accounts…";
+                    encBtn.Enabled = false; encRefresh.Enabled = false; encCancel.Visible = true; encCancel.Enabled = true; encCancel.BringToFront();
+                    encStatus.Text = ""; ShowEncScan(true, "Resolving accounts…");
                     try
                     {
-                        // resolve every account on each side to a STABLE Hi-Rez id (keeps the typed names for fallback / renames)
-                        async Task<(HashSet<long> ids, List<string> names)> ResolveSide(List<string> accts)
+                        // resolve every account on each side to a STABLE Hi-Rez id (keeps the typed names for fallback / renames).
+                        // `order` keeps the typed name alongside each unique id so the live scan indicator can name who it's reading.
+                        async Task<(HashSet<long> ids, List<string> names, List<(long id, string nm)> order)> ResolveSide(List<string> accts)
                         {
-                            var ids = new HashSet<long>(); var names = new List<string>();
+                            var ids = new HashSet<long>(); var names = new List<string>(); var order = new List<(long, string)>();
                             foreach (var n in accts)
                             {
                                 names.Add(n);
-                                try { using var pd = JsonDocument.Parse(await SmiteApi.Call("getplayer", n)); if (pd.RootElement.ValueKind == JsonValueKind.Array && pd.RootElement.GetArrayLength() > 0) { var r0 = pd.RootElement[0]; string idv = GS(r0, "Id"); if (string.IsNullOrEmpty(idv) || idv == "0") idv = GS(r0, "ActivePlayerId"); if (long.TryParse(idv, out var id) && id > 0) ids.Add(id); } } catch { }
+                                try { using var pd = JsonDocument.Parse(await SmiteApi.Call("getplayer", n)); if (pd.RootElement.ValueKind == JsonValueKind.Array && pd.RootElement.GetArrayLength() > 0) { var r0 = pd.RootElement[0]; string idv = GS(r0, "Id"); if (string.IsNullOrEmpty(idv) || idv == "0") idv = GS(r0, "ActivePlayerId"); if (long.TryParse(idv, out var id) && id > 0 && ids.Add(id)) order.Add((id, n)); } } catch { }
                             }
-                            return (ids, names);
+                            return (ids, names, order);
                         }
-                        var (aIds, aNames) = await ResolveSide(aAccts);
-                        var (bIds, bNames) = await ResolveSide(bAccts);
+                        var (aIds, aNames, aOrder) = await ResolveSide(aAccts);
+                        var (bIds, bNames, bOrder) = await ResolveSide(bAccts);
                         if (aIds.Count == 0 && bIds.Count == 0) { encStatus.ForeColor = Theme.Yellow; encStatus.Text = "Couldn't find those names on the SMITE API."; return; }
                         if (forceRefresh) foreach (var id in aIds.Concat(bIds)) await _sguru.WipeAsync(id, ct);   // gated wipe so it can't race an in-flight SaveCache
                         // scan EVERY account on both sides (season-by-season, back to 2020), union all matches by match_id.
@@ -5204,10 +7069,10 @@ namespace SmiteGodLab
                         var bOwn = new List<string>();
                         bool allComplete = true; int done = 0, totalAccts = aIds.Count + bIds.Count;
                         int NonZero(SmiteGuru.Match m) => m.Players == null ? 0 : m.Players.Count(p => p.Id != 0);
-                        async Task Scan(long id, bool isB)
+                        async Task Scan(long id, string nm, bool isB)
                         {
                             done++; int who = done;
-                            var h = await _sguru.GetHistory(id, 400, (p, m) => { try { encStatus.Text = p < 0 ? "Filling in any missed pages…" : "Scanning account " + who + " of " + totalAccts + " — " + p + " of ~" + m + " pages…"; } catch { } }, ct);
+                            var h = await _sguru.GetHistory(id, 400, (p, m) => { try { SetEncScan(p < 0 ? ("Scanning " + nm + " — filling in missed pages…") : ("Scanning " + nm + " — page " + p + " of ~" + m + "   (account " + who + " of " + totalAccts + ")")); } catch { } }, ct);
                             allComplete &= h.Complete;
                             // union by match_id; prefer the roster with MORE resolved (non-zero) ids so B's de-anonymized copy of a
                             // shared game upgrades A's anonymized one (the "one side was hidden" recovery).
@@ -5221,7 +7086,7 @@ namespace SmiteGodLab
                         bool IsBE(SmiteGuru.Player p) => (p.Id != 0 && bIds.Contains(p.Id)) || (!string.IsNullOrWhiteSpace(p.Name) && bNameSetE.Contains(p.Name.Trim()));
                         int EncCount(List<SmiteGuru.Match> ms) => ms.Count(m => m.Players != null && m.Players.Any(IsAE) && m.Players.Any(p => IsBE(p) && !IsAE(p)));
                         // A side first → show results as soon as A is scanned
-                        foreach (var id in aIds) await Scan(id, false);
+                        foreach (var (id, nm) in aOrder) await Scan(id, nm, false);
                         var listA = pool.Values.OrderByDescending(m => m.Time ?? "", StringComparer.Ordinal).ToList();
                         RenderEnc(new HashSet<long>(aIds), new HashSet<long>(bIds), aNames, bNames, listA, null);
                         int aOnly = EncCount(listA);
@@ -5234,7 +7099,7 @@ namespace SmiteGodLab
                         }
                         if (ct.IsCancellationRequested) return;
                         // then B side → fills any shared games missing from A's record (gaps / one side hidden) + B's rename history
-                        foreach (var id in bIds) { if (ct.IsCancellationRequested) break; await Scan(id, true); }
+                        foreach (var (id, nm) in bOrder) { if (ct.IsCancellationRequested) break; await Scan(id, nm, true); }
                         if (!ct.IsCancellationRequested)
                         {
                             var bOwnNames = bOwn.Where(n => n.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
@@ -5246,10 +7111,11 @@ namespace SmiteGodLab
                     }
                     catch (OperationCanceledException) { if (encCts == myCts) { encStatus.ForeColor = Theme.Dim; encStatus.Text = "Paused (progress saved — Compare again to resume)."; } }
                     catch (Exception ex) { if (encCts == myCts) { encStatus.ForeColor = Theme.Yellow; encStatus.Text = "Lookup failed: " + ex.Message; } }
-                    finally { if (encCts == myCts) { encBtn.Enabled = true; encRefresh.Enabled = true; } }   // only the newest run owns the buttons/status (superseded runs stay quiet)
+                    finally { if (encCts == myCts) { ShowEncScan(false); encBtn.Enabled = true; encRefresh.Enabled = true; encCancel.Visible = false; } }   // only the newest run owns the buttons/status (superseded runs stay quiet)
                 }
                 encBtn.Click += async (s, e) => await RunCompare(false);
                 encRefresh.Click += async (s, e) => await RunCompare(true);   // ↻ = wipe caches + full rescan (new games / retry gaps)
+                encCancel.Click += (s, e) => { encCancel.Enabled = false; encCts?.Cancel(); SetEncScan("Cancelling…"); };   // stop the in-flight scan (progress is saved → Compare resumes)
                 boxA.KeyDown += async (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; await RunCompare(false); } };
                 boxB.KeyDown += async (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; await RunCompare(false); } };
                 void ShowEncounters()
@@ -5872,7 +7738,7 @@ namespace SmiteGodLab
                     // empty strip) on every other My-profile sub-tab so it doesn't float over their content.
                     if (curPrimary == 0) { myProfBtn.Visible = (j == 0); top.Visible = (j == 0); }
                     curSecondary = j; StyleSecondary(j);
-                    switch (j) { case 0: ShowSearchView(); break; case 1: ShowExpanded(1); break; case 2: ShowExpanded(2); break; case 3: ShowAchievements(); break; case 4: _ = Guarded(ShowFriends); break; case 5: ShowEncounters(); break; }
+                    switch (j) { case 0: ShowSearchView(); break; case 1: ShowExpanded(1); break; case 2: ShowExpanded(2); break; case 3: ShowAchievements(); break; case 4: _ = Guarded(ShowFriends); break; }
                 }
                 Control MakeHiddenCard(HiddenTag t, int y)
                 {
@@ -5998,17 +7864,26 @@ namespace SmiteGodLab
                         subBar2.Visible = PlayerLoaded();
                         if (PlayerLoaded()) SelectSecondary(curSecondary); else ShowSearchView();
                     }
+                    else if (i == 5) { subBar2.Visible = false; ShowEncounters(); }   // Encounters: top-level, self-contained (own A/B inputs, no sub-tabs, no lookup bar)
                     else { subBar2.Visible = false; if (i == 2) ShowFavorites(); else if (i == 3) ShowRecents(); else ShowHidden(); }
                 }
                 for (int i = 0; i < primaryTabs.Length; i++) { int k = i; primaryTabs[i].Click += (s, e) => SelectPrimary(k); }
                 for (int j = 0; j < secondaryTabs.Length; j++) { int k = j; secondaryTabs[j].Click += (s, e) => SelectSecondary(k); }
                 // when a player finishes loading, reveal the secondary strip and default it to Overview; highlight My profile
-                // if the load was initiated from that tab (curPrimary==0), otherwise Track (1).
-                _trkPlayerLoaded = () => { int hp = curPrimary == 0 ? 0 : 1; StylePrimary(hp); myProfBtn.Visible = hp == 0; subBar2.Visible = true; curSecondary = 0; StyleSecondary(0); ShowStage(0); };
+                // if the load was initiated from that tab (curPrimary==0), otherwise Track (1). A player can be opened from
+                // Favorites/Recents/Encounters (where SelectPrimary hid the Track lookup bar), so ACTUALLY land on the styled
+                // tab (set curPrimary) and restore the ☆ Save / ＋ Friend List bar — otherwise those buttons stay hidden.
+                _trkPlayerLoaded = () => {
+                    int hp = curPrimary == 0 ? 0 : 1; curPrimary = hp; StylePrimary(hp);
+                    bool onTrack = hp == 1;
+                    lbl.Visible = bhost.Visible = track.Visible = favSaveBtn.Visible = friendAddBtn.Visible = onTrack;
+                    top.Visible = onTrack || hp == 0; myProfBtn.Visible = hp == 0;
+                    subBar2.Visible = true; curSecondary = 0; StyleSecondary(0); ShowStage(0);
+                };
                 _trkResetSecondary = () => { curSecondary = 0; StyleSecondary(0); };   // so SelectNav restores Overview (non-blocking), not a stale Guarded Friends view
                 _trkSubTab = SelectPrimary;
                 _trkSubTab2 = SelectSecondary;
-                _trkEncCompare = nm => { try { if (boxA.Text.Trim().Length == 0 && accA.Count == 0) boxA.Text = curName; boxB.Text = nm; _ = RunCompare(false); } catch { } };   // test/screenshot hook
+                _trkEncCompare = nm => { try { SelectPrimary(5); if (boxA.Text.Trim().Length == 0 && accA.Count == 0) boxA.Text = curName; boxB.Text = nm; _ = RunCompare(false); } catch { } };   // test/screenshot hook (Encounters is primary tab 5 now)
                 StylePrimary(1); StyleSecondary(0);
                 godLv.DoubleClick += async (s, e) =>
                 {
@@ -6452,11 +8327,27 @@ namespace SmiteGodLab
         static string AppVersionFromAssembly()
         {
             try { var v = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version; if (v != null && (v.Major + v.Minor + v.Build) > 0) return v.Major + "." + v.Minor + "." + v.Build; } catch { }
-            return "1.1.1";
+            return "1.2.0";
         }
         const string ReleasesApi = "https://api.github.com/repos/DariusSmite/Smite-1-Inspector/releases/latest";
         const string ReleasesPage = "https://github.com/DariusSmite/Smite-1-Inspector/releases/latest";
         bool _updateChecked;   // startup check runs once per launch
+
+        // True when this build was placed by the installer (so updates must go through the installer, not an exe-swap into
+        // a read-only Program Files folder). Detected by the Inno uninstaller sitting next to us, or a Program Files path.
+        static bool IsInstalled()
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(Environment.ProcessPath ?? "") ?? "";
+                if (string.IsNullOrEmpty(dir)) return false;
+                if (File.Exists(Path.Combine(dir, "unins000.exe"))) return true;
+                foreach (var sf in new[] { Environment.SpecialFolder.ProgramFiles, Environment.SpecialFolder.ProgramFilesX86 })
+                { string pf = Environment.GetFolderPath(sf); if (!string.IsNullOrEmpty(pf) && dir.StartsWith(pf, StringComparison.OrdinalIgnoreCase)) return true; }
+            }
+            catch { }
+            return false;
+        }
 
         static Version ParseVer(string s)
         {
@@ -6472,7 +8363,7 @@ namespace SmiteGodLab
         {
             try
             {
-                string tag = null, assetUrl = null; long assetSize = 0;
+                string tag = null, setupUrl = null, bareUrl = null; long setupSize = 0, bareSize = 0;
                 using (var http = new HttpClient { Timeout = TimeSpan.FromSeconds(12) })
                 {
                     http.DefaultRequestHeaders.Add("User-Agent", "Smite1Inspector");
@@ -6480,32 +8371,49 @@ namespace SmiteGodLab
                     if (doc.RootElement.TryGetProperty("tag_name", out var t)) tag = t.GetString();
                     if (doc.RootElement.TryGetProperty("assets", out var assets) && assets.ValueKind == JsonValueKind.Array)
                         foreach (var a in assets.EnumerateArray())
-                            if (GS(a, "name").EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-                            { assetUrl = GS(a, "browser_download_url"); assetSize = a.TryGetProperty("size", out var sz) ? sz.GetInt64() : 0; }
+                        {
+                            string nm = GS(a, "name");
+                            if (!nm.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) continue;
+                            long asz = a.TryGetProperty("size", out var sz) ? sz.GetInt64() : 0;
+                            if (nm.IndexOf("setup", StringComparison.OrdinalIgnoreCase) >= 0) { if (setupUrl == null) { setupUrl = GS(a, "browser_download_url"); setupSize = asz; } }
+                            else { if (bareUrl == null) { bareUrl = GS(a, "browser_download_url"); bareSize = asz; } }
+                        }
                 }
+                // An installed build (Program Files / has an uninstaller) must update via the installer (in-place upgrade
+                // that also refreshes the engine + shortcuts); a portable build swaps the bare exe. Prefer the matching
+                // asset, fall back to the other so a release with only one of them still updates everyone.
+                bool installed = IsInstalled();
+                string assetUrl; long assetSize; bool isInstaller;
+                if (installed) { if (setupUrl != null) { assetUrl = setupUrl; assetSize = setupSize; isInstaller = true; } else { assetUrl = bareUrl; assetSize = bareSize; isInstaller = false; } }
+                else { if (bareUrl != null) { assetUrl = bareUrl; assetSize = bareSize; isInstaller = false; } else { assetUrl = setupUrl; assetSize = setupSize; isInstaller = true; } }
                 if (string.IsNullOrEmpty(tag)) { if (userInitiated) MessageBox.Show(this, "Couldn't read the latest release.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
                 if (ParseVer(tag) <= ParseVer(AppVersion))
                 { if (userInitiated) MessageBox.Show(this, "You're on the latest version (v" + AppVersion + ").", "Up to date", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
                 if (!userInitiated && settings.SkippedVersion == tag) return;   // already declined this version at startup
                 if (string.IsNullOrEmpty(assetUrl))
                 { if (userInitiated) MessageBox.Show(this, tag + " is available, but no exe was attached. Get it from the Releases page.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
-                if (settings.AutoUpdate && !userInitiated) { await ApplyUpdate(assetUrl, assetSize, tag); return; }
+                if (settings.AutoUpdate && !userInitiated) { await ApplyUpdate(assetUrl, assetSize, tag, isInstaller); return; }
                 string sizeTxt = assetSize > 0 ? "  (download ~" + (assetSize / 1048576) + " MB)" : "";
                 var r = MessageBox.Show(this, "A new version is available: " + tag + "\nYou have v" + AppVersion + "." + sizeTxt + "\n\nUpdate now?",
                     "Update available", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                 if (r != DialogResult.Yes) { settings.SkippedVersion = tag; SaveSettings(); return; }   // remember the "no"
-                await ApplyUpdate(assetUrl, assetSize, tag);
+                await ApplyUpdate(assetUrl, assetSize, tag, isInstaller);
             }
             catch (Exception ex) { if (userInitiated) MessageBox.Show(this, "Update check failed: " + ex.Message, "Updates", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
         }
 
-        // Downloads the new exe (with a progress dialog) and swaps it in by renaming the running exe aside; takes effect on restart.
-        async Task ApplyUpdate(string url, long size, string tag)
+        // Downloads the update (with a progress dialog), then either runs the new INSTALLER (in-place upgrade — works for
+        // installed users in Program Files, and updates the whisper engine + shortcuts too) or, for a bare-exe asset,
+        // swaps the running exe in place (portable build).
+        async Task ApplyUpdate(string url, long size, string tag, bool isInstaller)
         {
             string exe = Environment.ProcessPath, dir = Path.GetDirectoryName(exe ?? "");
             if (string.IsNullOrEmpty(exe) || !exe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-            { MessageBox.Show(this, "Auto-update only works on the packaged exe. Download " + tag + " from the Releases page.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
-            string newExe = Path.Combine(dir, "SmiteInspector.update.exe");
+            { MessageBox.Show(this, "Auto-update only works on the packaged app. Download " + tag + " from the Releases page.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+            // Installer → TEMP; portable update → next to the exe.
+            string dlPath = isInstaller
+                ? Path.Combine(Path.GetTempPath(), "SmiteInspector-Setup-" + (tag ?? "new").TrimStart('v', 'V') + ".exe")
+                : Path.Combine(dir, "SmiteInspector.update.exe");
             bool ok = false;
             using (var dlg = new Form { Text = "Updating", BackColor = Theme.Bg, ForeColor = Theme.Text, Font = Theme.F(9.5f), FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MinimizeBox = false, MaximizeBox = false, ControlBox = false, ClientSize = new Size(S(430), S(96)) })
             {
@@ -6514,23 +8422,38 @@ namespace SmiteGodLab
                 dlg.Controls.Add(bar);
                 try { int on = 1; DwmSetWindowAttribute(dlg.Handle, 20, ref on, 4); } catch { }
                 var prog = new Progress<int>(p => bar.Value = Math.Min(100, Math.Max(0, p)));
-                dlg.Shown += async (s, e) => { try { ok = await DownloadFile(url, newExe, prog); } catch { ok = false; } dlg.Close(); };
+                dlg.Shown += async (s, e) => { try { ok = await DownloadFile(url, dlPath, prog); } catch { ok = false; } dlg.Close(); };
                 dlg.ShowDialog(this);
             }
-            // reject a truncated/incomplete download before swapping it in — a partial exe would brick the install
-            if (ok && size > 0) { try { ok = new FileInfo(newExe).Length == size; } catch { ok = false; } }
-            if (!ok) { try { File.Delete(newExe); } catch { } MessageBox.Show(this, "Download failed or was incomplete. You can update manually from the Releases page.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+            // reject a truncated/incomplete download before applying it
+            if (ok && size > 0) { try { ok = new FileInfo(dlPath).Length == size; } catch { ok = false; } }
+            if (!ok) { try { File.Delete(dlPath); } catch { } MessageBox.Show(this, "Download failed or was incomplete. You can update manually from the Releases page.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+
+            if (isInstaller)
+            {
+                // Run the installer silently. With CloseApplications=yes it closes this app, upgrades in place (app + engine
+                // + shortcuts), then relaunches it. UseShellExecute lets it elevate (one UAC prompt). If the user cancels
+                // UAC, Process.Start throws — keep the app running and tell them.
+                try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(dlPath, "/SILENT /SUPPRESSMSGBOXES /NORESTART") { UseShellExecute = true }); }
+                catch (Exception ex)
+                { MessageBox.Show(this, "Update was cancelled or couldn't start (" + ex.Message + ").\n\nYou can get " + tag + " from the Releases page.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                if (settings.SkippedVersion == tag) { settings.SkippedVersion = ""; SaveSettings(); }
+                Application.Exit();   // release the exe so the elevated installer can replace it; it relaunches us on finish
+                return;
+            }
+
+            // ---- portable build: swap the running exe by renaming it aside (a running exe can be renamed, not overwritten) ----
             try
             {
                 string bak = Path.Combine(dir, "SmiteInspector.old.exe");
                 try { if (File.Exists(bak)) File.Delete(bak); } catch { }
-                File.Move(exe, bak);     // a running exe can be renamed on Windows, just not overwritten
-                try { File.Move(newExe, exe); }
-                catch { try { if (!File.Exists(exe) && File.Exists(bak)) File.Move(bak, exe); } catch { } throw; }   // new-exe move failed → restore the original exe so the install is never left with NO exe
+                File.Move(exe, bak);
+                try { File.Move(dlPath, exe); }
+                catch { try { if (!File.Exists(exe) && File.Exists(bak)) File.Move(bak, exe); } catch { } throw; }   // restore on failure so we're never left with NO exe
             }
             catch (Exception ex)
             {
-                try { File.Delete(newExe); } catch { }
+                try { File.Delete(dlPath); } catch { }
                 MessageBox.Show(this, "Couldn't replace the app (is it in a read-only folder?): " + ex.Message + "\n\nUpdate manually from the Releases page.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
@@ -6844,7 +8767,7 @@ namespace SmiteGodLab
             try { Cursor.Current = Cursors.WaitCursor; (md, gods, items) = await _sguru.GetMatchFull(matchId, System.Threading.CancellationToken.None); }
             catch (Exception ex) { Cursor.Current = prev; MessageBox.Show(this, "Couldn't load this match from SmiteGuru: " + ex.Message, "SMITE", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
             finally { Cursor.Current = prev; }
-            if (md == null || md.Players == null || md.Players.Count == 0) { MessageBox.Show(this, "Couldn't load this match from SmiteGuru (it may not be available).", "SMITE"); return; }
+            if (md == null || md.Players == null || md.Players.Count == 0) { MessageBox.Show(this, "No scoreboard available for this match — smite.guru keeps the match in its history list but no longer stores the full per-player detail for it (older matches age out). Nothing the app can recover.", "Match too old", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
 
             string Qn(int q) => q switch { 426 => "Conquest", 451 => "Ranked Conquest", 459 => "Conquest", 435 => "Arena", 448 => "Joust", 450 => "Ranked Joust", 440 => "Ranked Duel", 445 => "Assault", 466 => "Clash", 10189 => "Slash", 504 => "Slash", _ => "Queue " + q };
             string God(int id) => gods != null && gods.TryGetValue(id, out var n) && !string.IsNullOrEmpty(n) ? n : ("God " + id);
@@ -6997,6 +8920,42 @@ namespace SmiteGodLab
                     foreach (var dup in gc.Where(kv => kv.Value >= 2).Select(kv => kv.Key).ToList()) present.Add(dup);
                 }
 
+                // GOD-BOARD reveal (experiment 2026-06-25): de-anonymize hidden RANKED players via the god-leaderboard
+                // id-leak → smite.guru name. Only for hidden slots that are actually ranked (a <Queue>_Tier>0 survives the
+                // privacy flag), and only when opted in (it pulls leaderboards + drives the smite.guru WebView2). Produces
+                // "godId|tf" → (name,conf), consumed by MakeScoreRow exactly like the local game-log map.
+                Dictionary<string, (string name, int conf)> gbMap = null;
+                if (settings.RankedReveal && NameDb.Enabled)
+                {
+                    var gbSlots = new List<GodBoard.Slot>();
+                    foreach (var pl in players)
+                    {
+                        string nmh = GS(pl, "playerName"); if (string.IsNullOrEmpty(nmh)) nmh = GS(pl, "hz_player_name");
+                        if (!string.IsNullOrEmpty(nmh)) continue;   // hidden slots only
+                        if (logMap != null && logMap.ContainsKey(GS(pl, "GodId") + "|" + GI(pl, "TaskForce"))) continue;   // already shown by the exact game-log reveal
+                        var qs = new List<int>();
+                        foreach (var kv in GodBoard.RankedQueueId) if (GI(pl, kv.Key + "_Tier") > 0) qs.Add(kv.Value);
+                        if (qs.Count == 0) continue;   // not ranked → on no god board
+                        gbSlots.Add(new GodBoard.Slot { GodId = GS(pl, "GodId"), GodName = GS(pl, "Reference_Name"), Tf = GI(pl, "TaskForce"), Level = GI(pl, "Account_Level"), Clan = GS(pl, "Team_Name"), ClanId = GI(pl, "TeamId"), Mastery = GI(pl, "Mastery_Level"), Queues = qs });
+                    }
+                    if (gbSlots.Count > 0)
+                    {
+                        try
+                        {
+                            _sguru ??= new SmiteGuru(this);
+                            gbMap = await GodBoard.ResolveSlots(gbSlots, (idlist, c) => _sguru.ResolveProfilesBatch(idlist, c), CancellationToken.None);
+                        }
+                        catch { }
+                        if (gbMap != null && gbMap.Count > 0)
+                        {
+                            // a god-board reveal can't be a name already PUBLIC in this match; then add revealed names so the
+                            // fingerprint guesser can't ≈-suggest a name already shown ✦ on another row.
+                            foreach (var k in gbMap.Where(kv => present.Contains(kv.Value.name)).Select(kv => kv.Key).ToList()) gbMap.Remove(k);
+                            foreach (var v in gbMap.Values) present.Add(v.name);
+                        }
+                    }
+                }
+
                 try
                 {
                 using (var dlg = new Form())
@@ -7024,7 +8983,7 @@ namespace SmiteGodLab
                             Text = "TEAM " + tf + "    " + (won ? "VICTORY" : "DEFEAT") + "    ·    " + kills + " kills"
                         });
                         y += S(34);
-                        foreach (var pl in team) { body.Controls.Add(MakeScoreRow(pl, y, rowW, dtip, partyColors.TryGetValue(GI(pl, "PartyId"), out var pc) ? pc : Color.Empty, partyNamed.TryGetValue(GI(pl, "PartyId"), out var comp) ? comp : null, matchId, teamNamed.TryGetValue(GI(pl, "TaskForce"), out var nbr) ? nbr : null, logMap, present)); y += S(46); }
+                        foreach (var pl in team) { body.Controls.Add(MakeScoreRow(pl, y, rowW, dtip, partyColors.TryGetValue(GI(pl, "PartyId"), out var pc) ? pc : Color.Empty, partyNamed.TryGetValue(GI(pl, "PartyId"), out var comp) ? comp : null, matchId, teamNamed.TryGetValue(GI(pl, "TaskForce"), out var nbr) ? nbr : null, logMap, present, gbMap)); y += S(46); }
                         y += S(10);
                     }
                     try { int on = 1; if (DwmSetWindowAttribute(dlg.Handle, 20, ref on, 4) != 0) DwmSetWindowAttribute(dlg.Handle, 19, ref on, 4); } catch { }
@@ -7036,7 +8995,7 @@ namespace SmiteGodLab
             }
         }
 
-        Control MakeScoreRow(JsonElement pl, int y, int rowW, ToolTip dtip, Color partyCol = default, List<string> companions = null, string matchId = null, List<string> neighbors = null, Dictionary<string, (string name, string id)> logMap = null, HashSet<string> present = null)
+        Control MakeScoreRow(JsonElement pl, int y, int rowW, ToolTip dtip, Color partyCol = default, List<string> companions = null, string matchId = null, List<string> neighbors = null, Dictionary<string, (string name, string id)> logMap = null, HashSet<string> present = null, Dictionary<string, (string name, int conf)> gbMap = null)
         {
             var row = new Panel { Location = new Point(S(4), y), Size = new Size(rowW, S(42)), BackColor = Theme.Panel };
             if (partyCol != Color.Empty)   // premade-party accent bar on the left
@@ -7076,6 +9035,11 @@ namespace SmiteGodLab
                 if (!string.IsNullOrEmpty(revName)) { revExact = true; revConf = 100; }
                 else { var rv = NameDb.Resolve(clanId, acct, mast, god, companions, neighbors, present, rareSkin, SlotRankFromRow(pl)); revName = rv.name; revConf = rv.conf; }
             }
+            // GOD-BOARD reveal (god-leaderboard id-leak → smite.guru name): a near-exact id→name resolution for THIS hidden
+            // ranked slot, pre-computed in ShowMatchDetails. Ranks above the fuzzy ≈ fingerprint, below the user's ★ tag.
+            string gbName = null; int gbConf = 0;
+            if (NameDb.Enabled && priv && gbMap != null && gbMap.TryGetValue(GS(pl, "GodId") + "|" + tf, out var gbv)) { gbName = gbv.name; gbConf = gbv.conf; }
+            Color gbCol = Color.FromArgb(120, 205, 170);   // teal-green = a leaderboard-sourced reveal
             string cName = null; int cVotes = 0; bool cConf = false;
             if (TagSync.Enabled && priv)
             {
@@ -7132,6 +9096,8 @@ namespace SmiteGodLab
                 { nameLbl.ForeColor = revCol; nameLbl.Text = "✔ " + revName + tail; }
                 else if (tag != null)
                 { nameLbl.ForeColor = Theme.Blue; nameLbl.Text = "★ " + tag.Nick + tail; }
+                else if (!string.IsNullOrEmpty(gbName))
+                { nameLbl.ForeColor = gbCol; nameLbl.Text = "✦ " + gbName + tail; }
                 else if (cConf)
                 { nameLbl.ForeColor = comCol; nameLbl.Text = "⚑ " + cName + "?" + tail; }
                 else if (!string.IsNullOrEmpty(revName))
@@ -7143,7 +9109,8 @@ namespace SmiteGodLab
                 string note; Color noteCol = Theme.Dim;
                 if (!string.IsNullOrEmpty(logName)) { note = "   ·   from your match log"; noteCol = logCol; }
                 else if (revExact) { note = "   ·   matched live capture"; noteCol = revCol; }
-                else if (tag != null) note = !string.IsNullOrEmpty(revName) ? "   ·   maybe " + revName : (!string.IsNullOrEmpty(cName) ? "   ·   community: " + cName : "");
+                else if (tag != null) note = !string.IsNullOrEmpty(revName) ? "   ·   maybe " + revName : (!string.IsNullOrEmpty(gbName) ? "   ·   maybe " + gbName : (!string.IsNullOrEmpty(cName) ? "   ·   community: " + cName : ""));
+                else if (!string.IsNullOrEmpty(gbName)) { note = "   ·   ranked leaderboard · " + gbConf + "%"; noteCol = gbCol; }
                 else if (cConf) { note = "   ·   community · " + cVotes + " taggers"; noteCol = comCol; }
                 else if (!string.IsNullOrEmpty(revName)) { note = "   ·   possible · " + revConf + "% (guess)"; noteCol = revCol; }
                 else if (!string.IsNullOrEmpty(cName)) { note = "   ·   community · unconfirmed"; noteCol = comCol; }
@@ -7162,8 +9129,8 @@ namespace SmiteGodLab
                     var cur = MatchHidden(clanId, acct, mast, companions, god);
                     // ACTIVE LEARNING: if the algorithm guessed a name (✔ exact / ≈ / ⚑), pre-fill it so one Save CONFIRMS it
                     // into a ground-truth user tag (★, which outranks every guess afterwards). Otherwise the box is blank to name fresh.
-                    string suggested = cur?.Nick ?? (!string.IsNullOrEmpty(logName) ? logName : (string.IsNullOrEmpty(revName) ? "" : revName));
-                    bool isGuess = cur == null && !string.IsNullOrEmpty(revName);
+                    string suggested = cur?.Nick ?? (!string.IsNullOrEmpty(logName) ? logName : (!string.IsNullOrEmpty(gbName) ? gbName : (string.IsNullOrEmpty(revName) ? "" : revName)));
+                    bool isGuess = cur == null && (!string.IsNullOrEmpty(revName) || !string.IsNullOrEmpty(gbName));
                     string head = priv ? (isGuess ? "Confirm or correct this player" : "Name this hidden player") : "Edit the tag for " + nm;
                     int compCount = companions?.Count ?? 0;
                     string matchNote = isGuess ? "suggested name pre-filled — Save to confirm, edit to correct, or clear to dismiss"
@@ -7177,6 +9144,8 @@ namespace SmiteGodLab
                     // matchId+team+GodId slot, clearing it FORGETS the slot — otherwise a tag captured live couldn't be
                     // removed here (ResolveExact would keep showing ✔). Only hidden rows have an exact slot.
                     if (priv && !string.IsNullOrEmpty(matchId)) { NameDb.LearnLiveSlot(matchId, tf, GS(pl, "GodId"), nick); NameDb.Save(true); }
+                    // recover the named account's REAL player_id via the getplayeridbyname leak → id-anchor the tag (best-effort, background)
+                    if (priv && !string.IsNullOrEmpty(nick)) _ = ConfirmHiddenNameAsync(nick, clanId, clan, acct, mast, god, companions, nbrSelf);
                     PaintName();
                 };
                 row.Cursor = nameLbl.Cursor = subLbl.Cursor = Cursors.Hand;
