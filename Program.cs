@@ -1554,6 +1554,8 @@ namespace SmiteGodLab
         public bool CheckUpdates { get; set; } = true;   // check GitHub for a newer release at startup (default on)
         public bool AutoUpdate { get; set; }             // download + install new versions without asking (default off)
         public string SkippedVersion { get; set; } = "";  // a version the user said "no" to → don't re-prompt for it
+        public bool BetaChannel { get; set; }            // opt in to pre-release (beta) builds when checking for updates
+        public string AppliedTag { get; set; } = "";     // full tag of the last update applied in-app (so iterative betas of the same numeric version are still offered)
         public bool RevealHidden { get; set; }   // EXPERIMENT: auto-reveal privacy-hidden players from the learned name DB
         public bool Harvest { get; set; }        // EXPERIMENT: run the background name harvester to grow the DB at scale
         public bool RankedReveal { get; set; }   // EXPERIMENT (2026-06-25): de-anon hidden RANKED players via the god-leaderboard id-leak → smite.guru name (network-heavy, opt-in)
@@ -4878,7 +4880,7 @@ namespace SmiteGodLab
             }
 
             H2("Overview");
-            P("Smite 1 Inspector is a single self-contained Windows app with two halves: a God Inspector that edits the game's god .ini tuning files offline, and a Player Tracker that pulls live stats from the official Hi-Rez SMITE 1 API. The left rail switches between Player Tracker, Friend List, God Inspector, this Codex, and Settings. Everything is offline-first except the tracker and friend features, which call the API only when you ask.");
+            P("Smite 1 Inspector is a single self-contained Windows app with three sides: a God Inspector that edits the game's god .ini tuning files offline, a Player Tracker that pulls live stats from the official Hi-Rez SMITE 1 API, and Whispers — a standalone messenger that talks to live players while the game is closed. The left rail switches between Player Tracker, Friend List, God Inspector, Whispers, this Codex, and Settings. Everything is offline-first except the tracker, friend, and whisper features, which reach the network only when you ask.");
 
             H2("God Inspector");
             P("Point it at your SMITE config folder and it loads every god's .ini. Each tunable — ability scaling, cooldowns, costs and so on — becomes an editable row. Change values, add new keys from the embedded UE3 SDK definition list, then Apply (write back to the .ini), Reload, or Restore Defaults.");
@@ -4992,6 +4994,42 @@ namespace SmiteGodLab
                + "offline : last seen = now - last login");
             P("Toggle Show online time to display uptime on online rows. Leaving the tab pauses the poller and caches the list exactly as you left it; returning shows it instantly and resumes by priority (online first, then offline) instead of re-scanning. The slow getplayer call (name, avatar, last login) is cached and only refreshed on an online/offline transition or every half hour. The preview panel shows the in-game avatar (or a coloured initial when none is set), an Open-profile button, a View-current-game button when they are in a match, and a per-friend Notes box.");
 
+            H2("Whispers");
+            P("Whispers is a standalone messenger that lets you message live SMITE players while the game is completely closed. It connects to SMITE's own chat service — the same backend the in-game whisper window uses — so the messages you send arrive as ordinary in-game whispers, and replies appear here in real time. Everything needed to reach that service is bundled with the app, so SMITE does not have to be installed on the PC running it.");
+
+            H3("How it connects");
+            P("Opening the Whispers tab starts a small background engine. It signs in to SMITE's chat backend and holds an encrypted connection open to the chat server, speaking the same login and messaging protocol the game client uses (via SMITE's own networking library, bundled alongside the app). Once signed in you appear online to the chat service exactly as if the game were running — which is what lets the people you message reply to you, and lets you see who is online.");
+            Math("engine  -> sign in  (Steam ticket OR Hi-Rez login)\n"
+               + "        -> open an encrypted link to the chat server\n"
+               + "        -> register as ONLINE with the chat service\n"
+               + "        <- incoming whispers + presence pushed back\n"
+               + "        -> your messages sent as chat whispers");
+
+            H3("Sign-in: Steam or Hi-Rez");
+            P("There are two ways to sign in, chosen in Whispers -> Options. Steam login reuses your running Steam session (Steam must be open and signed in to your SMITE account); it is one click, but because it borrows a live Steam session, Steam shows you as \"playing SMITE\" for as long as the chat connection is held. Hi-Rez login uses your Hi-Rez account name and password directly — it never touches Steam, connects a little faster, and shows no Steam game status. A saved password is encrypted with Windows' own per-user encryption (DPAPI) and is never written or logged in plain text. By default the engine connects only while the Whispers tab is open; Options also has a \"Connect automatically when the app opens\" toggle that keeps it connected for the whole session (so in Steam mode the SMITE status shows the entire time the app is running).");
+
+            H3("Sending, queuing and delivery");
+            P("Type a name, write a message, send. Message someone who is offline and you get an instant offline notice — the same immediate feedback the game gives — because the engine checks that player's presence with the chat service before sending. Messages you send during the few seconds while the engine is still signing in are not lost: they are held in a queue, shown with a queued marker, and sent automatically the moment the connection is ready; a queued message can be cancelled before it goes out. Delivery feedback is best-effort — the app marks a message sent once the chat service accepts it, but SMITE's chat backend does not return a hard read receipt.");
+
+            H3("Presence and conversations");
+            P("The engine periodically refreshes the presence of each open conversation, so you can see who is online without launching the game. Conversations behave like any chat app: pin the ones that matter to the top, and remove ones you don't want in the list. Delete is a soft delete — the history is kept and comes straight back if that person messages you again or you reopen the conversation. All conversations and history live locally as JSON in your data folder; nothing is uploaded.");
+
+            H3("Requirements & limitations");
+            P("Whispers talks to a live Hi-Rez service, so there are real constraints:");
+            Math("- SMITE itself must be CLOSED while you whisper: one\n"
+               + "  account cannot be signed in to chat twice at once.\n"
+               + "- One account at a time per running app.\n"
+               + "- Steam login needs Steam open + signed in; Hi-Rez\n"
+               + "  login needs your Hi-Rez account name + password.\n"
+               + "- The first sign-in can take ~10-30 seconds.\n"
+               + "- Presence is best-effort and cross-platform: a player\n"
+               + "  on console may report differently than on PC.\n"
+               + "- It depends on Hi-Rez's chat servers staying online; if\n"
+               + "  Hi-Rez retires them, Whispers stops working.");
+
+            H3("Known issues (beta)");
+            P("Whispers is the newest and most experimental feature and ships as a beta. Known rough edges: the first connection after launch can be slow or, rarely, fail and need a reconnect (reopen the tab); on a flaky network the engine may drop and re-establish the chat link, briefly showing \"connecting\"; presence can lag a few seconds behind reality; and because delivery is inferred rather than confirmed by the server, a message shown as sent may in rare cases not have been routed. If something misbehaves, use Export Logs on the Whispers tab and share the zip. It never includes your password or your saved conversation history, but the diagnostic logs can contain recent whisper text and your Hi-Rez username — so only share it with someone you trust to help.");
+
             H2("The Hi-Rez API");
             H3("Request signing");
             P("Stats come from the official SMITE 1 API. Each request is signed with an MD5 of the developer id, the method name, an auth key and a UTC timestamp:");
@@ -5004,7 +5042,7 @@ namespace SmiteGodLab
             P("A few things the API cannot do, by design. It cannot reveal a privacy-flagged player's name or id from a completed match, a live match, or a friends list — privacy-flagged players are anonymized everywhere the API returns them (the app can only put a name to them from your local combat log, or as a fingerprint best-guess). It does not expose newer in-client avatars, only an older avatar set, so many active players return no avatar (the app shows a coloured initial instead). Custom and scrim matches never appear in a player's match history, and Hi-Rez hides their detailed scoreboards for about 7 days after the match (an anti-scouting measure), so Recent Matches cannot list them (normal and ranked history is also capped at roughly the 50 most recent games). And it does not resolve linked-account names beyond the primary account. These are server-side limits, not app bugs.");
 
             H2("Your data");
-            P("Everything you save — favorites, recent lookups, hidden-player tags, the friend list with its per-friend notes, your settings, and the god default snapshots — is stored as plain JSON in your Documents folder under Smite Inspector, so a shared copy of the app in a read-only location still works. Nothing is uploaded anywhere; the only network traffic is to the Hi-Rez API, and only for the stats you explicitly request.");
+            P("Everything you save — favorites, recent lookups, hidden-player tags, the friend list with its per-friend notes, your Whispers conversations, your settings, and the god default snapshots — is stored as plain JSON in your Documents folder under Smite Inspector, so a shared copy of the app in a read-only location still works. Nothing is uploaded anywhere; the only network traffic is to the Hi-Rez API and chat service, and only when you ask. Settings → Uninstall removes the app and can optionally erase this folder.");
 
             // --- expandable sidebar tree (owner-drawn rows; chevron toggle; red accent bar follows the scroll) ---
             void SetExpanded(TocNode sec, bool exp)
@@ -5167,7 +5205,9 @@ namespace SmiteGodLab
             var chkUpd = MkChk("Check for updates on startup", settings.CheckUpdates); chkUpd.BackColor = Theme.Bg; chkUpd.Location = new Point(S(2), y);
             chkUpd.CheckedChanged += (s, e) => { settings.CheckUpdates = chkUpd.Checked; SaveSettings(); }; Add(chkUpd); y += S(28);
             var chkAuto = MkChk("Install updates automatically (no prompt)", settings.AutoUpdate); chkAuto.BackColor = Theme.Bg; chkAuto.Location = new Point(S(2), y);
-            chkAuto.CheckedChanged += (s, e) => { settings.AutoUpdate = chkAuto.Checked; SaveSettings(); }; Add(chkAuto); y += S(34);
+            chkAuto.CheckedChanged += (s, e) => { settings.AutoUpdate = chkAuto.Checked; SaveSettings(); }; Add(chkAuto); y += S(28);
+            var chkBeta = MkChk("Get beta releases (pre-release test builds — newer, but less stable)", settings.BetaChannel); chkBeta.BackColor = Theme.Bg; chkBeta.Location = new Point(S(2), y);
+            chkBeta.CheckedChanged += (s, e) => { settings.BetaChannel = chkBeta.Checked; settings.SkippedVersion = ""; SaveSettings(); }; Add(chkBeta); y += S(34);   // clear the skip on either toggle: the candidate "latest" changes meaning with the channel
             var btnUpd = MkBtn("Check for updates now", 184, false, Theme.Blue, Color.White); btnUpd.Location = new Point(S(2), y);
             btnUpd.Click += async (s, e) => await CheckForUpdate(true); Add(btnUpd); y += S(52);
 
@@ -5225,6 +5265,12 @@ namespace SmiteGodLab
             Add(lnkCodex); y += S(42);
 
             RefreshReveal();
+
+            // -- Uninstall --
+            Add(Lbl("UNINSTALL", Theme.Accent, 10f, y, FontStyle.Bold)); y += S(24);
+            Add(Lbl("Removes Smite 1 Inspector from this PC. You'll be asked whether to also delete your saved data.", Theme.Dim, 8.5f, y)); y += S(26);
+            var btnUninst = MkBtn("Uninstall Smite 1 Inspector", 224, false, Theme.Accent, Color.White); btnUninst.Location = new Point(S(2), y);
+            btnUninst.Click += (s, e) => UninstallApp(); Add(btnUninst); y += S(50);
 
             Add(Lbl("Data folder: " + Theme.DataDir, Theme.Dim, 8.5f, y)); y += S(24);
             return host;
@@ -8311,7 +8357,7 @@ namespace SmiteGodLab
             { try { if (File.Exists(pth)) { s = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(pth)); if (s != null) break; } } catch { } }
             try
             {
-                if (s != null) { settings.StartupTab = s.StartupTab; settings.TimeFormat = s.TimeFormat; settings.ShowFriendUptime = s.ShowFriendUptime; settings.CheckUpdates = s.CheckUpdates; settings.AutoUpdate = s.AutoUpdate; settings.SkippedVersion = s.SkippedVersion ?? ""; settings.RevealHidden = s.RevealHidden; settings.Harvest = s.Harvest; settings.CommunityTags = s.CommunityTags; settings.LogReveal = s.LogReveal; settings.MyProfileId = s.MyProfileId ?? ""; settings.MyProfileName = s.MyProfileName ?? ""; settings.MyProfilePortal = s.MyProfilePortal; }
+                if (s != null) { settings.StartupTab = s.StartupTab; settings.TimeFormat = s.TimeFormat; settings.ShowFriendUptime = s.ShowFriendUptime; settings.CheckUpdates = s.CheckUpdates; settings.AutoUpdate = s.AutoUpdate; settings.SkippedVersion = s.SkippedVersion ?? ""; settings.BetaChannel = s.BetaChannel; settings.AppliedTag = s.AppliedTag ?? ""; settings.RevealHidden = s.RevealHidden; settings.Harvest = s.Harvest; settings.CommunityTags = s.CommunityTags; settings.LogReveal = s.LogReveal; settings.MyProfileId = s.MyProfileId ?? ""; settings.MyProfileName = s.MyProfileName ?? ""; settings.MyProfilePortal = s.MyProfilePortal; }
             }
             catch { }
         }
@@ -8330,6 +8376,7 @@ namespace SmiteGodLab
             return "1.2.0";
         }
         const string ReleasesApi = "https://api.github.com/repos/DariusSmite/Smite-1-Inspector/releases/latest";
+        const string ReleasesListApi = "https://api.github.com/repos/DariusSmite/Smite-1-Inspector/releases?per_page=10";   // beta channel: includes pre-releases (newest first)
         const string ReleasesPage = "https://github.com/DariusSmite/Smite-1-Inspector/releases/latest";
         bool _updateChecked;   // startup check runs once per launch
 
@@ -8357,19 +8404,102 @@ namespace SmiteGodLab
             return Version.TryParse(s, out var v) ? v : new Version(0, 0);
         }
 
+        // Detached, fire-and-forget delete that runs AFTER this app exits (a short ping delay lets file locks release),
+        // so it can remove the running exe or the data folder. Best-effort: whatever is still locked is simply left behind.
+        static void ScheduleDetachedDelete(string path, bool isDir)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+            try
+            {
+                path = path.TrimEnd('\\');   // a trailing backslash would escape the closing quote in the cmd line
+                string inner = isDir ? "rd /s /q \"" + path + "\"" : "del /f /q \"" + path + "\"";
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("cmd.exe", "/c ping 127.0.0.1 -n 3 >nul & " + inner)
+                { CreateNoWindow = true, UseShellExecute = false, WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden });
+            }
+            catch { }
+        }
+
+        // Settings → Uninstall. Confirms, optionally erases the Documents\Smite Inspector data folder, then either runs the
+        // Inno uninstaller (installed build) or self-deletes the exe (portable build). The whisper engine is stopped first
+        // so its relay files unlock. Destructive — only ever reached by an explicit click + confirmations.
+        void UninstallApp()
+        {
+            bool installed = IsInstalled();
+            string exe = Environment.ProcessPath ?? "";
+            string dir = Path.GetDirectoryName(exe) ?? "";
+            string unins = Path.Combine(dir, "unins000.exe");
+            bool haveUninstaller = installed && File.Exists(unins);
+            // Normalize once so the path we safety-check is exactly the path we delete (no trailing-slash quoting hazard).
+            string dataDir; try { dataDir = Path.GetFullPath(Theme.DataDir).TrimEnd('\\'); } catch { dataDir = Theme.DataDir; }
+
+            string intro = installed
+                ? "Uninstall Smite 1 Inspector?\n\nThis closes the app and removes it from your PC."
+                : "This is the portable version, so there is nothing to formally uninstall.\n\nYou can close the app and (optionally) delete its saved data now; afterwards just delete SmiteInspector.exe.";
+            if (MessageBox.Show(this, intro, "Uninstall", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
+
+            // Installed in Program Files but the uninstaller is missing/damaged: never self-delete the program exe — that
+            // would orphan the install. Send the user to Windows' own uninstaller and leave everything (incl. data) intact.
+            if (installed && !haveUninstaller)
+            {
+                MessageBox.Show(this, "The uninstaller couldn't be found next to the app. Please uninstall Smite 1 Inspector from Windows Settings → Apps.\n\n(Your saved data was left untouched.)", "Uninstall", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            var dataChoice = MessageBox.Show(this,
+                "Also delete your saved data?\n\nThis permanently removes your conversations, hidden-player tags, friend list, notes and settings stored in:\n" + dataDir + "\n\nYes — delete my data        No — keep my data        Cancel — stop",
+                "Delete saved data?", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning);
+            if (dataChoice == DialogResult.Cancel) return;
+            bool clearData = dataChoice == DialogResult.Yes;
+
+            // Safety: only wipe the data folder when it is NOT the app/exe directory (the rare Documents-unavailable
+            // fallback) — recursively deleting the program folder would nuke the install out from under the uninstaller.
+            bool dataIsAppDir;
+            try { dataIsAppDir = string.Equals(dataDir, Path.GetFullPath(Theme.AppDir).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase); }
+            catch { dataIsAppDir = true; }   // can't prove it's safe → don't recursively delete
+
+            // Stop the background whisper engine(s) so the relay files release before any delete.
+            try { foreach (var p in System.Diagnostics.Process.GetProcessesByName("Probe5")) { try { p.Kill(); } catch { } } } catch { }
+
+            // Start the removal FIRST. Only once it is under way do we schedule the optional data wipe, so a cancelled/failed
+            // uninstaller launch (e.g. the user declines UAC) never erases data and then bails.
+            if (haveUninstaller)
+            {
+                try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(unins) { UseShellExecute = true }); }
+                catch (Exception ex) { MessageBox.Show(this, "Couldn't start the uninstaller: " + ex.Message + "\n\nYou can uninstall from Windows Settings → Apps instead.", "Uninstall", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+            }
+            else if (!string.IsNullOrEmpty(exe))
+            {
+                ScheduleDetachedDelete(exe, false);   // portable: remove the exe after we exit
+            }
+            if (clearData && !dataIsAppDir) ScheduleDetachedDelete(dataDir, true);
+            Application.Exit();
+        }
+
         // Checks GitHub for a newer release. userInitiated (Settings button) always prompts and reports "up to date";
         // the startup check stays quiet unless there's an update the user hasn't already declined.
         async Task CheckForUpdate(bool userInitiated)
         {
             try
             {
-                string tag = null, setupUrl = null, bareUrl = null; long setupSize = 0, bareSize = 0;
+                string tag = null, setupUrl = null, bareUrl = null; long setupSize = 0, bareSize = 0; bool prerelease = false;
                 using (var http = new HttpClient { Timeout = TimeSpan.FromSeconds(12) })
                 {
                     http.DefaultRequestHeaders.Add("User-Agent", "Smite1Inspector");
-                    using var doc = JsonDocument.Parse(await http.GetStringAsync(ReleasesApi));
-                    if (doc.RootElement.TryGetProperty("tag_name", out var t)) tag = t.GetString();
-                    if (doc.RootElement.TryGetProperty("assets", out var assets) && assets.ValueKind == JsonValueKind.Array)
+                    // Stable users read /releases/latest (GitHub omits pre-releases there). Beta users read the full
+                    // release list (newest first) and take the most recent entry, which may be a pre-release build.
+                    string api = settings.BetaChannel ? ReleasesListApi : ReleasesApi;
+                    using var doc = JsonDocument.Parse(await http.GetStringAsync(api));
+                    JsonElement rel;
+                    if (settings.BetaChannel)
+                    {
+                        if (doc.RootElement.ValueKind != JsonValueKind.Array || doc.RootElement.GetArrayLength() == 0)
+                        { if (userInitiated) MessageBox.Show(this, "Couldn't read the latest release.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                        rel = doc.RootElement[0];
+                    }
+                    else rel = doc.RootElement;
+                    if (rel.TryGetProperty("tag_name", out var t)) tag = t.GetString();
+                    if (rel.TryGetProperty("prerelease", out var pr) && pr.ValueKind == JsonValueKind.True) prerelease = true;
+                    if (rel.TryGetProperty("assets", out var assets) && assets.ValueKind == JsonValueKind.Array)
                         foreach (var a in assets.EnumerateArray())
                         {
                             string nm = GS(a, "name");
@@ -8387,14 +8517,20 @@ namespace SmiteGodLab
                 if (installed) { if (setupUrl != null) { assetUrl = setupUrl; assetSize = setupSize; isInstaller = true; } else { assetUrl = bareUrl; assetSize = bareSize; isInstaller = false; } }
                 else { if (bareUrl != null) { assetUrl = bareUrl; assetSize = bareSize; isInstaller = false; } else { assetUrl = setupUrl; assetSize = setupSize; isInstaller = true; } }
                 if (string.IsNullOrEmpty(tag)) { if (userInitiated) MessageBox.Show(this, "Couldn't read the latest release.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
-                if (ParseVer(tag) <= ParseVer(AppVersion))
+                // Newer by version, OR (beta channel) a different-tagged beta of the SAME numeric version than the one we
+                // last applied in-app — ParseVer strips the "-betaN" suffix, so iterative betas would otherwise be skipped.
+                bool isNewer = ParseVer(tag) > ParseVer(AppVersion)
+                    || (settings.BetaChannel && ParseVer(tag) == ParseVer(AppVersion)
+                        && !string.IsNullOrEmpty(settings.AppliedTag) && tag != settings.AppliedTag);
+                if (!isNewer)
                 { if (userInitiated) MessageBox.Show(this, "You're on the latest version (v" + AppVersion + ").", "Up to date", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
                 if (!userInitiated && settings.SkippedVersion == tag) return;   // already declined this version at startup
                 if (string.IsNullOrEmpty(assetUrl))
                 { if (userInitiated) MessageBox.Show(this, tag + " is available, but no exe was attached. Get it from the Releases page.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
                 if (settings.AutoUpdate && !userInitiated) { await ApplyUpdate(assetUrl, assetSize, tag, isInstaller); return; }
                 string sizeTxt = assetSize > 0 ? "  (download ~" + (assetSize / 1048576) + " MB)" : "";
-                var r = MessageBox.Show(this, "A new version is available: " + tag + "\nYou have v" + AppVersion + "." + sizeTxt + "\n\nUpdate now?",
+                string betaTxt = prerelease ? "  [BETA]" : "";
+                var r = MessageBox.Show(this, "A new version is available: " + tag + betaTxt + "\nYou have v" + AppVersion + "." + sizeTxt + "\n\nUpdate now?",
                     "Update available", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                 if (r != DialogResult.Yes) { settings.SkippedVersion = tag; SaveSettings(); return; }   // remember the "no"
                 await ApplyUpdate(assetUrl, assetSize, tag, isInstaller);
@@ -8428,6 +8564,7 @@ namespace SmiteGodLab
             // reject a truncated/incomplete download before applying it
             if (ok && size > 0) { try { ok = new FileInfo(dlPath).Length == size; } catch { ok = false; } }
             if (!ok) { try { File.Delete(dlPath); } catch { } MessageBox.Show(this, "Download failed or was incomplete. You can update manually from the Releases page.", "Updates", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+            if (!string.IsNullOrEmpty(tag)) { settings.AppliedTag = tag; SaveSettings(); }   // remember the exact tag we applied (iterative-beta tracking)
 
             if (isInstaller)
             {
