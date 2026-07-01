@@ -2982,6 +2982,13 @@ namespace SmiteGodLab
         public event Action<string, bool> Presence;  // (player name, online) — from REQUEST_PLAYER_INFO responses
         long _presPos;
         public string State { get; private set; } = "stopped";
+        // Diagnostics: exposed so Export Logs can summarize connection HEALTH at a glance (a "connected" state with no
+        // real traffic for minutes is a dead session — the exact case that used to be invisible in a bug report).
+        public bool EverConnected { get { return _everConnected; } }
+        public double SecondsSinceTraffic { get { return (DateTime.Now - _lastTrafficAt).TotalSeconds; } }
+        public double SecondsSinceLine { get { return (DateTime.Now - _lastLineAt).TotalSeconds; } }
+        public int InboundCount { get { return _inboundCount; } }
+        volatile int _inboundCount;   // real inbound lines (replies + delivery echoes) seen this run — frozen count == dead link
 
         // Login method: "steam" (default — uses the Steam SMITE ticket, so Steam shows the game running) or
         // "hirez" (Hi-Rez username/password — no Steam, no "playing" status, and skips the EOS/Steam startup waits).
@@ -3028,7 +3035,7 @@ namespace SmiteGodLab
             _inPos = 0;
             // Fresh run, fresh grace period: a brand-new child's own normal pre-login "connected=False" chatter must
             // NOT be mistaken for a lost-and-regained session (that gate is keyed on _everConnected, see OnLine()).
-            _everConnected = false;
+            _everConnected = false; _inboundCount = 0;
             _lastLineAt = DateTime.Now; _lastTrafficAt = DateTime.Now; _lastQueryAt = DateTime.MinValue;
             var psi = new System.Diagnostics.ProcessStartInfo
             {
@@ -3156,7 +3163,7 @@ namespace SmiteGodLab
                                         var parts = ln.Split(new[] { '\t' }, 3);
                                         string sender = parts.Length >= 3 ? parts[1] : "";
                                         string text = parts.Length >= 3 ? parts[2] : ln;
-                                        if (text.Length > 0) try { Inbound?.Invoke(sender, text); } catch { }
+                                        if (text.Length > 0) { _inboundCount++; try { Inbound?.Invoke(sender, text); } catch { } }
                                     }
                                     _inPos = fs.Position;
                                 }
@@ -6448,6 +6455,10 @@ namespace SmiteGodLab
             // offline network doesn't spin in a tight restart loop; resets the moment we're connected again.
             int reconnectAttempts = 0;
             System.Windows.Forms.Timer reconnectTimer = null;
+            // Compact APP-side event log (the engine-live.log only has Probe5's side). Captures the connection lifecycle
+            // + send outcomes so a bug report shows what the app DID, not just what the engine saw. Included in Export Logs.
+            var wlog = new List<string>();
+            void WLog(string s) { try { wlog.Add(DateTime.Now.ToString("HH:mm:ss.fff") + " " + s); if (wlog.Count > 2000) wlog.RemoveRange(0, wlog.Count - 2000); } catch { } }
             // Drop any pending auto-reconnect and reset its backoff. Called whenever we reach a genuinely healthy
             // "connected" state, or whenever something ELSE already restarted the engine (a manual login-settings
             // change) — otherwise a stale scheduled restart fires later and disrupts an already-fine connection.
@@ -6459,14 +6470,16 @@ namespace SmiteGodLab
                 // SMITE open on the same Steam account is the one disconnect cause a restart can NEVER fix (the
                 // server will just close the fresh login again); don't churn the engine while that's true. Reopening
                 // the tab / app already re-attempts the connection once the conflict clears.
-                if (_gameOpen) return;
+                if (_gameOpen) { WLog("reconnect skipped — SMITE open on this account"); return; }
                 int attempt = reconnectAttempts++;
                 int delayMs = Math.Min(2000 * (int)Math.Pow(2, Math.Min(attempt, 4)), 30000);   // 2s,4s,8s,16s,30s cap
+                WLog("reconnect scheduled — attempt " + (attempt + 1) + " in " + (delayMs / 1000) + "s");
                 reconnectTimer = new System.Windows.Forms.Timer { Interval = delayMs };
                 reconnectTimer.Tick += (s, e) =>
                 {
                     reconnectTimer.Stop(); reconnectTimer.Dispose(); reconnectTimer = null;
                     if (engine == null || !LoginReady()) return;
+                    WLog("reconnecting now — restarting engine");
                     try { engine.Stop(); } catch { }
                     ApplyLogin(); engine.Start();
                 };
@@ -6479,6 +6492,7 @@ namespace SmiteGodLab
             {
                 engine.Status += st => Ui(() =>
                 {
+                    WLog("engine state -> " + st + (st == "connected" ? "  (login=" + loginMode + ")" : ""));
                     SetStatus(st);
                     if (st == "connected")
                     {
@@ -6517,6 +6531,7 @@ namespace SmiteGodLab
                         if (matchKey != null && convs.TryGetValue(matchKey, out var mc))
                             foreach (var m in mc.Msgs) if (m.Dir == "out" && m.St == "queued" && m.Text == text) { m.St = ""; cleared = true; break; }
                         if (cleared) { SaveConvs(); if (activeKey == matchKey) RenderThread(matchKey); RenderConvList(true); RefreshConnLabel(); }
+                        WLog("delivery: confirmed by server (SENT echo)" + (matchKey != null ? " (" + matchKey + ")" : ""));
                         return;
                     }
                     string disp = string.IsNullOrWhiteSpace(sender) ? (activeKey != null ? convs[activeKey].Display : "?") : sender;
@@ -6548,6 +6563,7 @@ namespace SmiteGodLab
                 string key = activeKey;
                 bool connected = engine.State == "connected";   // sample BEFORE Send so a mid-send flip can't double-handle it
                 engine.Send(convs[key].Display, msg);
+                WLog("outgoing -> " + convs[key].Display + "  connected=" + connected + (connected ? "" : " (queued)"));
                 // Engine still logging in -> the message is QUEUED. Show it as queued (with a ✕ cancel) and bail; the
                 // delivery/offline checks happen later, when login finishes and FlushQueued() actually sends it.
                 if (!connected)
@@ -6597,6 +6613,7 @@ namespace SmiteGodLab
                             if (m.Dir == "out" && m.St == "" && m.Text == p.text) { m.St = "queued"; break; }
                         SaveConvs(); if (activeKey == p.key) RenderThread(p.key); RenderConvList(true); RefreshConnLabel();
                         AddMsg(p.key, "sys", "\"" + snip + "\" connection dropped before this was confirmed — it'll resend automatically once reconnected.");
+                        WLog("delivery: no echo + link down -> re-queued (" + p.key + ")");
                         continue;
                     }
                     // No echo within the window while still connected ⇒ genuinely not accepted. Blame offline if we
@@ -6609,6 +6626,7 @@ namespace SmiteGodLab
                             ? "they're offline — it wasn't delivered."
                             : "SMITE's spam/repetition filter rejected it — try rephrasing.";
                         AddMsg(p.key, "sys", "\"" + snip + "\" " + reason);
+                        WLog("delivery: no echo (still connected) -> " + (_gameOpen ? "game-open" : offline ? "offline" : "spam/reject") + " (" + p.key + ")");
                     }
                 }
             };
@@ -6681,6 +6699,42 @@ namespace SmiteGodLab
                     sb.AppendLine("  Login:    mode=" + loginMode + "  user-set=" + (loginUser.Length > 0 ? "yes" : "no") + "  auto-connect=" + loginAuto + "  login-ready=" + LoginReady());
                     sb.AppendLine("  Engine:   running=" + (engine != null && engine.Running) + "  state=" + (engine != null ? engine.State : "<no engine>"));
                     sb.AppendLine("  Status:   \"" + statusLbl.Text + "\"   game-conflict-warn=" + _gameOpen);
+                    // Connection HEALTH — the signals that make a dead/degraded session obvious at a glance instead of
+                    // buried in the raw logs (a "connected" state with no traffic for minutes = dead link; the exact
+                    // identity the login sent = the GAMER_TAG class of bug; all-offline presence + a server CLOSE).
+                    sb.AppendLine("[Connection health]");
+                    if (engine != null)
+                    {
+                        double ta = engine.SecondsSinceTraffic;
+                        sb.AppendLine("  ever-connected=" + engine.EverConnected + "  inbound-replies=" + engine.InboundCount
+                            + "  last-server-reply=" + (engine.EverConnected ? ((int)ta) + "s ago" : "never"));
+                        if (engine.State == "connected" && engine.EverConnected && ta > 60)
+                            sb.AppendLine("  !! state is \"connected\" but NO server reply in " + (int)ta + "s — the link is likely DEAD (stale session).");
+                    }
+                    try
+                    {
+                        string idLine = null;
+                        if (engine != null) foreach (var ln in engine.RecentLog()) { int ix = ln.IndexOf("SetPortalUserName(", StringComparison.Ordinal); if (ix >= 0) idLine = ln.Substring(ix); }
+                        sb.AppendLine("  login-identity-sent: " + (idLine ?? "(not logged this run — Hi-Rez mode or pre-login)"));
+                    }
+                    catch { }
+                    try
+                    {
+                        string pf = Path.Combine(relayDir, "presence.tsv");
+                        if (File.Exists(pf))
+                        {
+                            int tot = 0, on = 0;
+                            foreach (var ln in File.ReadLines(pf)) { var pp = ln.Split('\t'); if (pp.Length >= 3) { tot++; if (pp[2].Trim() == "0") on++; } }
+                            sb.AppendLine("  presence: " + on + " online / " + tot + " reported" + (tot > 20 && on == 0 ? "   !! ALL offline — suspicious (dead/stale session, not everyone actually away)" : ""));
+                        }
+                    }
+                    catch { }
+                    try
+                    {
+                        string cf = Path.Combine(relayDir, "chatcap.log");
+                        if (File.Exists(cf)) sb.AppendLine("  server CLOSE_CONNECTION seen: " + (File.ReadAllText(cf).IndexOf("CLOSE_CONNECTION", StringComparison.Ordinal) >= 0 ? "YES !! (server dropped the chat session)" : "no"));
+                    }
+                    catch { }
                     sb.AppendLine("[Running processes]");
                     sb.AppendLine("  Smite.exe:  " + ProcInfo("Smite"));
                     sb.AppendLine("  Probe5.exe: " + ProcInfo("Probe5"));
@@ -6688,7 +6742,7 @@ namespace SmiteGodLab
                     sb.AppendLine("[Conversations]");
                     sb.AppendLine("  total=" + convs.Count + "  visible=" + visible + "   (counts only — message history is NOT exported)");
                     sb.AppendLine("=====================================================");
-                    sb.AppendLine("Included: report.txt, engine-live.log, relay/* (probe5_out.txt, chatcap.log, loginfix.log,");
+                    sb.AppendLine("Included: report.txt, engine-live.log, app-events.log, relay/* (probe5_out.txt, chatcap.log, loginfix.log,");
                     sb.AppendLine("  eosinproc.log, presence.tsv, idname.tsv, myparams.txt, whisper_in/out.txt ...), login.json.");
                     sb.AppendLine("Privacy: relay logs can contain whisper text + your Hi-Rez username. They do NOT contain your");
                     sb.AppendLine("  password. Your conversation history (conversations.json) is NOT included.");
@@ -6697,6 +6751,7 @@ namespace SmiteGodLab
                     {
                         AddText(zip, "report.txt", sb.ToString());
                         if (engine != null) AddText(zip, "engine-live.log", string.Join("\r\n", engine.RecentLog()));
+                        AddText(zip, "app-events.log", string.Join("\r\n", wlog));
                         try { if (Directory.Exists(relayDir)) foreach (var f in Directory.GetFiles(relayDir)) AddFile(zip, "relay/" + Path.GetFileName(f), f); } catch { }
                         try { if (File.Exists(loginFile)) AddFile(zip, "login.json", loginFile); } catch { }
                     }
@@ -9190,7 +9245,7 @@ namespace SmiteGodLab
         static string AppVersionFromAssembly()
         {
             try { var v = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version; if (v != null && (v.Major + v.Minor + v.Build) > 0) return v.Major + "." + v.Minor + "." + v.Build; } catch { }
-            return "1.2.2";
+            return "1.3.0";
         }
         const string ReleasesApi = "https://api.github.com/repos/DariusSmite/Smite-1-Inspector/releases/latest";
         const string ReleasesListApi = "https://api.github.com/repos/DariusSmite/Smite-1-Inspector/releases?per_page=10";   // beta channel: includes pre-releases (newest first)
