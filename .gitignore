@@ -19,3 +19,5 @@ api.txt
 .vs/
 *.user
 *.suo
+
+publish/

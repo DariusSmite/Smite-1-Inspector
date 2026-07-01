@@ -8,7 +8,7 @@
     <Nullable>disable</Nullable>
     <AssemblyName>SmiteInspector</AssemblyName>
     <RootNamespace>SmiteGodLab</RootNamespace>
-    <Version>1.2.2</Version>
+    <Version>1.3.0-beta</Version>
     <Product>Smite 1 Inspector</Product>
     <!-- Publish hints; the build.bat passes these on the command line too. -->
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
@@ -41,6 +41,10 @@
     <EmbeddedResource Include="data\abilities.json" />
     <EmbeddedResource Include="data\sdkdata.json" />
     <EmbeddedResource Include="data\sdkinspect.json" />
+    <!-- Pre-built patched TgClient.upk (the "Reveal Private Profiles" game patch) — deployed by the Extra tab. -->
+    <EmbeddedResource Include="data\reveal_tgclient.upk">
+      <LogicalName>reveal.tgclient.upk</LogicalName>
+    </EmbeddedResource>
   </ItemGroup>
 
   <!-- Precharged icons (downscaled) embedded in the exe: gicon.<base>.jpg portraits, aicon.<slug>.jpg abilities. -->

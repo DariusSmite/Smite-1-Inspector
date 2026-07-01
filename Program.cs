@@ -3299,7 +3299,8 @@ namespace SmiteGodLab
         Button openBtn, rescanBtn, applyBtn, reloadBtn, restoreBtn, addBtn, inspectBtn;
         Button[] navBtns;                            // left rail: 0 God Inspector, 1 Player Tracker, 2 Friend List, 3 Settings (tracker Track/Saved/Favorites/Friends are sub-tabs inside the view)
         int navIdx;
-        Panel settingsHost, friendListHost, codexHost, whispersHost;   // Settings / Friend List / Codex / Whispers tab content
+        Panel settingsHost, friendListHost, codexHost, whispersHost, extraHost;   // Settings / Friend List / Codex / Whispers / Extra tab content
+        Action _extraOnShow;                          // entering the Extra tab: show the one-time disclaimer
         Action _wsOnShow;                            // entering the Whispers tab: ensure the engine is started
         Action _wsAutoStart;                          // app startup: connect the engine in the background IF that option is on
         Action<string, string> _openWhisper;         // open/create a conversation with (player name, player id) — id may be "" for typed names
@@ -3527,6 +3528,9 @@ namespace SmiteGodLab
             codexHost.Dock = DockStyle.Fill; codexHost.Visible = false;
             whispersHost = BuildWhispersPanel();
             whispersHost.Dock = DockStyle.Fill; whispersHost.Visible = false;
+            extraHost = BuildExtraPanel();
+            extraHost.Dock = DockStyle.Fill; extraHost.Visible = false;
+            bodyHost.Controls.Add(extraHost);
             bodyHost.Controls.Add(whispersHost);
             bodyHost.Controls.Add(codexHost);
             bodyHost.Controls.Add(settingsHost);
@@ -3548,8 +3552,8 @@ namespace SmiteGodLab
             var navFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, BackColor = Theme.Panel, Padding = new Padding(S(8), S(4), S(8), S(8)) };
             // navBtns indexed by MODE: 0 God Inspector, 1 Player Tracker, 2 Friend List, 3 Settings, 4 Codex.
             // Shown in a custom order: Player Tracker on top, then Friend List, then God Inspector, then Codex, then Settings.
-            navBtns = new[] { MkNav("God Inspector"), MkNav("Player Tracker"), MkNav("Friend List"), MkNav("Settings"), MkNav("Codex"), MkNav("Whispers") };
-            foreach (var k in new[] { 1, 2, 5, 0, 4, 3 }) navFlow.Controls.Add(navBtns[k]);
+            navBtns = new[] { MkNav("God Inspector"), MkNav("Player Tracker"), MkNav("Friend List"), MkNav("Settings"), MkNav("Codex"), MkNav("Whispers"), MkNav("Extra") };
+            foreach (var k in new[] { 1, 2, 5, 0, 4, 6, 3 }) navFlow.Controls.Add(navBtns[k]);
             for (int i = 0; i < navBtns.Length; i++) { int k = i; navBtns[i].Click += (s, e) => SelectNav(k); }
             sideRail.Controls.Add(navFlow); sideRail.Controls.Add(brandWrap); sideRail.Controls.Add(railLine);
 
@@ -3592,6 +3596,7 @@ namespace SmiteGodLab
             if (idx == 3) { SwitchMode(3); return; }
             if (idx == 4) { SwitchMode(4); return; }
             if (idx == 5) { SwitchMode(5); _wsOnShow?.Invoke(); return; }
+            if (idx == 6) { SwitchMode(6); _extraOnShow?.Invoke(); return; }
             bool wasTracker = curMode == 1;
             SwitchMode(1);
             if (!wasTracker) _trkSubTab?.Invoke(1);   // entering the tracker → default to the Track tab (index 1; 0 is My profile)
@@ -3602,13 +3607,14 @@ namespace SmiteGodLab
         {
             curMode = mode;
             if (mode != 2) _flPause?.Invoke();   // stop the Friend List live poller whenever another tab is showing (zero FL calls while hidden)
-            bool insp = mode == 0, trk = mode == 1, fl = mode == 2, set = mode == 3, cod = mode == 4, wsp = mode == 5;
+            bool insp = mode == 0, trk = mode == 1, fl = mode == 2, set = mode == 3, cod = mode == 4, wsp = mode == 5, ext = mode == 6;
             split.Visible = insp;
             trackerHost.Visible = trk;
             if (friendListHost != null) friendListHost.Visible = fl;
             if (settingsHost != null) settingsHost.Visible = set;
             if (codexHost != null) codexHost.Visible = cod;
             if (whispersHost != null) whispersHost.Visible = wsp;
+            if (extraHost != null) extraHost.Visible = ext;
             bottomBar.Visible = insp;
             try { root.RowStyles[3].Height = insp ? S(48) : 0; } catch { }   // bottom bar (inspector only)
             try { root.RowStyles[0].Height = insp ? S(54) : 0; } catch { }   // top toolbar (inspector only)
@@ -4121,6 +4127,304 @@ namespace SmiteGodLab
 
         CheckBox MkChk(string text, bool ch)
             => new FlatCheck { Text = text, Checked = ch, AutoSize = true, ForeColor = Theme.Dim, BackColor = Theme.Panel, Font = Theme.F(9f), BoxSize = S(15), Margin = new Padding(S(12), S(6), 0, 0) };
+
+        // ===== "Extra" tab — bake the hidden-profile reveal into the installed game (permanent on-disk patch) =====
+        const string RevealOrigUpkSha1    = "6F1A631BE4586A581C2342495ABECC3277F20DDD";  // pristine TgClient.upk
+        const string RevealPatchedUpkSha1 = "17A8346EFB13E2855BDC2AC179801A840DB27A4A";  // patched TgClient.upk (bundled)
+        const int    RevealExeHashOffset  = 0x4036c6b;                                     // stored-hash offset in Smite.exe (fast path)
+
+        Panel BuildExtraPanel()
+        {
+            var host = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Bg, AutoScroll = true };
+            var col = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoSize = true, BackColor = Theme.Bg, Location = new Point(S(32), S(26)), Padding = new Padding(0) };
+
+            col.Controls.Add(new Label { AutoSize = true, Text = "Extra", ForeColor = Theme.Text, Font = Theme.F(20f, FontStyle.Bold), Margin = new Padding(0, 0, 0, S(3)) });
+            col.Controls.Add(new Label { AutoSize = true, Text = "Tools for your installed SMITE. Do step 1 before step 2.", ForeColor = Theme.Dim, Font = Theme.F(9.5f), Margin = new Padding(0, 0, 0, S(22)) });
+
+            // ===== 1. Disable EasyAntiCheat (prerequisite) =====
+            col.Controls.Add(ExtraSectionTitle("1.   Disable EasyAntiCheat"));
+            var prereq = new Panel { Width = S(700), Height = S(44), BackColor = Color.FromArgb(34, 12, 12), Margin = new Padding(0, 0, 0, S(12)) };
+            prereq.Paint += (s, e) => { using var pen = new Pen(Theme.Accent); e.Graphics.DrawRectangle(pen, 0, 0, prereq.Width - 1, prereq.Height - 1); };
+            prereq.Controls.Add(new Label { AutoSize = false, Dock = DockStyle.Fill, ForeColor = Theme.Text, Font = Theme.F(9.5f, FontStyle.Bold), TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(S(14), 0, S(14), 0), Text = "Required first. EasyAntiCheat must be disabled for the Reveal patch (and any other Extra) to work." });
+            col.Controls.Add(prereq);
+            var eacRow = new FlowLayoutPanel { FlowDirection = FlowDirection.LeftToRight, WrapContents = false, AutoSize = true, BackColor = Theme.Bg, Margin = new Padding(0) };
+            var eacEpic  = MkBigPlatformBtn("epic",  "Disable EAC", "Epic Games install", true);
+            var eacSteam = MkBigPlatformBtn("steam", "Disable EAC", "Steam install",      true);
+            eacRow.Controls.Add(eacEpic); eacRow.Controls.Add(eacSteam);
+            col.Controls.Add(eacRow);
+            var eacStatus = new Label { AutoSize = false, Width = S(700), Height = S(22), ForeColor = Theme.Dim, Font = Theme.F(10f, FontStyle.Bold), Margin = new Padding(0, S(12), 0, S(8)), Text = "" };
+            col.Controls.Add(eacStatus);
+            var eacUndo = MkBtn("↩  Re-enable EAC (undo)", 210, false);
+            eacUndo.Height = S(32); eacUndo.Margin = new Padding(0, 0, 0, 0);
+            col.Controls.Add(eacUndo);
+            WireBigBtn(eacEpic,  () => EacApply("epic",  true, eacStatus));
+            WireBigBtn(eacSteam, () => EacApply("steam", true, eacStatus));
+            eacUndo.Click += (s, e) => EacUndoAll(eacStatus);
+
+            col.Controls.Add(ExtraDivider());
+
+            // ===== 2. Reveal Private Profiles In Game =====
+            col.Controls.Add(ExtraSectionTitle("2.   Reveal Private Profiles In Game"));
+            col.Controls.Add(new Label {
+                AutoSize = false, Width = S(720), Height = S(64), ForeColor = Theme.Dim, Font = Theme.F(9.5f), Margin = new Padding(0, 0, 0, S(14)),
+                Text = "Patches your installed SMITE so its own profile screen shows private and hidden players' stats and match history instead of “PROFILE UNAVAILABLE”. It is baked into the game files, with no injection and nothing running in the background. A backup is made automatically; use “Restore backup” to undo at any time." });
+
+            var status = new Label { AutoSize = false, Width = S(720), Height = S(46), ForeColor = Theme.Dim, Font = Theme.F(10f, FontStyle.Bold), Margin = new Padding(0, S(4), 0, S(8)), Text = "" };
+
+            var row = new FlowLayoutPanel { FlowDirection = FlowDirection.LeftToRight, WrapContents = false, AutoSize = true, BackColor = Theme.Bg, Margin = new Padding(0) };
+            var epic  = MkBigPlatformBtn("epic",  "Patch Epic Games", "Epic Games install", true);
+            var steam = MkBigPlatformBtn("steam", "Patch Steam",      "Steam install",      true);
+            row.Controls.Add(epic); row.Controls.Add(steam);
+            col.Controls.Add(row);
+            col.Controls.Add(status);
+
+            var restore = MkBtn("↩  Restore backup (undo)", 210, false);
+            restore.Height = S(32); restore.Margin = new Padding(0, S(2), 0, 0);
+            col.Controls.Add(restore);
+
+            WireBigBtn(epic,  async () => await RevealPatch("epic",  status));
+            WireBigBtn(steam, async () => await RevealPatch("steam", status));
+            restore.Click += (s, e) => RevealRestoreAll(status);
+
+            host.Controls.Add(col);
+
+            _extraOnShow = () =>
+            {
+                try
+                {
+                    string ack = Path.Combine(Theme.DataDir, "extra_ack.txt");
+                    if (File.Exists(ack)) return;
+                    MessageBox.Show(this,
+                        "This tool modifies your local SMITE game files to reveal information the game normally keeps hidden.\n\n" +
+                        "Use it at your own risk. We are NOT responsible for anything that happens to your account, your game install, or your data as a result of using it.\n\n" +
+                        "A backup of the changed files is made automatically, and you can restore it at any time with “Restore backup”.\n\n" +
+                        "By continuing you acknowledge that you understand what this does.",
+                        "Reveal Private Profiles (Disclaimer)", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    try { File.WriteAllText(ack, DateTime.Now.ToString("o")); } catch { }
+                }
+                catch { }
+            };
+            return host;
+        }
+
+        Label ExtraSectionTitle(string t) => new Label { AutoSize = true, Text = t, ForeColor = Theme.Text, Font = Theme.F(13.5f, FontStyle.Bold), Margin = new Padding(0, 0, 0, S(10)) };
+        Panel ExtraDivider() => new Panel { Width = S(700), Height = 1, BackColor = Theme.Line, Margin = new Padding(0, S(6), 0, S(24)) };
+
+        // A big platform button: circle logo + title + subtitle, hover accent border. Disabled = dimmed, no click.
+        Panel MkBigPlatformBtn(string logoKey, string title, string subtitle, bool enabled)
+        {
+            var p = new Panel { Width = S(330), Height = S(102), BackColor = enabled ? Theme.Panel : Color.FromArgb(9, 9, 9), Cursor = enabled ? Cursors.Hand : Cursors.Default, Margin = new Padding(0, 0, S(16), 0) };
+            bool hover = false;
+            p.Paint += (s, e) =>
+            {
+                Color b = !enabled ? Color.FromArgb(30, 30, 30) : (hover ? Theme.Accent : Theme.Line);
+                using var pen = new Pen(b, (hover && enabled) ? 2f : 1f);
+                e.Graphics.DrawRectangle(pen, 1, 1, p.Width - 3, p.Height - 3);
+            };
+            var icon = new PictureBox { Size = new Size(S(54), S(54)), Location = new Point(S(20), S(24)), BackColor = Color.Transparent, SizeMode = PictureBoxSizeMode.Zoom };
+            try { icon.Image = PlatformLogo(logoKey, S(54)); } catch { }
+            var t = new Label { AutoSize = true, Text = title, ForeColor = enabled ? Theme.Text : Theme.Dim, Font = Theme.F(13f, FontStyle.Bold), Location = new Point(S(90), S(28)), BackColor = Color.Transparent };
+            var sub = new Label { AutoSize = true, Text = subtitle, ForeColor = Theme.Dim, Font = Theme.F(8.5f), Location = new Point(S(90), S(56)), BackColor = Color.Transparent };
+            p.Controls.Add(icon); p.Controls.Add(t); p.Controls.Add(sub);
+            if (enabled)
+            {
+                EventHandler en = (s, e) => { hover = true;  p.BackColor = Color.FromArgb(22, 22, 26); p.Invalidate(); };
+                EventHandler lv = (s, e) => { hover = false; p.BackColor = Theme.Panel;                 p.Invalidate(); };
+                foreach (Control c in new Control[] { p, icon, t, sub }) { c.MouseEnter += en; c.MouseLeave += lv; }
+            }
+            p.Tag = enabled;
+            return p;
+        }
+
+        void WireBigBtn(Panel p, Action onClick)
+        {
+            if (!(p.Tag is bool en) || !en) return;
+            void handler(object s, EventArgs e) => onClick();
+            p.Click += handler;
+            foreach (Control c in p.Controls) c.Click += handler;
+        }
+
+        static string RevealSmiteRoot(string platform)
+        {
+            string[] cands = platform == "epic"
+                ? new[] { @"C:\Program Files\Epic Games\SMITE", @"C:\Program Files (x86)\Epic Games\SMITE" }
+                : new[] { @"C:\Program Files (x86)\Steam\steamapps\common\SMITE", @"C:\Program Files\Steam\steamapps\common\SMITE" };
+            foreach (var c in cands)
+                if (File.Exists(Path.Combine(c, @"Binaries\Win64\Smite.exe"))) return c;
+            return null;
+        }
+
+        static string RevealSha1(byte[] b) => Convert.ToHexString(System.Security.Cryptography.SHA1.HashData(b));
+
+        static byte[] ReadEmbedded(string logicalName)
+        {
+            try
+            {
+                var asm = Assembly.GetExecutingAssembly();
+                using var s = asm.GetManifestResourceStream(logicalName);
+                if (s == null) return null;
+                using var ms = new MemoryStream();
+                s.CopyTo(ms);
+                return ms.ToArray();
+            }
+            catch { return null; }
+        }
+
+        static bool RegionEquals(byte[] hay, int at, byte[] needle)
+        {
+            if (at < 0 || at + needle.Length > hay.Length) return false;
+            for (int j = 0; j < needle.Length; j++) if (hay[at + j] != needle[j]) return false;
+            return true;
+        }
+
+        static int IndexOfBytes(byte[] hay, byte[] needle)
+        {
+            for (int i = 0; i <= hay.Length - needle.Length; i++)
+            {
+                bool m = true;
+                for (int j = 0; j < needle.Length; j++) if (hay[i + j] != needle[j]) { m = false; break; }
+                if (m) return i;
+            }
+            return -1;
+        }
+
+        async Task RevealPatch(string platform, Label status)
+        {
+            void Set(string msg, Color c) { try { if (status.IsHandleCreated) status.BeginInvoke(new Action(() => { status.Text = msg; status.ForeColor = c; })); else { status.Text = msg; status.ForeColor = c; } } catch { } }
+            try
+            {
+                string root = RevealSmiteRoot(platform);
+                if (root == null) { Set("Couldn't find the " + (platform == "epic" ? "Epic Games" : "Steam") + " SMITE install.", Theme.Accent); return; }
+                string upk = Path.Combine(root, @"BattleGame\CookedPCConsole\TgClient.upk");
+                string exe = Path.Combine(root, @"Binaries\Win64\Smite.exe");
+                if (!File.Exists(upk) || !File.Exists(exe)) { Set("SMITE files not found under " + root, Theme.Accent); return; }
+
+                var running = System.Diagnostics.Process.GetProcessesByName("Smite");
+                if (running.Length > 0)
+                {
+                    var r = MessageBox.Show(this, "SMITE is running and must be closed to patch it. Close it now?", "Close SMITE", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                    if (r != DialogResult.Yes) { Set("Cancelled. Close SMITE and try again.", Theme.Dim); return; }
+                    foreach (var pr in running) { try { pr.Kill(); pr.WaitForExit(4000); } catch { } }
+                    await Task.Delay(800);
+                }
+
+                Set("Working…", Theme.Dim);
+                await Task.Run(() =>
+                {
+                    string curSha = RevealSha1(File.ReadAllBytes(upk));
+                    if (string.Equals(curSha, RevealPatchedUpkSha1, StringComparison.OrdinalIgnoreCase)) { Set("Already patched. Launch SMITE and open a hidden profile.", Theme.Green); return; }
+                    if (!string.Equals(curSha, RevealOrigUpkSha1, StringComparison.OrdinalIgnoreCase)) { Set("Your SMITE version differs from the one this patch supports, so it was not applied (your game is untouched).", Theme.Accent); return; }
+
+                    byte[] patched = ReadEmbedded("reveal.tgclient.upk");
+                    if (patched == null || !string.Equals(RevealSha1(patched), RevealPatchedUpkSha1, StringComparison.OrdinalIgnoreCase)) { Set("Internal error: bundled patch missing/corrupt.", Theme.Accent); return; }
+
+                    if (!File.Exists(upk + ".orig_backup")) File.Copy(upk, upk + ".orig_backup");
+                    if (!File.Exists(exe + ".orig_backup")) File.Copy(exe, exe + ".orig_backup");
+
+                    // patch the exe's stored hash (known offset fast-path, else scan)
+                    byte[] eb = File.ReadAllBytes(exe);
+                    byte[] needle = Convert.FromHexString(RevealOrigUpkSha1);
+                    byte[] repl   = Convert.FromHexString(RevealPatchedUpkSha1);
+                    int off = RegionEquals(eb, RevealExeHashOffset, needle) ? RevealExeHashOffset : IndexOfBytes(eb, needle);
+                    if (off < 0)
+                    {
+                        if (IndexOfBytes(eb, repl) < 0) { Set("Couldn't find the game's stored hash, so it was not applied (your game is untouched).", Theme.Accent); return; }
+                        // exe already carries the patched hash; only the package needs installing
+                    }
+                    else { Array.Copy(repl, 0, eb, off, 20); File.WriteAllBytes(exe, eb); }
+
+                    File.WriteAllBytes(upk, patched);
+                    Set("Done. Launch SMITE and open any hidden profile to see their stats and history.", Theme.Green);
+                });
+            }
+            catch (Exception ex) { Set("Error: " + ex.Message, Theme.Accent); }
+        }
+
+        // Restore the original files for BOTH installs (whichever have backups).
+        void RevealRestoreAll(Label status)
+        {
+            void Set(string msg, Color c) { status.Text = msg; status.ForeColor = c; }
+            try
+            {
+                if (System.Diagnostics.Process.GetProcessesByName("Smite").Length > 0) { Set("Close SMITE first, then restore.", Theme.Accent); return; }
+                var done = new List<string>();
+                foreach (var plat in new[] { "epic", "steam" })
+                {
+                    string root = RevealSmiteRoot(plat);
+                    if (root == null) continue;
+                    string upk = Path.Combine(root, @"BattleGame\CookedPCConsole\TgClient.upk");
+                    string exe = Path.Combine(root, @"Binaries\Win64\Smite.exe");
+                    bool did = false;
+                    try
+                    {
+                        if (File.Exists(upk + ".orig_backup")) { File.Copy(upk + ".orig_backup", upk, true); did = true; }
+                        if (File.Exists(exe + ".orig_backup")) { File.Copy(exe + ".orig_backup", exe, true); did = true; }
+                    }
+                    catch { }
+                    if (did) done.Add(plat == "epic" ? "Epic" : "Steam");
+                }
+                Set(done.Count > 0 ? ("Restored original files for: " + string.Join(", ", done) + ".") : "No backups found (nothing to restore).",
+                    done.Count > 0 ? Theme.Green : Theme.Dim);
+            }
+            catch (Exception ex) { Set("Error: " + ex.Message, Theme.Accent); }
+        }
+
+        // ===== EasyAntiCheat disable / re-enable (edits EasyAntiCheat\Settings.json) =====
+        // SMITE is EOL so these EAC ids are fixed. Disabling writes an invalid id → EAC can't initialize → the game runs without it.
+        const string EacProductId    = "f71b1231985f48d1af3de723e0a6acdd";
+        const string EacSandboxId    = "076207fa2b5c4803a636af606c3c28b7";
+        const string EacDeploymentId = "e03ac5a2b3444159b50aded07f1ed69b";
+        const string EacOffSuffix    = "aaa";
+
+        static string EacSettingsPath(string platform)
+        {
+            string root = RevealSmiteRoot(platform);
+            return root == null ? null : Path.Combine(root, @"EasyAntiCheat\Settings.json");
+        }
+
+        // Replace the three id values in-place via regex so the file's exact formatting (incl. the unescaped backslash in the exe path) is preserved.
+        static string EacSetIds(string text, string suffix)
+        {
+            text = Regex.Replace(text, "(\"productid\"\\s*:\\s*\")[^\"]*(\")",    "$1" + EacProductId    + suffix + "$2");
+            text = Regex.Replace(text, "(\"sandboxid\"\\s*:\\s*\")[^\"]*(\")",    "$1" + EacSandboxId    + suffix + "$2");
+            text = Regex.Replace(text, "(\"deploymentid\"\\s*:\\s*\")[^\"]*(\")", "$1" + EacDeploymentId + suffix + "$2");
+            return text;
+        }
+
+        void EacApply(string platform, bool disable, Label status)
+        {
+            void Set(string m, Color c) { status.Text = m; status.ForeColor = c; }
+            string who = platform == "epic" ? "Epic" : "Steam";
+            try
+            {
+                string path = EacSettingsPath(platform);
+                if (path == null || !File.Exists(path)) { Set(who + ": EAC Settings.json not found.", Theme.Accent); return; }
+                if (System.Diagnostics.Process.GetProcessesByName("Smite").Length > 0) { Set("Close SMITE first, then try again.", Theme.Accent); return; }
+                if (!File.Exists(path + ".orig_backup")) File.Copy(path, path + ".orig_backup");
+                File.WriteAllText(path, EacSetIds(File.ReadAllText(path), disable ? EacOffSuffix : ""));
+                Set(disable ? (who + ": EasyAntiCheat disabled ✓  (EAC will not run for this install)") : (who + ": EasyAntiCheat re-enabled."), Theme.Green);
+            }
+            catch (Exception ex) { Set("Error: " + ex.Message, Theme.Accent); }
+        }
+
+        // Undo = re-enable EAC on both installs (write the valid ids back).
+        void EacUndoAll(Label status)
+        {
+            void Set(string m, Color c) { status.Text = m; status.ForeColor = c; }
+            try
+            {
+                if (System.Diagnostics.Process.GetProcessesByName("Smite").Length > 0) { Set("Close SMITE first, then try again.", Theme.Accent); return; }
+                var done = new List<string>();
+                foreach (var plat in new[] { "epic", "steam" })
+                {
+                    string path = EacSettingsPath(plat);
+                    if (path == null || !File.Exists(path)) continue;
+                    try { File.WriteAllText(path, EacSetIds(File.ReadAllText(path), "")); done.Add(plat == "epic" ? "Epic" : "Steam"); } catch { }
+                }
+                Set(done.Count > 0 ? ("EasyAntiCheat re-enabled for: " + string.Join(", ", done) + ".") : "No SMITE install found.", done.Count > 0 ? Theme.Green : Theme.Dim);
+            }
+            catch (Exception ex) { Set("Error: " + ex.Message, Theme.Accent); }
+        }
 
         // A 1px panel that turns red while the hosted textbox has focus -> sharp red focus border.
         // Host height is pinned to the textbox's natural height so there is no gray gap below it.
