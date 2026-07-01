@@ -6478,7 +6478,9 @@ namespace SmiteGodLab
                 reconnectTimer.Tick += (s, e) =>
                 {
                     reconnectTimer.Stop(); reconnectTimer.Dispose(); reconnectTimer = null;
-                    if (engine == null || !LoginReady()) return;
+                    // Re-check the game right before restarting (it may have opened during the backoff delay) so a
+                    // reconnect never logs in and kicks a now-running game's chat.
+                    if (engine == null || !LoginReady() || CheckGameOpen()) { if (CheckGameOpen()) { _gameOpen = true; SetStatus(engine != null ? engine.State : "stopped"); } return; }
                     WLog("reconnecting now — restarting engine");
                     try { engine.Stop(); } catch { }
                     ApplyLogin(); engine.Start();
@@ -6639,6 +6641,11 @@ namespace SmiteGodLab
             void TryStartEngine()
             {
                 if (engine == null || engine.Running) return;
+                // NEVER start the engine while THIS account's SMITE is open. A second chat login makes the server
+                // CLOSE_CONNECTION one of the two sessions — which disconnects the running game's chat. Refuse to start
+                // and show the "close SMITE" banner; the presence timer auto-starts us the moment the game closes.
+                _gameOpen = CheckGameOpen();
+                if (_gameOpen) { SetStatus(engine.State); return; }
                 if (!LoginReady()) { OpenLoginSettings(); return; }
                 ApplyLogin();
                 engine.Start();
@@ -6893,7 +6900,29 @@ namespace SmiteGodLab
             // refresh the active conversation's presence rapidly while the tab is open, + instantly on window focus
             // Poll EVERY open conversation in one batch (not just the active one) so none go stale.
             var presTimer = new System.Windows.Forms.Timer { Interval = 5000 };
-            presTimer.Tick += (s, e) => { bool g = CheckGameOpen(); if (g != _gameOpen) { _gameOpen = g; RefreshConnLabel(); } if (root.Visible) QueryAllPresence(); };
+            presTimer.Tick += (s, e) =>
+            {
+                bool g = CheckGameOpen();
+                if (g != _gameOpen)
+                {
+                    _gameOpen = g;
+                    if (g)
+                    {
+                        // Game just opened -> yield the chat session to it (stop our engine) so IT stays connected in-game,
+                        // and cancel any pending reconnect so we don't fight it.
+                        CancelPendingReconnect();
+                        try { if (engine != null && engine.Running) engine.Stop(); } catch { }
+                        WLog("game opened -> engine stopped (yielding chat to the game)");
+                    }
+                    else if (root.Visible && engine != null && !engine.Running && LoginReady())
+                    {
+                        WLog("game closed -> starting engine");
+                        TryStartEngine();   // game closed -> safe to (re)connect now
+                    }
+                    RefreshConnLabel();
+                }
+                if (root.Visible) QueryAllPresence();
+            };
             presTimer.Start();
             this.Activated += (s, e) => { if (root.Visible) QueryAllPresence(); };
             loginBtn.Click += (s, e) => OpenLoginSettings();
@@ -6908,6 +6937,7 @@ namespace SmiteGodLab
             _mctsEnsureConnected = async (timeoutMs) =>
             {
                 if (engine != null && engine.State == "connected") return true;
+                if (CheckGameOpen()) { _gameOpen = true; SetStatus(engine != null ? engine.State : "stopped"); return false; }   // can't share the account's chat with a running game
                 if (engine != null && !engine.Running && LoginReady()) { ApplyLogin(); engine.Start(); }
                 if (engine == null || !engine.Running) return false;
                 var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -6919,7 +6949,7 @@ namespace SmiteGodLab
                 }
                 return engine.State == "connected";
             };
-            _mctsPreconnect = () => { if (engine != null && !engine.Running && LoginReady()) { ApplyLogin(); engine.Start(); } };
+            _mctsPreconnect = () => { if (engine != null && !engine.Running && LoginReady() && !CheckGameOpen()) { ApplyLogin(); engine.Start(); } };
             this.FormClosing += (s, e) => { try { reconnectTimer?.Stop(); reconnectTimer?.Dispose(); } catch { } try { engine?.Stop(); } catch { } };
 
             RenderConvList();
@@ -9245,7 +9275,7 @@ namespace SmiteGodLab
         static string AppVersionFromAssembly()
         {
             try { var v = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version; if (v != null && (v.Major + v.Minor + v.Build) > 0) return v.Major + "." + v.Minor + "." + v.Build; } catch { }
-            return "1.3.0";
+            return "1.3.1";
         }
         const string ReleasesApi = "https://api.github.com/repos/DariusSmite/Smite-1-Inspector/releases/latest";
         const string ReleasesListApi = "https://api.github.com/repos/DariusSmite/Smite-1-Inspector/releases?per_page=10";   // beta channel: includes pre-releases (newest first)
